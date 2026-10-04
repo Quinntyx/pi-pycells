@@ -53,9 +53,11 @@ metadata:
      summary. Until teardown, windows remain available for inspection and
      steering. `subagents.finish()` also belongs in a dedicated cleanup cell.
 
-   Create the opening workflow cell with `write_cell`. Submit that saved cell
-   with `request_cell_review(session_id=..., n=...)`, then execute it using
-   `run_cell` after approval. Do not use `exec_cell` or `scratch_run` to start
+   Create the opening workflow cell with the Pi tool `write_cell`. Submit that
+   saved cell with the Pi tool `request_cell_review`, passing `session_id` and
+   `n` as tool arguments; then call the Pi tool `run_cell` after approval.
+   These are tool calls outside Python cells, not Python function calls or
+   `pi_subagents` methods. Do not use `exec_cell` or `scratch_run` to start
    an unreviewed workflow. Constants remain visible in the preceding cell;
    review must not hide the implementation in a wrapper such as `await main()`.
    See review/autonomy below for explicit no-prompt requests.
@@ -77,8 +79,14 @@ and tear down in ordered cells.
 
 # Review and autonomy
 
-- `request_cell_review` is a separate tool. It previews inline code, a file's
+- `request_cell_review` is the exact registered Pi tool name. Call it through
+  the tool interface outside Python cells; do not import it, call it from
+  Python, or substitute another name. It previews inline code, a file's
   complete contents, or a saved notebook code cell. It never executes code.
+- Check that `request_cell_review` is available in the current agent's tools.
+  A standalone subagent profile without pi-pycells does not expose it. If it is
+  absent, report the missing extension or disabled tool and stop before running
+  work that requires review; do not invent an alias or treat it as approval.
 - Review the saved opening workflow cell before a substantial workflow and
   review destructive operations before running them. Use `n` and `session_id`
   to show exactly the cell that will be run; keep prompts and constants in
