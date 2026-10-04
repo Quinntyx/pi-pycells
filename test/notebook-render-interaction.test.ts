@@ -161,6 +161,52 @@ test("fullscreen input and output wheel windows scroll independently and persist
   } finally { setNotebookTuiModeProvider(undefined); }
 });
 
+test("fullscreen wheel scrolling only captures the actual fenced box, not labels or gutter metadata", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    for (const cellIdx of [12, 123456789]) {
+      const state = {};
+      const component = frame({ userCode: source, cellIdx, liveOutput: output }, state, true);
+      for (const width of [80, 55]) {
+        const lines = component.render(width).map(stripAnsi);
+        for (const label of [`In[${cellIdx}]:`, `Out[${cellIdx}]:`]) {
+          const row = labelRow(lines, label);
+          const left = lines[row - 1].indexOf("┌");
+          const right = lines[row - 1].indexOf("┐");
+          assert.ok(left > 0 && right > left);
+          const positionsBefore = { ...state.scrollPositions };
+          for (const y of [row - 1, row, row + 1, row + 2]) {
+            for (const x of [0, 1, left - 1, right + 1]) {
+              assert.equal(component.handleMouse({ ...wheel(y, 1), x }), undefined, `${label}, x=${x}, y=${y}`);
+            }
+          }
+          assert.deepEqual(state.scrollPositions ?? {}, positionsBefore, "gutter events must not change box positions");
+          assert.ok(component.handleMouse({ ...wheel(row, -1), x: left })?.handled, "left fence captures wheel events");
+          component.invalidate();
+          assert.ok(component.handleMouse({ ...wheel(row, 1), x: right })?.handled, "right fence captures before repaint");
+          // Return to tail so the next box/width starts with unchanged state.
+          component.handleMouse({ ...wheel(row, 100), x: left + 1 });
+        }
+        assert.equal(component.handleMouse(wheel(lines.length, 1)), undefined, "below the boxes is transcript space");
+      }
+    }
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
+test("generic boxes use their own fence bounds and clipped panes never capture invisible gutter space", () => {
+  const { NotebookComponent } = require("../dist/execution/notebook-component.js");
+  const { renderLabeledBox } = require("../dist/execution/cell-view.js");
+  const component = new NotebookComponent((width, layout) => layout.box("generic", 40,
+    { width, mode: "fullscreen", theme: THEME },
+    (options) => renderLabeledBox("Run:", source.map((text) => ({ text })), options)));
+  const lines = component.render(40).map(stripAnsi);
+  const left = lines[0].indexOf("┌");
+  assert.equal(component.handleMouse({ ...wheel(1, 1), x: left - 1 }), undefined);
+  assert.ok(component.handleMouse({ ...wheel(1, 1), x: left })?.handled);
+  component.render(3);
+  assert.equal(component.handleMouse({ ...wheel(1, 1), x: 2 }), undefined);
+});
+
 test("live output follows the tail, pauses while scrolled up, and resumes at the bottom", () => {
   setNotebookTuiModeProvider(() => "fullscreen");
   try {
@@ -331,6 +377,9 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     let lines = host.render(80).map(stripAnsi);
     assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1);
     const inputRow = labelRow(lines, "In[ ]:");
+    for (const y of [inputRow, inputRow + 1, inputRow + 2]) {
+      assert.ok(!host.handleMouse({ ...wheel(y, 4), x: 1 })?.handled, "gutter events propagate to transcript navigation");
+    }
     assert.ok(host.handleMouse(wheel(inputRow, 4))?.handled);
     assert.ok(host.handleMouse(wheel(inputRow, 2))?.handled, "a second event before repaint must not scroll the transcript");
     lines = host.render(80).map(stripAnsi);

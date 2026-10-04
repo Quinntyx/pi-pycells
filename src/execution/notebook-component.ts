@@ -1,11 +1,13 @@
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { FULLSCREEN_VIEWPORT_LINES, NORMAL_VIEWPORT_LINES, type CellRenderOptions } from "./cell-view";
+import { FULLSCREEN_VIEWPORT_LINES, NORMAL_VIEWPORT_LINES, visibleWidth, type CellRenderOptions } from "./cell-view";
 import type { NotebookRenderState } from "./notebook-render";
 
 interface ScrollRegion {
   key: string;
   top: number;
   bottom: number;
+  left: number;
+  right: number;
   start: number;
   maximum: number;
   followsTail: boolean;
@@ -31,7 +33,19 @@ export class NotebookBoxLayout {
     const start = Math.max(1, Math.min(maximum, position));
     const lines = render({ ...options, viewStart: start });
     if (scrollable && options.mode === "fullscreen" && maximum > 1) {
-      this.regions.push({ key, top, bottom: top + lines.length, start, maximum, followsTail });
+      // The gutter belongs to transcript navigation, not the box viewport.
+      // Derive bounds from the painted fence so custom labels, ANSI styling,
+      // wide characters, and narrow/clipped panes use the actual box geometry.
+      const fence = lines[0] ?? "";
+      const leftCorner = fence.indexOf("┌");
+      const rightCorner = fence.lastIndexOf("┐");
+      if (leftCorner >= 0 && rightCorner > leftCorner) {
+        const left = visibleWidth(fence.slice(0, leftCorner));
+        const right = Math.min(options.width, visibleWidth(fence.slice(0, rightCorner)) + 1);
+        if (right > left) {
+          this.regions.push({ key, top, bottom: top + lines.length, left, right, start, maximum, followsTail });
+        }
+      }
     }
     return lines;
   }
@@ -57,7 +71,9 @@ export class NotebookComponent implements Component {
     // Preserve transcript selection/clicks and let unhandled events reach the
     // outer ScrollView. Ctrl+o remains the keyboard path to the complete cell.
     if (event.type !== "wheel" || !event.wheelDelta) return undefined;
-    const region = this.regions.find((box) => event.y >= box.top && event.y < box.bottom);
+    const region = this.regions.find((box) =>
+      event.x >= box.left && event.x < box.right && event.y >= box.top && event.y < box.bottom,
+    );
     if (!region) return undefined;
     const next = Math.max(1, Math.min(region.maximum, region.start + event.wheelDelta));
     if (next === region.start) return { handled: true, render: false };
