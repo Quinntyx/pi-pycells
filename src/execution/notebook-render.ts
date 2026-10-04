@@ -58,6 +58,8 @@ export interface NotebookRenderState {
   /** 1-based first visible code line, carried over from the executing view. */
   viewStartLine?: number;
   scrollPositions?: Record<string, number>;
+  /** Changes only when this tool row scrolls; unrelated history stays warm. */
+  scrollRevision?: number;
   /** Call previews yield to the partial/final input box at paint time. */
   resultOwnsInput?: boolean;
   callCode?: string;
@@ -327,7 +329,7 @@ function renderExecutingFrame(
       viewStart: Math.max(1, total - FULLSCREEN_VIEWPORT_LINES + 1),
     }, (options) => renderOutCell(liveText, options), lines.length, true, mode === "fullscreen"));
     return lines;
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 // ---------------------------------------------------------------------------
 // Call phase (renderCall): the In box for the submitted code. During
@@ -357,7 +359,7 @@ export function renderNotebookCall(
       labelBackground: "toolPendingBg",
       highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate, true),
     }, (opts) => renderInCell(source, opts), 0, true);
-  }, state, context?.invalidate);
+  }, state, context?.invalidate, () => currentViewportMode(false));
 }
 // Completed frames, per op
 // ---------------------------------------------------------------------------
@@ -388,7 +390,7 @@ function renderExecCompleted(
     lines.push(...layout.box("output", bodyLineCount(text), { ...base, viewStart: 1, outputStyle },
       (options) => renderOutCell(text, options), lines.length));
     return lines;
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 /**
  * Jupyter-style Out content: stdout plus the echoed value, without the
@@ -436,7 +438,7 @@ function renderWriteCompleted(
     return layout.box("input", bodyLineCount(source), {
       ...opts, highlightLines: renderHighlights(source, undefined, theme, state, redraw),
     }, (options) => renderInCell(source, options));
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 /** delete_cell: the whole cell — gutter included — in red. */
 function renderDeleteCompleted(
@@ -451,7 +453,7 @@ function renderDeleteCompleted(
     return layout.box("input", bodyLineCount(source), {
       ...boxOptions(details, expanded, theme, state), width, cellNumber: details.n,
     }, (options) => renderDeletedCell(source, options));
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 /** run_to / run_all: one compact per-cell status list. */
 function renderRunBatchCompleted(
@@ -472,7 +474,7 @@ function renderRunBatchCompleted(
     return layout.box("run", rows.length, {
       width, mode: currentViewportMode(expanded), theme,
     }, (options) => renderLabeledBox("Run:", rows, options));
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 /** reset_kernel: one muted line; the notebook file is untouched. */
 function renderResetCompleted(result: NotebookToolResult, theme: Theme): Component {
@@ -500,7 +502,7 @@ function renderReadOneCompleted(
         (options) => renderOutCell(cell.outputText, options), lines.length));
     }
     return lines;
-  }, state, redraw);
+  }, state, redraw, () => currentViewportMode(expanded));
 }
 /** read_cells: compact per-cell list (headers muted, sources plain). */
 function renderReadManyCompleted(

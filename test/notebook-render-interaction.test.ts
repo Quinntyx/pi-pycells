@@ -207,6 +207,73 @@ test("generic boxes use their own fence bounds and clipped panes never capture i
   assert.equal(component.handleMouse({ ...wheel(1, 1), x: 2 }), undefined);
 });
 
+test("unchanged history reuses painted rows while resize, state, and explicit invalidation rebuild", () => {
+  const { NotebookComponent } = require("../dist/execution/notebook-component.js");
+  const { renderLabeledBox } = require("../dist/execution/cell-view.js");
+  const state = {};
+  let builds = 0;
+  let mode = "fullscreen";
+  const component = new NotebookComponent((width, layout) => {
+    builds++;
+    return layout.box("input", source.length, { width, mode, theme: THEME },
+      (options) => renderLabeledBox("Run:", source.map((text) => ({ text })), options));
+  }, state, undefined, () => mode);
+  const first = component.render(80);
+  assert.strictEqual(component.render(80), first);
+  assert.equal(builds, 1, "unchanged history must not rebuild rows");
+  assert.equal(component.handleMouse({ ...wheel(1, 1), x: 0 }), undefined);
+  assert.strictEqual(component.render(80), first, "transcript navigation leaves box cache warm");
+  component.handleMouse(wheel(1, 1));
+  assert.notStrictEqual(component.render(80), first);
+  assert.equal(builds, 2);
+  component.render(55);
+  assert.equal(builds, 3, "width changes rebuild geometry");
+  state.lastHighlights = { code: "x", lines: ["x"], themeKey: "light", revision: 1 };
+  component.render(55);
+  assert.equal(builds, 4, "async highlight completion refreshes colors");
+  mode = "normal";
+  component.render(55);
+  assert.equal(builds, 5, "viewport mode changes rebuild even at identical width");
+  assert.equal(component.handleMouse(wheel(1, 1)), undefined);
+  component.invalidate();
+  component.render(55);
+  assert.equal(builds, 6, "explicit theme/content invalidation refreshes styling");
+});
+
+test("scrolling invalidates sibling cached components sharing a tool's viewport state", () => {
+  const { NotebookComponent } = require("../dist/execution/notebook-component.js");
+  const state = {};
+  const make = () => new NotebookComponent((width, layout) => layout.box("input", source.length,
+    { width, mode: "fullscreen", cellNumber: 1 },
+    (options) => renderInCell(source.join("\n"), options)), state);
+  const first = make();
+  const sibling = make();
+  first.render(80);
+  const before = sibling.render(80);
+  first.handleMouse(wheel(1, 3));
+  const after = sibling.render(80);
+  assert.notStrictEqual(after, before);
+  assert.ok(after.some((line) => line.includes("line_3 =")));
+});
+
+test("cached real notebook frames refresh viewport mode without a resize", () => {
+  let mode = "fullscreen";
+  setNotebookTuiModeProvider(() => mode);
+  try {
+    const component = frame({ userCode: source, cellIdx: 2 }, {});
+    const fullscreen = component.render(80);
+    assert.strictEqual(component.render(80), fullscreen);
+    mode = "regular";
+    const normal = component.render(80);
+    assert.notStrictEqual(normal, fullscreen);
+    assert.ok(normal.some((line) => line.includes("more lines")));
+    assert.equal(component.handleMouse(wheel(1, 1)), undefined);
+    mode = "fullscreen";
+    assert.ok(!component.render(80).some((line) => line.includes("more lines")));
+    assert.ok(component.handleMouse(wheel(1, 1))?.handled);
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
 test("live output follows the tail, pauses while scrolled up, and resumes at the bottom", () => {
   setNotebookTuiModeProvider(() => "fullscreen");
   try {
@@ -391,5 +458,14 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     assert.ok(!lines.some((line) => /^ In\[ \]:/.test(line)));
     assert.ok(lines.some((line) => line.includes("line_6 =")));
     assert.ok(redraws > 0);
-  } finally { setNotebookTuiModeProvider(undefined); }
+    const lightFrame = host.render(80);
+    initTheme("dark", false);
+    host.invalidate();
+    const darkFrame = host.render(80);
+    assert.notDeepEqual(darkFrame, lightFrame, "host theme invalidation must not reuse light styling");
+    assert.deepEqual(darkFrame.map(stripAnsi), lightFrame.map(stripAnsi), "theme changes preserve box geometry");
+  } finally {
+    initTheme("light", false);
+    setNotebookTuiModeProvider(undefined);
+  }
 });

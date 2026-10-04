@@ -54,16 +54,52 @@ export class NotebookBoxLayout {
 /** Width-aware, mouse-scrollable tool component. Regular mode keeps terminal scrollback. */
 export class NotebookComponent implements Component {
   private regions: ScrollRegion[] = [];
+  private cached?: {
+    width: number;
+    renderKey: unknown;
+    lastHighlights: NotebookRenderState["lastHighlights"];
+    highlightRevision: number | undefined;
+    viewStartLine: number | undefined;
+    callCode: string | undefined;
+    resultOwnsInput: boolean | undefined;
+    scrollRevision: number | undefined;
+    lines: string[];
+  };
   constructor(
     private readonly build: (width: number, layout: NotebookBoxLayout) => string[],
     private readonly state: NotebookRenderState = {},
     private readonly redraw?: () => void,
+    private readonly renderKey?: () => unknown,
   ) {}
 
   render(width: number): string[] {
+    const renderKey = this.renderKey?.();
+    const cached = this.cached;
+    // Transcript redraws revisit every historical tool. Reuse the painted
+    // rows instead of reparsing output, allocating body rows, and restyling
+    // ANSI text when neither geometry nor this row's state has changed.
+    if (cached && cached.width === width && cached.renderKey === renderKey &&
+        cached.lastHighlights === this.state.lastHighlights &&
+        cached.highlightRevision === this.state.highlightRevision &&
+        cached.viewStartLine === this.state.viewStartLine &&
+        cached.callCode === this.state.callCode &&
+        cached.resultOwnsInput === this.state.resultOwnsInput &&
+        cached.scrollRevision === this.state.scrollRevision) {
+      return cached.lines;
+    }
     const layout = new NotebookBoxLayout(this.state);
     const lines = this.build(width, layout);
     this.regions = layout.regions;
+    // Snapshot after build: rendering may resolve already-cached highlights.
+    this.cached = {
+      width, renderKey, lines,
+      lastHighlights: this.state.lastHighlights,
+      highlightRevision: this.state.highlightRevision,
+      viewStartLine: this.state.viewStartLine,
+      callCode: this.state.callCode,
+      resultOwnsInput: this.state.resultOwnsInput,
+      scrollRevision: this.state.scrollRevision,
+    };
     return lines;
   }
 
@@ -81,11 +117,13 @@ export class NotebookComponent implements Component {
     if (region.followsTail && next === region.maximum) delete positions[region.key];
     else positions[region.key] = next;
     region.start = next;
+    this.state.scrollRevision = (this.state.scrollRevision ?? 0) + 1;
+    this.invalidate();
     this.redraw?.();
     return { handled: true, render: true };
   }
 
   // Keep the last painted hit regions until repaint: host invalidation can occur
   // between consecutive wheel events, which must not leak into transcript scrolling.
-  invalidate(): void {}
+  invalidate(): void { this.cached = undefined; }
 }
