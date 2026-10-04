@@ -307,7 +307,7 @@ function renderExecutingFrame(
   redraw?: () => void,
 ): Component {
   return new NotebookComponent((width, layout) => {
-    const code = (details.userCode ?? []).join("\n");
+    const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const mode = currentViewportMode(expanded);
     const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
     const opts = { width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const };
@@ -559,9 +559,11 @@ export function renderNotebookResult(
   try {
     const details = (result.details ?? {}) as CellOpDetails;
     const state = (context?.state ?? {}) as NotebookRenderState;
-    if (["exec_cell", "run_cell", "scratch_run"].includes(toolName)) {
-      state.resultOwnsInput = details.userCode !== undefined || state.callCode !== undefined;
-    if (state.resultOwnsInput) state.streamingHighlights?.cancelPending();
+    if (["exec_cell", "run_cell", "scratch_run", "write_cell"].includes(toolName)) {
+      state.resultOwnsInput = toolName === "write_cell"
+        ? details.cellSource !== undefined
+        : details.userCode !== undefined || state.callCode !== undefined;
+      if (state.resultOwnsInput) state.streamingHighlights?.cancelPending();
     }
     if (options.isPartial) {
       return renderExecutingFrame(toolName, details, theme, state, options.expanded ?? false, context?.invalidate);

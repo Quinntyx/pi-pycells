@@ -925,6 +925,64 @@ test("exec_cell file mode records and validates the real file contents", async (
   }
 });
 
+test("registered source-bearing tools stream input through Pi's real tool shell", async (t) => {
+  const sandbox = {
+    async cleanup() {},
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const restore = restoreInjectedModules(sandbox);
+  const { initTheme, ToolExecutionComponent } = await import("@earendil-works/pi-coding-agent");
+  const { setNotebookTuiModeProvider } = require("../dist/execution/notebook-render.js");
+  const stripAnsi = (text) => text.replace(/\x1b\[[0-9;]*m/g, "");
+  initTheme("light", false);
+  try {
+    const registered = [];
+    const eventHandlers = new Map();
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await (await loadExtension())(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    setNotebookTuiModeProvider(() => "fullscreen");
+    for (const [name, field] of [["exec_cell", "code"], ["scratch_run", "code"], ["write_cell", "source"]]) {
+      await t.test(name, () => {
+        const definition = registered.find((tool) => tool.name === name);
+        const host = new ToolExecutionComponent(name, `stream-${name}`, {}, {}, definition,
+          { requestRender() {} }, process.cwd());
+        const paint = () => host.render(80).map(stripAnsi);
+        assert.equal(paint().filter((line) => /^ In/.test(line)).length, 0);
+        for (const code of ["first = 1", "first = 1\nsecond = 2"]) {
+          host.updateArgs({ session_id: "s1", at: 2, [field]: code });
+          const lines = paint();
+          assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "input previews must stream before execution");
+          assert.ok(lines.some((line) => line.includes(code.split("\n").at(-1))));
+        }
+        const code = Array.from({ length: 24 }, (_, i) => `stream_line_${i} = ${i}`).join("\n");
+        host.updateArgs({ session_id: "s1", at: 2, [field]: code });
+        let lines = paint();
+        assert.ok(lines.some((line) => line.includes("stream_line_23 =")), "streaming follows the newest line");
+        assert.ok(!lines.some((line) => line.includes("stream_line_0 =")));
+        host.setArgsComplete();
+        host.markExecutionStarted();
+        if (name !== "write_cell") {
+          // Early progress may carry output before execution attaches userCode.
+          host.updateResult({ content: [], details: { liveOutput: ["starting"] } }, true);
+          assert.ok(paint().some((line) => line.includes("stream_line_")), "progress retains the streamed input");
+          assert.equal(paint().filter((line) => /^ In/.test(line)).length, 1);
+        }
+        const details = name === "write_cell"
+          ? { cellSource: code, cellType: "code", replaced: false, at: 2 }
+          : { userCode: code.split("\n"), cellIdx: name === "exec_cell" ? 8 : undefined };
+        host.updateResult({ content: [{ type: "text", text: "done" }], details }, false);
+        lines = paint();
+        assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "result replaces the streaming preview");
+      });
+    }
+  } finally {
+    setNotebookTuiModeProvider(undefined);
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
 test("completed exec_cell rendering omits missing durations instead of printing NaN", async () => {
   const sandbox = {
     async cleanup() {},

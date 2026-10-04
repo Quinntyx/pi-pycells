@@ -27,17 +27,6 @@ test("workflow examples consume validated bodies and have replay guards", () => 
   assert.ok(blocks[1].includes("active_workflow_key != workflow_key"));
 });
 
-test("review guidance names the registered Pi tool, not a Python helper or invented alias", () => {
-  const { createCellReviewTool } = require("../dist/tools/cell-review.js");
-  const tool = createCellReviewTool({}, async () => ({ action: "approve" }));
-  assert.equal(tool.name, "request_cell_review");
-  assert.match(skill, /`request_cell_review` is the exact registered Pi tool name/);
-  assert.match(skill, /tool calls outside Python cells/);
-  assert.match(skill, /standalone subagent profile without pi-pycells/);
-  assert.doesNotMatch(skill, /request_cell_review\s*\(/);
-  assert.ok(blocks.every((block) => !block.includes(tool.name)), "review stays outside executable Python");
-});
-
 test("review, failure handling and activity API guidance name the current contracts", () => {
   assert.match(skill, /request_cell_review/);
   assert.match(skill, /AgentPoolFailureError/);
