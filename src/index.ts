@@ -10,7 +10,7 @@ import type {
   Theme,
   ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Text, type Component } from "@earendil-works/pi-tui";
 import { PtcPythonError } from "./execution/execution-errors";
 import { CustomToolManager } from "./custom-tool-manager";
 import { buildCodeExecutionRecoveryPrompt, classifyCodeExecutionFailure } from "./recovery-classifier";
@@ -28,7 +28,7 @@ import {
 import { createSandbox } from "./sandbox-manager";
 import { ensurePtcVenv, resolvePiSubagentsSource, startSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
-import { createCellReviewTool } from "./tools/cell-review";
+import { createRenderedCellReviewTool } from "./tools/cell-review";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
@@ -661,215 +661,6 @@ function execFilePtc(
     }
   });
 }
-
-/** User's approve/reject decision for an explicit cell review. */
-interface CellApprovalDecision {
-  action: "approve" | "reject";
-  note?: string;
-}
-
-/** The three choices offered in the cell approval popup. */
-const CELL_APPROVAL_OPTIONS = [
-  { value: "approve", label: "Approve — accept this operation" },
-  { value: "reject", label: "Reject — do not execute this operation" },
-  { value: "note", label: "Reject with note — tell the model why" },
-] as const;
-
-/**
- * Questionnaire-style approval box: shows the cell code, then Approve /
- * Reject / Reject with note. Resolves when the user decides (Esc = reject).
- */
-async function requestCellApproval(
-  ctx: ExtensionContext,
-  sessionId: string,
-  code: string
-): Promise<CellApprovalDecision> {
-  if (!ctx.hasUI) {
-    // No UI to ask in: fail closed with an explanatory result.
-    return { action: "reject", note: "approval requested but no UI is available in this mode" };
-  }
-
-  // Highlight once, up-front (before the sync TUI renderer runs). Falls back
-  // to plain text if Shiki is unavailable.
-  const highlightedLines = await highlightCellCode(code, ctx.ui?.theme);
-  const previewLines = highlightedLines ?? code.split("\n");
-  const isHighlighted = highlightedLines !== null;
-
-  try {
-    return await ctx.ui.custom<CellApprovalDecision>((tui, theme, _kb, done) => {
-      let optionIndex = 0;
-      let inputMode = false;
-      let cachedLines: string[] | undefined;
-      const viewportRows = 24; // visible code rows; the box scrolls instead of truncating
-      let rowOffset = 0;
-      const editorTheme: EditorTheme = {
-        borderColor: (style: string) => theme.fg("accent", style),
-        selectList: {
-          selectedPrefix: (style: string) => theme.fg("accent", style),
-          selectedText: (style: string) => theme.fg("accent", style),
-          description: (style: string) => theme.fg("muted", style),
-          scrollInfo: (style: string) => theme.fg("dim", style),
-          noMatch: (style: string) => theme.fg("warning", style),
-        },
-      };
-      const editor = new Editor(tui, editorTheme);
-      editor.onSubmit = (value: string) => {
-        const note = value.trim() || "(no note)";
-        done({ action: "reject", note });
-      };
-
-      // Wrapped rows over the whole document, rebuilt when the width changes.
-      let cachedRows: { text: string; line: number }[] | undefined;
-      let cachedRowsWidth = -1;
-
-      function buildRows(renderWidth: number): void {
-        const innerWidth = Math.max(1, renderWidth - 3);
-        const gutterWidth = Math.max(1, String(previewLines.length).length);
-        const rows: { text: string; line: number }[] = [];
-        for (let i = 0; i < previewLines.length; i++) {
-          const num = theme.fg("dim", String(i + 1).padStart(gutterWidth));
-          for (const wrapped of wrapTextWithAnsi(num + "  " + previewLines[i], innerWidth)) {
-            rows.push({ text: wrapped, line: i });
-          }
-        }
-        cachedRows = rows;
-        cachedRowsWidth = renderWidth;
-      }
-
-      function refresh() {
-        cachedLines = undefined;
-        tui.requestRender();
-      }
-
-      function render(width: number): string[] {
-        if (cachedLines) return cachedLines;
-        const renderWidth: number = Math.max(1, width);
-        if (!cachedRows || cachedRowsWidth !== renderWidth) buildRows(renderWidth);
-        const rows = cachedRows!;
-
-        // Clamp the scroll window so the bottom of the code is reachable.
-        rowOffset = Math.max(0, Math.min(rowOffset, Math.max(0, rows.length - viewportRows)));
-        const visible = rows.slice(rowOffset, rowOffset + viewportRows);
-
-        const lines: string[] = [];
-        lines.push(theme.fg("accent", "┌─ cell review ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
-        const rangeLabel = visible.length
-          ? `lines ${visible[0].line + 1}–${visible[visible.length - 1].line + 1} of ${previewLines.length}`
-          : "0 lines";
-        const syntaxLabel = isHighlighted ? "· shiki" : "· plain";
-        const canScroll = rows.length > viewportRows;
-        const scrollLabel = canScroll ? `· PgUp/PgDn scroll (${rowOffset + 1}/${rows.length})` : "";
-        lines.push(theme.fg("muted", `│ ${rangeLabel} ${syntaxLabel}${scrollLabel}`));
-        for (const row of visible) {
-          lines.push("│ " + row.text);
-        }
-        lines.push(theme.fg("accent", "└" + "─".repeat(Math.max(0, renderWidth - 2)) + "┘"));
-        lines.push("");
-        CELL_APPROVAL_OPTIONS.forEach((option, index) => {
-          const selected = !inputMode && index === optionIndex;
-          const marker = selected ? theme.fg("accent", "❯ ") : "  ";
-          const label = selected ? theme.fg("accent", option.label) : theme.fg("muted", option.label);
-          lines.push(`${marker}${label}`);
-        });
-        if (inputMode) {
-          lines.push(theme.fg("muted", "Why reject? (Enter to submit)"));
-          lines.push(...editor.getLines());
-        }
-        lines.push(theme.fg("dim", "↑/↓ select · wheel/PgUp/PgDn scroll · Home/End top/bottom · Enter confirm · y approve · n reject · Esc reject"));
-        return lines;
-      }
-
-      function handleInput(data: string): void {
-        if (inputMode) {
-          editor.handleInput(data);
-          refresh();
-          return;
-        }
-        if (matchesKey(data, Key.pageUp)) {
-          rowOffset = Math.max(0, rowOffset - (viewportRows - 4));
-          refresh();
-          return;
-        }
-        if (matchesKey(data, Key.pageDown)) {
-          rowOffset += viewportRows - 4;
-          refresh();
-          return;
-        }
-        if (matchesKey(data, Key.home)) {
-          rowOffset = 0;
-          refresh();
-          return;
-        }
-        if (matchesKey(data, Key.end)) {
-          rowOffset = Number.MAX_SAFE_INTEGER; // render() clamps to the last full page
-          refresh();
-          return;
-        }
-        if (data === "\x1b[A" || data === "k") {
-          optionIndex = (optionIndex + CELL_APPROVAL_OPTIONS.length - 1) % CELL_APPROVAL_OPTIONS.length;
-          refresh();
-          return;
-        }
-        if (data === "\x1b[B" || data === "j") {
-          optionIndex = (optionIndex + 1) % CELL_APPROVAL_OPTIONS.length;
-          refresh();
-          return;
-        }
-        if (data === "y") {
-          done({ action: "approve" });
-          return;
-        }
-        if (data === "n") {
-          done({ action: "reject" });
-          return;
-        }
-        if (matchesKey(data, Key.return)) {
-          const selected = CELL_APPROVAL_OPTIONS[optionIndex];
-          if (selected.value === "approve") {
-            done({ action: "approve" });
-          } else if (selected.value === "note") {
-            inputMode = true;
-            editor.setText("");
-            refresh();
-          } else {
-            done({ action: "reject" });
-          }
-          return;
-        }
-        if (matchesKey(data, Key.escape)) {
-          done({ action: "reject" });
-        }
-      }
-
-      /**
-       * Wheel scrolling: pi-tui's alt-screen renderer dispatches wheel events
-       * as normalized mouse events to the component under the pointer before
-       * falling back to chat scrolling. Consuming them here scrolls the code
-       * viewport; wheelDelta is negative when scrolling up.
-       */
-      function handleMouse(event: { type?: string; wheelDelta?: number }): { handled: boolean } | undefined {
-        if (event.type !== "wheel") return undefined;
-        const delta = event.wheelDelta ?? 0;
-        if (delta !== 0) {
-          rowOffset += delta; // render() clamps to the valid range
-          refresh();
-        }
-        return { handled: true };
-      }
-
-      void visibleWidth;
-      return { render, invalidate: () => { cachedLines = undefined; }, handleInput, handleMouse };
-    });
-  } catch (error) {
-    // A broken dialog must not run the cell unasked.
-    return {
-      action: "reject",
-      note: `approval dialog failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-}
-
-
 
 /** provision_kernel tool: spawn a persistent notebook-backed kernel (optionally sourcing a workflow). */
 function provisionKernelTool(
@@ -1897,7 +1688,7 @@ async function handleSessionStart(
   pi.registerTool(deleteCellTool(sessionManager));
   pi.registerTool(readCellsTool(sessionManager));
   pi.registerTool(readCellTool(sessionManager));
-  pi.registerTool(createCellReviewTool(sessionManager, requestCellApproval));
+  pi.registerTool(createRenderedCellReviewTool(sessionManager));
   pi.registerTool(runCellTool(sessionManager, settings, sessionState));
   pi.registerTool(
     runBatchTool(sessionManager, sessionState, {
