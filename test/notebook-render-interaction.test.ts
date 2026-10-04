@@ -514,3 +514,142 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     setNotebookTuiModeProvider(undefined);
   }
 });
+
+
+function inputLabelClick(lines, label, overrides = {}) {
+  const y = labelRow(lines, label);
+  assert.ok(y >= 0, `missing label ${label}`);
+  return { ...wheel(y, 0), type: "click", button: "left", x: 1, screenX: 1, ...overrides };
+}
+
+test("In labels toggle call previews, persist across reconstruction, and handle rapid clicks", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const state = {};
+    let redraws = 0;
+    const context = { state, invalidate: () => { redraws++; } };
+    let call = renderNotebookCall(source.join("\n"), { toolName: "exec_cell" }, THEME, context);
+    const collapsed = call.render(80);
+    assert.ok(collapsed.length < source.length);
+    const click = inputLabelClick(collapsed, "In[ ]:");
+    assert.deepEqual(call.handleMouse(click), { handled: true, render: true });
+    assert.ok(call.render(80).some((line) => stripAnsi(line).includes("line_0 =")));
+    assert.ok(call.render(80).length > source.length);
+    call = renderNotebookCall(source.join("\n"), { toolName: "exec_cell" }, THEME, context);
+    assert.ok(call.render(80).length > source.length, "per-row state survives renderer replacement");
+    call.handleMouse(click);
+    call.invalidate();
+    call.handleMouse(click);
+    assert.ok(call.render(80).length > source.length, "two clicks before repaint cancel out");
+    call.handleMouse(click);
+    assert.deepEqual(call.render(80), collapsed, "collapse restores the viewport position");
+    assert.equal(redraws, 4);
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
+test("In expansion preserves the output viewport and survives partial/final transitions", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const state = { scrollPositions: { input: 5, output: 4 } };
+    let component = frame({ userCode: source, liveOutput: output, cellIdx: null }, state, true);
+    const before = component.render(80);
+    component.handleMouse(inputLabelClick(before, "In[ ]:"));
+    const expanded = component.render(80);
+    assert.ok(expanded.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.deepEqual(expanded.slice(labelRow(expanded, "Out[ ]:") - 1), before.slice(labelRow(before, "Out[ ]:") - 1));
+    component = renderNotebookResult("exec_cell", result({ userCode: source, cellIdx: 12 }, output.join("\n")), {}, THEME, { state });
+    const final = component.render(80);
+    assert.ok(final.some((line) => stripAnsi(line).includes("line_39 =")));
+    component.handleMouse(inputLabelClick(final, "In[12]:"));
+    const collapsed = component.render(80);
+    assert.ok(collapsed.some((line) => stripAnsi(line).includes("line_4 =")));
+    assert.ok(!collapsed.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.deepEqual(state.scrollPositions, { input: 5, output: 4 });
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
+test("only unmodified left clicks on visible In text are handled", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const component = frame({ userCode: source, cellIdx: 1234 }, {});
+    const lines = component.render(80);
+    const click = inputLabelClick(lines, "In[1234]:");
+    for (const change of [
+      { x: 0 }, { x: 10 }, { x: 15 }, { y: click.y - 1 }, { y: click.y + 1 },
+      { type: "press" }, { type: "release" }, { type: "drag" }, { type: "move" },
+      { button: "right" }, { button: "middle" }, { shift: true }, { alt: true }, { ctrl: true },
+    ]) assert.equal(component.handleMouse({ ...click, ...change }), undefined, JSON.stringify(change));
+    assert.equal(component.handleMouse(inputLabelClick(lines, "Out[1234]:")), undefined, "Out retains Pi's own expansion handler");
+    assert.ok(component.handleMouse({ ...click, x: 9 })?.handled, "the label's final colon is clickable");
+    const narrow = frame({ userCode: source, cellIdx: 1234 }, {});
+    const clipped = narrow.render(2);
+    assert.equal(narrow.handleMouse({ ...inputLabelClick(clipped, "In[1234]:"), x: 2 }), undefined);
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
+test("all input renderers support In clicks, including scratch, read, edit, clear, and delete", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const cases = [
+      ["scratch_run", { userCode: source }, "In:"],
+      ["write_cell", { cellSource: source.join("\n") }, "In[ ]:"],
+      ["write_cell", { cellSource: source.join("\n"), oldCellSource: "old = 1", replaced: true }, "In[ ]:"],
+      ["write_cell", { cellSource: "", oldCellSource: source.join("\n"), replaced: true }, "In[ ]:"],
+      ["delete_cell", { cellSource: source.join("\n"), n: 123 }, "In[123]:"],
+      ["read_cell", { cells: [{ index: 1, cellType: "code", source: source.join("\n"), executionCount: 9, outputText: "out" }] }, "In[9]:"],
+    ];
+    for (const [tool, details, label] of cases) {
+      const component = renderNotebookResult(tool, result(details), {}, THEME, { state: {} });
+      const before = component.render(80);
+      assert.ok(component.handleMouse(inputLabelClick(before, label))?.handled, tool);
+      const after = component.render(80);
+      assert.ok(after.length > before.length, tool);
+      assert.ok(after.some((line) => stripAnsi(line).includes("line_39 =")), tool);
+      component.handleMouse(inputLabelClick(after, label));
+      assert.deepEqual(component.render(80), before, tool);
+    }
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
+test("real Pi shell routes In clicks before and after execution without stealing Out or Ctrl+o", async () => {
+  const { initTheme, ToolExecutionComponent } = await import("@earendil-works/pi-coding-agent");
+  initTheme("light", false);
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const definition = {
+      renderShell: "self",
+      renderCall: (args, theme, context) => renderNotebookCall(args.code, { toolName: "exec_cell" }, theme, context),
+      renderResult: (value, options, theme, context) => renderNotebookResult("exec_cell", value, options, theme, context),
+    };
+    const host = new ToolExecutionComponent("exec_cell", "input-click-regression", { code: source.join("\n") }, {}, definition,
+      { requestRender() {} }, process.cwd());
+    host.setArgsComplete();
+    host.markExecutionStarted();
+    let lines = host.render(80);
+    assert.ok(host.handleMouse(inputLabelClick(lines, "In[ ]:"))?.handled);
+    assert.ok(host.render(80).some((line) => stripAnsi(line).includes("line_39 =")));
+    host.updateResult(result({ userCode: source, cellIdx: 7 }, output.join("\n")), false);
+    lines = host.render(80);
+    assert.equal(lines.filter((line) => /^ In/.test(stripAnsi(line))).length, 1);
+    assert.ok(host.handleMouse(inputLabelClick(lines, "In[7]:"))?.handled);
+    lines = host.render(80);
+    assert.ok(!lines.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.ok(host.handleMouse(inputLabelClick(lines, "Out[7]:"))?.handled);
+    lines = host.render(80);
+    assert.ok(lines.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.ok(lines.some((line) => stripAnsi(line).includes("output_39")));
+    host.handleMouse(inputLabelClick(lines, "In[7]:"));
+    lines = host.render(80);
+    assert.ok(!lines.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.ok(lines.some((line) => stripAnsi(line).includes("output_39")), "In collapse is independent of Out");
+    host.setExpanded(false);
+    host.render(80);
+    host.setExpanded(true);
+    lines = host.render(80);
+    assert.ok(lines.some((line) => stripAnsi(line).includes("line_39 =")), "Ctrl+o supersedes local collapse");
+    host.setExpanded(false);
+    lines = host.render(80);
+    assert.ok(!lines.some((line) => stripAnsi(line).includes("line_39 =")));
+    assert.ok(!lines.some((line) => stripAnsi(line).includes("output_39")));
+  } finally { setNotebookTuiModeProvider(undefined); }
+});

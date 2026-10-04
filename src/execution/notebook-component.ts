@@ -1,4 +1,4 @@
-import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { FULLSCREEN_VIEWPORT_LINES, NORMAL_VIEWPORT_LINES, visibleWidth, type CellRenderOptions } from "./cell-view";
 import type { NotebookRenderState } from "./notebook-render";
 
@@ -13,9 +13,17 @@ interface ScrollRegion {
   followsTail: boolean;
 }
 
+interface InputLabelRegion {
+  top: number;
+  left: number;
+  right: number;
+  expanded: boolean;
+}
+
 /** Build each box with its own persistent viewport and local mouse hit region. */
 export class NotebookBoxLayout {
   readonly regions: ScrollRegion[] = [];
+  readonly inputLabels: InputLabelRegion[] = [];
   constructor(private readonly state: NotebookRenderState) {}
 
   box(
@@ -32,6 +40,16 @@ export class NotebookBoxLayout {
     const position = this.state.scrollPositions?.[key] ?? options.viewStart ?? (followsTail ? maximum : 1);
     const start = Math.max(1, Math.min(maximum, position));
     const lines = render({ ...options, viewStart: start });
+    if (key === "input") {
+      // Only the painted label is clickable; blank gutter, fences, and code
+      // retain their normal transcript selection/fallback behavior.
+      const label = /^( *)(In(?:\[[^\]]*\])?:)/.exec(stripTerminalSequences(lines[1] ?? ""));
+      if (label) {
+        const left = label[1].length;
+        const right = Math.min(options.width, left + label[2].length);
+        if (right > left) this.inputLabels.push({ top: top + 1, left, right, expanded: options.mode === "expanded" });
+      }
+    }
     if (scrollable && options.mode === "fullscreen" && maximum > 1) {
       // The gutter belongs to transcript navigation, not the box viewport.
       // Derive bounds from the painted fence so custom labels, ANSI styling,
@@ -54,6 +72,7 @@ export class NotebookBoxLayout {
 /** Width-aware, mouse-scrollable tool component. Regular mode keeps terminal scrollback. */
 export class NotebookComponent implements Component {
   private regions: ScrollRegion[] = [];
+  private inputLabels: InputLabelRegion[] = [];
   private cached?: {
     width: number;
     renderKey: unknown;
@@ -63,6 +82,8 @@ export class NotebookComponent implements Component {
     callCode: string | undefined;
     resultOwnsInput: boolean | undefined;
     scrollRevision: number | undefined;
+    inputExpanded: boolean | undefined;
+    inputExpansionBase: boolean | undefined;
     lines: string[];
   };
   constructor(
@@ -84,12 +105,15 @@ export class NotebookComponent implements Component {
         cached.viewStartLine === this.state.viewStartLine &&
         cached.callCode === this.state.callCode &&
         cached.resultOwnsInput === this.state.resultOwnsInput &&
-        cached.scrollRevision === this.state.scrollRevision) {
+        cached.scrollRevision === this.state.scrollRevision &&
+        cached.inputExpanded === this.state.inputExpanded &&
+        cached.inputExpansionBase === this.state.inputExpansionBase) {
       return cached.lines;
     }
     const layout = new NotebookBoxLayout(this.state);
     const lines = this.build(width, layout);
     this.regions = layout.regions;
+    this.inputLabels = layout.inputLabels;
     // Snapshot after build: rendering may resolve already-cached highlights.
     this.cached = {
       width, renderKey, lines,
@@ -99,6 +123,8 @@ export class NotebookComponent implements Component {
       callCode: this.state.callCode,
       resultOwnsInput: this.state.resultOwnsInput,
       scrollRevision: this.state.scrollRevision,
+      inputExpanded: this.state.inputExpanded,
+      inputExpansionBase: this.state.inputExpansionBase,
     };
     return lines;
   }
@@ -106,6 +132,17 @@ export class NotebookComponent implements Component {
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     // Preserve transcript selection/clicks and let unhandled events reach the
     // outer ScrollView. Ctrl+o remains the keyboard path to the complete cell.
+    if (event.type === "click" && event.button === "left" && !event.shift && !event.alt && !event.ctrl) {
+      const label = this.inputLabels.find((region) =>
+        event.y === region.top && event.x >= region.left && event.x < region.right,
+      );
+      if (!label) return undefined;
+      label.expanded = !label.expanded;
+      this.state.inputExpanded = label.expanded;
+      this.invalidate();
+      this.redraw?.();
+      return { handled: true, render: true };
+    }
     if (event.type !== "wheel" || !event.wheelDelta) return undefined;
     const region = this.regions.find((box) =>
       event.x >= box.left && event.x < box.right && event.y >= box.top && event.y < box.bottom,

@@ -60,6 +60,9 @@ export interface NotebookRenderState {
   scrollPositions?: Record<string, number>;
   /** Changes only when this tool row scrolls; unrelated history stays warm. */
   scrollRevision?: number;
+  /** Local In-label toggle; reset when Pi's global expansion changes. */
+  inputExpanded?: boolean;
+  inputExpansionBase?: boolean;
   /** Call previews yield to the partial/final input box at paint time. */
   resultOwnsInput?: boolean;
   callCode?: string;
@@ -289,6 +292,15 @@ export function buildExecutingCodeLines(
   return lines;
 }
 
+/** In labels expand independently; Ctrl+o / Out clicks remain authoritative on a mode change. */
+function inputViewportMode(expanded: boolean, state: NotebookRenderState): ViewportMode {
+  if (state.inputExpansionBase !== expanded) {
+    state.inputExpanded = undefined;
+    state.inputExpansionBase = expanded;
+  }
+  return currentViewportMode(state.inputExpanded ?? expanded);
+}
+
 /**
  * Partial-frame component for exec-like tools: the static executing-code view
  * (width-independent, as before) plus the LIVE Out box, which IS width-aware —
@@ -312,7 +324,7 @@ function renderExecutingFrame(
     const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
     const opts = { width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const };
     const lines = layout.box("input", bodyLineCount(code), {
-      ...opts, viewStart: state.viewStartLine,
+      ...opts, mode: inputViewportMode(expanded, state), viewStart: state.viewStartLine,
       highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
     }, (options) => renderInCell(code, options));
     if (details.activeTool) lines.push(theme.fg("muted", `· calling ${details.activeTool}()`));
@@ -357,7 +369,7 @@ export function renderNotebookCall(
     if (!source.trim()) return lines;
     lines.push(...layout.box("input", bodyLineCount(source), {
       width: options?.width ?? width,
-      mode: currentViewportMode(false),
+      mode: inputViewportMode(false, state),
       followTail: true,
       cellNumber: null,
       theme,
@@ -390,7 +402,7 @@ function renderExecCompleted(
     const labelBackground = result.isError ? "toolErrorBg" as const : "toolSuccessBg" as const;
     const base = { ...opts, width, cellNumber, labelBackground };
     const lines = layout.box("input", bodyLineCount(code), {
-      ...base, highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
+      ...base, mode: inputViewportMode(expanded, state), highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
     }, (options) => renderInCell(code, options));
     lines.push("");
     lines.push(...layout.box("output", bodyLineCount(text), { ...base, viewStart: 1, outputStyle },
@@ -433,7 +445,7 @@ function renderWriteCompleted(
   const source = details.cellSource;
   if (source === undefined) return renderFallback(result, theme);
   return new NotebookComponent((width, layout) => {
-    const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: null };
+    const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: null, mode: inputViewportMode(expanded, state) };
     const oldSource = details.oldCellSource;
     if (details.replaced && oldSource !== undefined) {
       if (!source.trim()) return layout.box("input", bodyLineCount(oldSource), opts,
@@ -457,7 +469,7 @@ function renderDeleteCompleted(
   return new NotebookComponent((width, layout) => {
     const source = details.cellSource ?? "(source unavailable)";
     return layout.box("input", bodyLineCount(source), {
-      ...boxOptions(details, expanded, theme, state), width, cellNumber: details.n,
+      ...boxOptions(details, expanded, theme, state), width, cellNumber: details.n, mode: inputViewportMode(expanded, state),
     }, (options) => renderDeletedCell(source, options));
   }, state, redraw, () => currentViewportMode(expanded));
 }
@@ -501,7 +513,7 @@ function renderReadOneCompleted(
     if (!cell) return [theme.fg("muted", "(no cell)")];
     const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: cell.executionCount };
     const lines = layout.box("input", bodyLineCount(cell.source), {
-      ...opts, highlightLines: cell.cellType === "code" ? renderHighlights(cell.source, undefined, theme, state, redraw) : undefined,
+      ...opts, mode: inputViewportMode(expanded, state), highlightLines: cell.cellType === "code" ? renderHighlights(cell.source, undefined, theme, state, redraw) : undefined,
     }, (options) => renderInCell(cell.source, options));
     if (cell.outputText) {
       lines.push(...layout.box("output", bodyLineCount(cell.outputText), { ...opts, viewStart: 1 },
