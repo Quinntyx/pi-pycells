@@ -85,6 +85,48 @@ test("code and output ANSI resets restore the tool background instead of leaving
   }
 });
 
+test("named input previews use a compact bold tool-title header and clamp to pane width", () => {
+  const theme = {
+    ...THEME,
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+    fg: (color, text) => color === "toolTitle" ? `\x1b[34m${text}\x1b[39m` : text,
+  };
+  for (const name of ["exec_cell", "scratch_run", "write_cell"]) {
+    const state = {};
+    const options = { toolName: name };
+    const pending = renderNotebookCall(undefined, options, theme, { state });
+    assert.deepEqual(pending.render(80).map(stripAnsi), [` ${name}`]);
+    assert.ok(pending.render(80)[0].includes(`\x1b[34m\x1b[1m${name}`));
+    const call = renderNotebookCall("print(1)", options, theme, { state });
+    const painted = call.render(80);
+    const lines = painted.map(stripAnsi);
+    assert.equal(lines[0], ` ${name}`);
+    assert.equal(labelRow(lines, "In[ ]:"), 2);
+    assert.strictEqual(call.render(80), painted, "unchanged titled previews retain the row cache");
+    state.resultOwnsInput = true;
+    const titleOnly = call.render(80);
+    assert.deepEqual(titleOnly.map(stripAnsi), [` ${name}`], "only the box transfers to the result");
+    assert.strictEqual(call.render(80), titleOnly, "historical headers retain the row cache");
+    for (const width of [0, 1, 5, 8, 80]) {
+      assert.ok(call.render(width).every((line) => visibleWidth(line) <= width));
+    }
+  }
+});
+
+test("named call headers stay outside the input box wheel region", () => {
+  setNotebookTuiModeProvider(() => "fullscreen");
+  try {
+    const call = renderNotebookCall(source.join("\n"), { toolName: "exec_cell" }, THEME, { state: {} });
+    const lines = call.render(80).map(stripAnsi);
+    assert.equal(lines[0], " exec_cell");
+    assert.equal(call.handleMouse(wheel(0, -3)), undefined, "the title scrolls the transcript");
+    const inputRow = labelRow(lines, "In[ ]:");
+    assert.equal(call.handleMouse({ ...wheel(inputRow, -3), x: 1 }), undefined, "the gutter scrolls the transcript");
+    assert.ok(call.handleMouse(wheel(inputRow, -3))?.handled);
+    assert.ok(call.render(80).some((line) => stripAnsi(line).includes("line_29 =")));
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
 test("the first partial result replaces the argument preview in Pi's call-then-result paint order", () => {
   const state = {};
   const context = { state };
@@ -432,7 +474,7 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
   try {
     const definition = {
       renderShell: "self",
-      renderCall: (args, theme, context) => renderNotebookCall(args.code, undefined, theme, context),
+      renderCall: (args, theme, context) => renderNotebookCall(args.code, { toolName: "exec_cell" }, theme, context),
       renderResult: (value, options, theme, context) => renderNotebookResult("exec_cell", value, options, theme, context),
     };
     const host = new ToolExecutionComponent("exec_cell", "renderer-regression", { code: source.join("\n") }, {}, definition,
@@ -440,6 +482,8 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     host.setArgsComplete();
     host.markExecutionStarted();
     assert.equal(host.render(80).map(stripAnsi).filter((line) => /^ In/.test(line)).length, 1);
+    assert.equal(host.render(80).map(stripAnsi).filter((line) => line.trim() === "exec_cell").length, 1);
+    assert.ok(!host.handleMouse(wheel(0, -3))?.handled, "header wheel events propagate to transcript scrolling");
     host.updateResult(result({ userCode: source, liveOutput: output.slice(0, 12) }), true);
     let lines = host.render(80).map(stripAnsi);
     assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1);
@@ -456,6 +500,7 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1);
     assert.ok(lines.some((line) => /^ In\[43\]:/.test(line)));
     assert.ok(!lines.some((line) => /^ In\[ \]:/.test(line)));
+    assert.equal(lines.filter((line) => line.trim() === "exec_cell").length, 1);
     assert.ok(lines.some((line) => line.includes("line_6 =")));
     assert.ok(redraws > 0);
     const lightFrame = host.render(80);

@@ -91,12 +91,12 @@ interface PartialRenderContext {
  */
 
 /** Source-bearing tools share the same streaming input preview. */
-function notebookCallRenderer(argument: "code" | "source") {
+function notebookCallRenderer(toolName: string, argument: "code" | "source") {
   return (args: unknown, theme: Theme, context?: PartialRenderContext): Component => {
     const value = typeof args === "object" && args !== null
       ? (args as Record<string, unknown>)[argument]
       : undefined;
-    return renderNotebookCall(typeof value === "string" ? value : undefined, undefined, theme, context);
+    return renderNotebookCall(typeof value === "string" ? value : undefined, { toolName }, theme, context);
   };
 }
 
@@ -1159,7 +1159,7 @@ function execCellTool(
       }
     },
     renderShell: "self",
-    renderCall: notebookCallRenderer("code"),
+    renderCall: notebookCallRenderer("exec_cell", "code"),
     renderResult: notebookResultRenderer("exec_cell"),
   });
 }
@@ -1276,7 +1276,7 @@ function scratchRunTool(
       }
     },
     renderShell: "self",
-    renderCall: notebookCallRenderer("code"),
+    renderCall: notebookCallRenderer("scratch_run", "code"),
     renderResult: notebookResultRenderer("scratch_run"),
   });
 }
@@ -1357,7 +1357,7 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
       }
     },
     renderShell: "self",
-    renderCall: notebookCallRenderer("source"),
+    renderCall: notebookCallRenderer("write_cell", "source"),
     renderResult: notebookResultRenderer("write_cell"),
   });
 }

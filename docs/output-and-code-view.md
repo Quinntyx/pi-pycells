@@ -38,6 +38,12 @@ Every executed cell is appended to the kernel's `.ipynb`, and the full (uncollap
 
 ### Cell boxes: preview, streaming, and completion
 
+`exec_cell`, `scratch_run`, and `write_cell` each show a compact, bold tool-name
+header in the theme's `toolTitle` color, styled like pi-tool-display. It appears
+before arguments arrive and remains through streaming and completion, without
+repeating the name above the Out box. Headers and label gutters leave wheel
+scrolling to the transcript; only the fenced boxes capture it.
+
 `src/execution/notebook-render.ts` uses the pure geometry in `src/execution/cell-view.ts` for every cell phase. Pi retains separate call and result components, so the argument preview yields at paint time as soon as a result owns the input box. Completion updates the pending `In[ ]:` to the runtime's actual execution count; notebook positions are never substituted for execution counts. Writes remain `In[ ]:` until executed, and scratch execution uses unnumbered `In:` / `Out:` labels.
 
 The input and output fences align across one-, two-, and three-digit counts. Labels sit one column in from the transcript edge. The normal pending/success/error tool-call background covers every row across the full box width; ANSI resets in highlighted code or output restore that background. Counts beyond 999 grow the gutter safely rather than overflowing it.

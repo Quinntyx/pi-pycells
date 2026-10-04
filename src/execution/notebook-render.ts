@@ -21,7 +21,7 @@
  *   wheel-scroll window; regular mode retains terminal scrollback.
  */
 
-import { Text, type Component } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { NotebookComponent } from "./notebook-component";
 import { cachedCellHighlights, cellHighlightKey, highlightCellCode, reuseCellHighlights, StreamingCellHighlights } from "./code-highlight";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -337,7 +337,7 @@ function renderExecutingFrame(
 // call never shows a raw/truncated argument dump.
 export function renderNotebookCall(
   code: string | undefined,
-  options: { width?: number } | undefined,
+  options: { width?: number; toolName?: string } | undefined,
   theme: Theme,
   context?: NotebookRenderContext,
 ): Component {
@@ -347,10 +347,15 @@ export function renderNotebookCall(
     // Pi retains both call and result components. Read shared state at PAINT
     // time (after both renderer callbacks), so even the first result replaces
     // this preview without a duplicate or an extra invalidation round.
-    if (state.resultOwnsInput) return [];
+    // Keep one compact, pi-tool-display-style title in the call component.
+    // Only the input box transfers to the result component during execution.
+    const lines = options?.toolName
+      ? [truncateToWidth(` ${theme.fg("toolTitle", theme.bold?.(options.toolName) ?? options.toolName)}`, width)]
+      : [];
+    if (state.resultOwnsInput) return lines;
     const source = code ?? "";
-    if (!source.trim()) return [];
-    return layout.box("input", bodyLineCount(source), {
+    if (!source.trim()) return lines;
+    lines.push(...layout.box("input", bodyLineCount(source), {
       width: options?.width ?? width,
       mode: currentViewportMode(false),
       followTail: true,
@@ -358,7 +363,8 @@ export function renderNotebookCall(
       theme,
       labelBackground: "toolPendingBg",
       highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate, true),
-    }, (opts) => renderInCell(source, opts), 0, true);
+    }, (opts) => renderInCell(source, opts), lines.length, true));
+    return lines;
   }, state, context?.invalidate, () => currentViewportMode(false));
 }
 // Completed frames, per op

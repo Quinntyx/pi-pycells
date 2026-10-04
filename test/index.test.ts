@@ -949,9 +949,11 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
           { requestRender() {} }, process.cwd());
         const paint = () => host.render(80).map(stripAnsi);
         assert.equal(paint().filter((line) => /^ In/.test(line)).length, 0);
+        assert.equal(paint().filter((line) => line.trim() === name).length, 1, "title is visible before arguments arrive");
         for (const code of ["first = 1", "first = 1\nsecond = 2"]) {
           host.updateArgs({ session_id: "s1", at: 2, [field]: code });
           const lines = paint();
+          assert.equal(lines.filter((line) => line.trim() === name).length, 1);
           assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "input previews must stream before execution");
           assert.ok(lines.some((line) => line.includes(code.split("\n").at(-1))));
         }
@@ -967,6 +969,7 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
           host.updateResult({ content: [], details: { liveOutput: ["starting"] } }, true);
           assert.ok(paint().some((line) => line.includes("stream_line_")), "progress retains the streamed input");
           assert.equal(paint().filter((line) => /^ In/.test(line)).length, 1);
+          assert.equal(paint().filter((line) => line.trim() === name).length, 1, "title survives execution progress");
         }
         const details = name === "write_cell"
           ? { cellSource: code, cellType: "code", replaced: false, at: 2 }
@@ -974,6 +977,7 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
         host.updateResult({ content: [{ type: "text", text: "done" }], details }, false);
         lines = paint();
         assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "result replaces the streaming preview");
+        assert.equal(lines.filter((line) => line.trim() === name).length, 1, "title survives completion without duplication");
       });
     }
   } finally {
