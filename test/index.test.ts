@@ -1182,6 +1182,44 @@ test("failed exec_cell tool results receive terminal telemetry", async () => {
   }
 });
 
+test("provision_dependency rejects nested installers before resolving or spawning", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("nested installer spawned a process"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+    resolvePythonExecutable() { throw new Error("nested installer resolved Python"); },
+  };
+  const restore = restoreInjectedModules(sandbox);
+  const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+  const previousToken = process.env.PI_SUBAGENTS_PARENT_TOKEN;
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const dependency = registered.find((tool) => tool.name === "provision_dependency");
+    for (const [depth, token] of [["1", undefined], ["0", "inherited-parent"]]) {
+      process.env.PI_SUBAGENT_DEPTH = depth;
+      if (token === undefined) delete process.env.PI_SUBAGENTS_PARENT_TOKEN;
+      else process.env.PI_SUBAGENTS_PARENT_TOKEN = token;
+      const result = await dependency.execute("nested-dependency", { package: "pi-subagents", session_id: "missing" });
+      assert.equal(result.isError, true);
+      assert.equal(result.details.error, "nested-dependency-install-blocked");
+      assert.match(result.content[0].text, /root agent.*provision dependencies/);
+      assert.doesNotMatch(result.content[0].text, /Unknown python session/);
+    }
+  } finally {
+    if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+    else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    if (previousToken === undefined) delete process.env.PI_SUBAGENTS_PARENT_TOKEN;
+    else process.env.PI_SUBAGENTS_PARENT_TOKEN = previousToken;
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
 test("provision_dependency does not treat spawn failures as successful installs", async () => {
   const sandbox = {
     async cleanup() {},

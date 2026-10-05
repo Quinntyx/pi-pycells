@@ -416,6 +416,17 @@ export function provisionDependencyTool(
         return { content: [{ type: "text", text: "provision_dependency requires a package name." }], details: {} };
       }
 
+      if (isNestedSubagent()) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: "Nested subagents reuse the parent's interpreter and cannot install dependencies. Ask the root agent to provision dependencies before launching the workflow.",
+          }],
+          details: { package: packageName.trim(), error: "nested-dependency-install-blocked" },
+        };
+      }
+
       // Target resolution: explicit kernel → its env (pinned venv or shared);
       // no id → most recently used kernel; no live kernels → shared env.
       let targetPython: string;
