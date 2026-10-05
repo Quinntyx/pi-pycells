@@ -28,6 +28,8 @@ metadata:
   1. Root depth is 0, child depth 1, and grandchild depth 2; maximum 1 is flat.
   Read inherited root identity and immutable limits; never edit them to bypass
   admission. Imports remain legal at the maximum depth; only spawning is blocked.
+  Nested tasks also require explicit delegated fuel and remaining levels from
+  their parent; absent authorization or fuel makes the assignment a leaf.
 - A loaded runtime that passes the Stage 3 compatibility preflight. Repository
   documentation, installed skills, and an imported Python module may differ;
   a skill edit does not upgrade the runtime.
@@ -71,6 +73,9 @@ metadata:
    Leave root headroom for authorized descendants; a parent waiting on children
    still occupies a live window. Saturated root admission fails fast, not by
    queueing indefinitely until that same parent releases capacity.
+   Before any nested dispatch, verify parent authorization and allocated B/L
+   under Delegation authorization and fuel. At the root, record finite total fuel;
+   in a child, never derive fresh fuel from C, ready-work headroom, or root limits.
 3. Decompose the objective into small bounded deliverables. Record each task's
    identity, ownership, dependencies, prompt contract, checks, and timeout. Keep
    task duration bounded enough that completions can release useful work promptly.
@@ -298,6 +303,46 @@ metadata:
   There is no cross-process pi-sock child snapshot relay. Do not add descendant
   estimates to local totals or describe this feed as a root-wide telemetry view.
 
+# Delegation authorization and fuel
+
+- In a nested orchestrator, inherited maximum depth is capability, not permission.
+  Require explicit parent authorization plus `delegation_jobs_remaining` (B) and
+  `delegation_levels_remaining` (L), both nonnegative integers, in the task prompt.
+  Missing authorization, missing/invalid budgets, B=0, or L=0 means no delegation:
+  complete the assigned bounded work locally or report blocked to the owner.
+- The root derives finite B from its approved work plan and records it in the
+  notebook ledger. L cannot exceed the unused inherited depth, maximum minus
+  current depth. Leaves receive B=0 and L=0 and an explicit no-spawning instruction.
+  A child never invents a fresh allowance merely because capacity is available.
+- For each child, reserve one unit for its task plus its allocated B_child from
+  the parent's remaining B. The sum of all reserved child allocations must not
+  exceed that remaining B. Set L_child at most L-1 and at most the child's unused
+  inherited depth. Zero remaining levels always makes the next assignment a leaf.
+- Count every child-task submission, retry, and scheduled continuation against B,
+  even when reusing a retained session; do not refund failed or cancelled work.
+  Unspent allowances do not become duplicate grants to siblings. Keep one owner
+  and ledger per subtree. A continuation preserves spent fuel and round counts.
+- Put each child's explicit authorization, allocated B and L, deadline, round cap,
+  scope, acceptance checks, stop condition, and report destination in its prompt.
+  Mirror the budgets in task metadata for accounting, but metadata alone does not
+  teach a child its contract. Require authorized orchestrators to load this skill;
+  leaf tasks must not spawn even when the process-wide depth permits it.
+- Delegate only a strictly narrower independently verifiable deliverable. Do not
+  recursively hand down the enclosing objective unchanged or delegate delegation.
+  Return accepted evidence or a blocker to the immediate owner, then stop.
+- The ready-work target around 3C does not create delegation fuel or permission.
+  Child deadlines cannot exceed the parent's or the remaining root deadline;
+  retries and review loops also obey the declared finite round cap.
+- Preserve the ledger across cells and continuations. After kernel loss, recover
+  it from recorded submissions and outcomes; if recovery is uncertain, block new
+  delegation rather than replenishing spent fuel. Pool creation is not a reset.
+- Never bypass exhaustion through manual Pi/tmux launches, new root identities,
+  depth resets, changed limits, source swaps, or a fresh kernel. At a boundary,
+  stop spawning, finish allowed local work, and report the limit to the owner.
+- B, L, and authorization are orchestration policy, not extra runtime-enforced
+  capabilities. Runtime depth and immutable root admission/deadline limits remain
+  the hard backstop; do not describe prompt-only fuel as a security boundary.
+
 # Prompt contracts
 
 - Give each task one bounded deliverable and a concrete stop condition. Split
@@ -314,6 +359,9 @@ metadata:
   unless their task explicitly authorizes bounded recursion within the inherited
   depth policy, root live-window budget, admission cap, and deadline. Assign each
   subtree an owner; keep integration gates and the primary voice in the root.
+  Include explicit delegated B/L and the monotone allocation rules. Require
+  authorized child orchestrators to load this skill before creating any pool;
+  expressly forbid spawning in leaf assignments.
 - Supply only relevant context and exact paths. Require evidence with paths/lines,
   checks performed or not run, assumptions, blockers, risks, and parent follow-ups.
 - Require bounded completion or a blocker report, not waiting for another agent.

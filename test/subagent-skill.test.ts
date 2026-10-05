@@ -358,3 +358,34 @@ test("recursive policy preserves flat default, shared live admission, and local 
     /primary voice in the root/i,
   ]);
 });
+
+test("nested authorization and decreasing fuel prevent depth, fanout, and continuation loops", () => {
+  concepts(section("Delegation authorization and fuel"), [
+    /capability, not permission/i,
+    /explicit parent authorization/i,
+    /delegation_jobs_remaining.*delegation_levels_remaining/i,
+    /missing.authorization.*missing.invalid budgets.*B=0.*L=0 means no delegation/i,
+    /finite B from its approved work plan/i,
+    /leaves receive B=0 and L=0/i,
+    /task plus its allocated B_child/i,
+    /sum of all reserved child allocations.*not exceed/i,
+    /L_child at most L-1/i,
+    /submission, retry, and scheduled continuation against B/i,
+    /do not refund failed or cancelled work/i,
+    /continuation preserves spent fuel and round counts/i,
+    /metadata alone does not teach a child/i,
+    /orchestrators to load this skill/i,
+    /strictly narrower independently verifiable deliverable/i,
+    /enclosing objective unchanged/i,
+    /3C does not create delegation fuel or permission/i,
+    /child deadlines cannot exceed the parent's/i,
+    /if recovery is uncertain, block new delegation/i,
+    /manual Pi.tmux launches, new root identities/i,
+    /not extra runtime-enforced capabilities/i,
+    /hard backstop/i,
+  ]);
+  concepts(stage(1, "Prepare"), [/parent authorization and allocated B.L/i, /finite total fuel/i]);
+  concepts(section("Prompt contracts"), [/delegated B.L/i, /before creating any pool/i,
+    /forbid spawning in leaf assignments/i]);
+  assert.ok(skill.split(/\r?\n/).length <= 500, "canonical skill stays below 500 lines");
+});
