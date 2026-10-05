@@ -24,6 +24,10 @@ metadata:
   shared by pools in this process. Read it without changing the environment. If
   unset, use the library default of 8; reject invalid or non-positive values as
   workflow policy rather than silently accepting the runtime's fallback/clamp.
+- Recursion requires explicit task authorization and `PI_SUBAGENTS_MAX_DEPTH` above
+  1. Root depth is 0, child depth 1, and grandchild depth 2; maximum 1 is flat.
+  Read inherited root identity and immutable limits; never edit them to bypass
+  admission. Imports remain legal at the maximum depth; only spawning is blocked.
 - A loaded runtime that passes the Stage 3 compatibility preflight. Repository
   documentation, installed skills, and an imported Python module may differ;
   a skill edit does not upgrade the runtime.
@@ -62,7 +66,11 @@ metadata:
    name. Tasks and handoffs must identify the baseline they actually inspected.
 2. Read C from `PI_SUBAGENTS_MAX_CONCURRENT`. Use pool concurrency at most C; use
    `AgentPool()` to inherit the library ceiling unless a smaller limit is needed.
-   Do not equate a queued roster with active concurrency.
+   Do not equate a queued roster with active concurrency. For recursive work,
+   record the shared root live-window cap, admission count cap, and deadline.
+   Leave root headroom for authorized descendants; a parent waiting on children
+   still occupies a live window. Saturated root admission fails fast, not by
+   queueing indefinitely until that same parent releases capacity.
 3. Decompose the objective into small bounded deliverables. Record each task's
    identity, ownership, dependencies, prompt contract, checks, and timeout. Keep
    task duration bounded enough that completions can release useful work promptly.
@@ -265,6 +273,31 @@ metadata:
   hard-coded model. `agent_dir_defaults()` describes the default directory, not
   a per-task agentDir override; inspect that override's settings separately.
 
+# Recursive admission and scope
+
+- Recursion is opt-in: maximum depth 1 is flat; maximum 2 permits grandchildren,
+  and maximum 3 permits one more generation. Parse depths as nonnegative integers
+  and limits as positive integers; malformed values must fail rather than bypass.
+- C remains per process. All kernels and descendants of the same root share
+  `PI_SUBAGENTS_ROOT_MAX_CONCURRENT`, default C, as a live-window cap. Independent
+  workflows from the same primary voice share immutable root limits and deadline.
+- `PI_SUBAGENTS_ROOT_MAX_TASKS`, default 512, counts window admissions and dormant
+  reopens, not every conversation turn. `PI_SUBAGENTS_ROOT_TIMEOUT`, default 1800
+  seconds, bounds root admission and waits; it is not a fresh deadline per child.
+- Failed retained windows stay charged until explicit close confirms termination.
+  Never reclaim capacity merely because a Python launcher exited. Successful
+  validated dormancy releases live resources; failure is not successful dormancy.
+- Parent-await-child saturation fails fast. Account for it as a blocked or failed
+  unit; do not enlarge inherited limits, wait indefinitely, or automatically retry.
+- Children reuse the existing inherited interpreter and source; tmux requires
+  explicit child environment forwarding. No nested installer, bootstrap lock,
+  interpreter fallback, or source swap is allowed. Incompatibility blocks dispatch.
+- Cancel and close terminate owned descendants recursively, never the caller or
+  unrelated panes. Retain the owning failure window for inspection until close.
+- PTC subscribers receive local kernel snapshots with session and root identity.
+  There is no cross-process pi-sock child snapshot relay. Do not add descendant
+  estimates to local totals or describe this feed as a root-wide telemetry view.
+
 # Prompt contracts
 
 - Give each task one bounded deliverable and a concrete stop condition. Split
@@ -277,8 +310,10 @@ metadata:
   acceptance evidence with reasons. A blocked report can be a valid task response
   without completing its objective; the parent must not release downstream gates.
   Report handoff identity through checkout/baseline and changed path/artifact digests.
-- Instruct writers not to edit another owner's files; instruct all agents not to
-  spawn subagents. Keep scheduling and integration decisions in the parent.
+- Instruct writers not to edit another owner's files. Agents must not spawn subagents
+  unless their task explicitly authorizes bounded recursion within the inherited
+  depth policy, root live-window budget, admission cap, and deadline. Assign each
+  subtree an owner; keep integration gates and the primary voice in the root.
 - Supply only relevant context and exact paths. Require evidence with paths/lines,
   checks performed or not run, assumptions, blockers, risks, and parent follow-ups.
 - Require bounded completion or a blocker report, not waiting for another agent.
@@ -331,7 +366,8 @@ metadata:
   name. A user renaming the tmux session must not invalidate its placement.
 - `await handle` / `handle.wait(timeout)` obtains its outcome or raises its error.
   `handle.cancel()` removes queued work or requests abort of a starting/running
-  turn; startup observes cancellation even before a session is retained. It
+  turn; startup observes cancellation even before a session is retained. Recursive
+  cancellation also terminates owned descendants, not unrelated panes. It
   returns false for already-terminal work, not cancellation of a later follow-up;
   cancel the new continuation handle instead. Cancellation does not unload a
   retained session, close the pool, or interrupt unrelated tasks. A cell interrupt

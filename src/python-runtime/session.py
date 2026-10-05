@@ -54,10 +54,40 @@ import builtins as _ptc_builtins
 
 # The subagent bridge: pi_subagents detects PTC_STATE_EMIT in builtins and
 # forwards its runtime snapshots through the RPC pipe as subagent_state frames.
-_ptc_builtins.PTC_STATE_EMIT = lambda snapshot: _emit_protocol({
-    "type": "subagent_state",
-    "snapshot": snapshot,
-})
+def _ptc_emit_subagent_state(snapshot):
+    # This frame describes this kernel's registry only, not remote descendants.
+    scoped = dict(snapshot)
+    scoped["rootId"] = _ptc_os.environ.get("PI_SUBAGENTS_ROOT_ID")
+    scoped["parentToken"] = _ptc_os.environ.get("PI_SUBAGENTS_PARENT_TOKEN")
+    scoped["scope"] = "process"
+    _emit_protocol({"type": "subagent_state", "snapshot": scoped})
+
+
+_ptc_builtins.PTC_STATE_EMIT = _ptc_emit_subagent_state
+
+
+def _ptc_export_subagent_runtime():
+    """Expose actual interpreter/source for explicit tmux child env forwarding.
+
+    Never install or import the optional library just to discover its source.
+    The launcher must copy these vars with tmux -e; tmux does not inherit this
+    Python process's environment automatically.
+    """
+    import importlib.util as _ptc_importlib_util
+    from pathlib import Path as _ptc_Path
+
+    _ptc_os.environ["PTC_PYTHON_EXECUTABLE"] = _ptc_sys.executable
+    spec = _ptc_importlib_util.find_spec("pi_subagents")
+    if spec is None or not spec.origin:
+        return
+    module_path = _ptc_Path(spec.origin).resolve()
+    for parent in module_path.parents:
+        if (parent / "pyproject.toml").is_file():
+            _ptc_os.environ["PTC_SUBAGENTS_SOURCE"] = str(parent)
+            return
+
+
+_ptc_export_subagent_runtime()
 
 _cell_counter = 0
 # Live notebook artifact: provision_kernel passes the .ipynb path on every exec

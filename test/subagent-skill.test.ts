@@ -334,3 +334,27 @@ test("current dev notebook APIs preserve review and separate deliberate cleanup"
   assert.doesNotMatch(skill, /(?:confirm|review)\s*=\s*(?:true|True)/);
   assert.doesNotMatch(skill, /\.(?:ok|unwrap)\b/);
 });
+
+test("recursive policy preserves flat default, shared live admission, and local telemetry scope", () => {
+  concepts(section("Recursive admission and scope"), [
+    /opt-in/i, /maximum depth 1 is flat/i, /maximum 2 permits grandchildren/i,
+    /maximum 3/i, /C remains per process/i, /all kernels and descendants/i,
+    /live-window cap/i, /same primary voice/i, /immutable root limits and deadline/i,
+    /window admissions and dormant reopens, not every conversation turn/i,
+    /bounds root admission and waits/i, /failed retained windows stay charged/i,
+    /launcher exited/i, /parent-await-child saturation fails fast/i,
+    /existing inherited interpreter and source/i, /explicit child environment forwarding/i,
+    /no nested installer/i, /incompatibility blocks dispatch/i,
+    /owned descendants recursively, never the caller or unrelated panes/i,
+    /no cross-process pi-sock child snapshot relay/i,
+    /do not add descendant estimates to local totals/i,
+  ]);
+  concepts(section("Input Contract"), [
+    /maximum 1 is flat/i, /imports remain legal at the maximum depth/i,
+    /only spawning is blocked/i, /never edit them to bypass admission/i,
+  ]);
+  concepts(section("Prompt contracts"), [
+    /must not spawn subagents unless their task explicitly authorizes bounded recursion/i,
+    /primary voice in the root/i,
+  ]);
+});

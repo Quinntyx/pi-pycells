@@ -60,6 +60,10 @@ export interface SubagentAgentRow {
   id: string;
   name: string;
   group?: string | null;
+  /** Optional admission identity; these rows remain owned by one local registry. */
+  rootId?: string | null;
+  parentToken?: string | null;
+  depth?: number;
   /** Exec id of the exec_cell cell this agent was spawned in. */
   execScope?: string | null;
   status: string;
@@ -115,6 +119,11 @@ export interface SubagentPoolState {
 }
 
 export interface SubagentRuntimeSnapshot {
+  /** Immutable root identity for correlation, not an aggregate descendant feed. */
+  rootId?: string | null;
+  parentToken?: string | null;
+  /** Snapshots/totals describe the emitting process only. */
+  scope?: "process";
   pid?: number;
   depth?: number;
   agents: SubagentAgentRow[];

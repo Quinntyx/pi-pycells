@@ -26,7 +26,7 @@ import {
   type PtcRecoveryState,
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
-import { ensurePtcVenv, resolvePiSubagentsSource, startSubagentsEnv } from "./subagents-env";
+import { ensurePtcVenv, inheritedSubagentsRuntime, isNestedSubagent, resolvePiSubagentsSource, startSubagentsEnv, subagentDepthPolicy } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { createRenderedCellReviewTool } from "./tools/cell-review";
 import { ToolRegistry } from "./tool-registry";
@@ -56,7 +56,6 @@ import type {
   CodeExecutionResult,
   NotebookCellSummary,
   NotebookRunResult,
-  PythonSessionManagerHooks,
   SessionSummary,
 } from "./contracts/execution-types";
 
@@ -462,7 +461,7 @@ export function provisionDependencyTool(
         ];
         // Pinned venvs are created bare: bootstrap pi_subagents so pinned
         // kernels can orchestrate subagents just like the shared env.
-        if (pinned) {
+        if (pinned && !isNestedSubagent()) {
           const subagentsSource = resolvePiSubagentsSource();
           if (subagentsSource) {
             const bootstrap = await execFilePtc(
@@ -720,6 +719,25 @@ function provisionKernelTool(
       }
 
       try {
+        if (isNestedSubagent()) {
+          let requestedVersion = version;
+          if (!requestedVersion && source) {
+            const requested = source.trim();
+            let sourcePath = path.resolve(ctx.cwd, requested);
+            if (!path.isAbsolute(requested) && path.basename(requested) === requested) {
+              const candidates = path.extname(requested)
+                ? [path.join(sessionManager.resolveLibraryDir(), requested)]
+                : [path.join(sessionManager.resolveLibraryDir(), `${requested}.ipynb`), path.join(sessionManager.resolveLibraryDir(), `${requested}.py`)];
+              sourcePath = candidates.find((candidate) => fs.existsSync(candidate)) ?? sourcePath;
+            }
+            if (path.extname(sourcePath).toLowerCase() === ".ipynb") {
+              const document = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+              const pin = document.metadata?.language_info?.version;
+              if (typeof pin === "string") requestedVersion = pin.match(/^\d+\.\d+/)?.[0];
+            }
+          }
+          inheritedSubagentsRuntime(requestedVersion);
+        }
         const { id, sourcedFrom, sourceError, scriptError } = await sessionManager.provision({
           cwd: ctx.cwd,
           ctx,
@@ -1562,7 +1580,10 @@ function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManag
 const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-pycells:subagent-runtime");
 
 /** Snapshot shape published on globalThis for other extensions (see createSubagentRuntime). */
-interface SubagentRuntimeApi {
+export interface SubagentRuntimeApi {
+  /** Local-process fanout only; this is not cross-process socket telemetry. */
+  publish(sessionId: string, snapshot: SubagentRuntimeSnapshot): void;
+  dispose(): void;
   getSnapshot(): {
     sessions: Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }>;
     totals: { running: number; settled: number; failed: number };
@@ -1576,23 +1597,25 @@ interface SubagentRuntimeApi {
  * current per-session snapshots plus running/settled/failed totals, and a
  * listener subscription for snapshot updates.
  */
-function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRuntimeApi {
+export function createSubagentRuntime(sessionManager: Pick<PythonSessionManager, "allSubagentSnapshots">): SubagentRuntimeApi {
   const listeners = new Set<(payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void>();
 
-  const hooks: PythonSessionManagerHooks = {
-    onSubagentSnapshot: (sessionId, _execId, snapshot) => {
-      for (const listener of listeners) {
-        try {
-          listener({ sessionId, snapshot });
-        } catch {
-          // broken consumer must not take the runtime down
+  let disposed = false;
+  return {
+    publish(sessionId, snapshot) {
+      if (disposed) return;
+      for (const listener of [...listeners]) {
+        try { listener({ sessionId, snapshot }); } catch {
+          // A broken consumer must not prevent other subscribers receiving updates.
         }
       }
     },
-  };
-
-  return {
+    dispose() {
+      disposed = true;
+      listeners.clear();
+    },
     getSnapshot() {
+      if (disposed) return null;
       const sessions = sessionManager.allSubagentSnapshots();
       if (sessions.length === 0) {
         return null;
@@ -1606,8 +1629,8 @@ function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRu
       return { sessions, totals };
     },
     subscribe(listener: (payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+      if (!disposed) listeners.add(listener);
+      return () => { listeners.delete(listener); };
     },
   };
 }
@@ -1723,12 +1746,15 @@ function handleBeforeAgentStart(
   }
 
   // Depth-aware system prompt for subagent instances.
-  const depth = Number.parseInt(process.env.PI_SUBAGENT_DEPTH ?? "", 10);
-  if (Number.isFinite(depth) && depth > 0) {
+  const { depth, maxDepth } = subagentDepthPolicy();
+  if (depth > 0) {
     const depthNote =
-      `You are a pi subagent at nesting depth ${depth}. Subagent spawning is unavailable: ` +
-      "`import pi_subagents` raises NotImplementedError in this environment. `exec_cell` " +
-      "remains available for computation. Report your final answer as your last message.";
+      `You are a pi subagent at nesting depth ${depth} (maximum ${maxDepth}). ` +
+      "Importing pi_subagents remains legal, including at the depth boundary. " +
+      (depth < maxDepth
+        ? "Spawning is enabled by the opt-in depth policy, but requires explicit task authorization and shared root capacity; saturated root admission fails fast. "
+        : "Spawning is blocked at this depth boundary; the default maximum depth is 1 (flat). ") +
+      "exec_cell remains available for computation. Report your final answer as your last message.";
     result = { ...(result ?? {}), systemPrompt: `${result?.systemPrompt ?? event.systemPrompt}\n\n${depthNote}` };
   }
 
@@ -1830,6 +1856,9 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     lastCtx: context ?? null,
   };
 
+  // Retire the previous fanout before disposal can emit teardown snapshots.
+  const previousRuntime = (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] as SubagentRuntimeApi | undefined;
+  previousRuntime?.dispose?.();
   // Reload hygiene: an earlier extension instance's sessions die with it.
   const previousManager = (globalThis as Record<string, unknown>).__ptcPythonSessionManager as
     | { disposeAll(): Promise<void> }
@@ -1838,8 +1867,10 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     await previousManager.disposeAll().catch(() => undefined);
   }
 
+  let subagentRuntime: SubagentRuntimeApi | undefined;
   const sessionManager = new PythonSessionManager(sandboxManager, toolRegistry, settings, extensionRoot, {
-    onSubagentSnapshot: (_sessionId, execId, snapshot) => {
+    onSubagentSnapshot: (sessionId, execId, snapshot) => {
+      subagentRuntime?.publish(sessionId, snapshot);
       sessionState.lastSubagentSnapshot = snapshot;
       updateSubagentFooter(sessionState, settings, snapshot, execId);
     },
@@ -1850,14 +1881,20 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     },
   });
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;
-  (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = createSubagentRuntime(sessionManager);
+  subagentRuntime = createSubagentRuntime(sessionManager);
+  (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = subagentRuntime;
 
   // Provision the pi_subagents runtime in the background — but only when the
   // user opted in: subagents are OFF unless PI_SUBAGENTS_MAX_CONCURRENT is set
-  // to a positive number (which also becomes the global pool cap). An
+  // to a positive number (which also becomes the per-process pool cap). An
   // "optional" dependency that installs itself before you asked is just an
   // unrequested install; nothing downloads until you enable it.
-  if (subagentsProvisioningEnabled()) {
+  if (isNestedSubagent()) {
+    // tmux must explicitly forward the interpreter/source exported by the parent
+    // kernel. A child must never enter the bootstrap lock or run installers.
+    const result = await startSubagentsEnv({ extensionRoot });
+    if (result.status === "failed") console.warn(`[PTC] nested runtime unavailable: ${result.reason}`);
+  } else if (subagentsProvisioningEnabled()) {
     // Memoized and shared: the session manager's readiness gate awaits this
     // same promise before its first kernel spawn, so a first-install kernel
     // does not lock in system python3 while packages land in the venv.
@@ -1872,8 +1909,8 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
       }
       });
   } else {
-    // Spawned subagent window: the full pi_subagents sync is skipped, but
-    // kernels still need the shared venv (there is no system-python fallback).
+    // Root with orchestration disabled: only provision the notebook interpreter.
+    // Children took the validation-only branch above; never bootstrap them.
     void ensurePtcVenv().then((ok) => {
       if (!ok) {
         console.warn(
@@ -1922,5 +1959,8 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   (pi as unknown as { on(event: "context", handler: typeof onContext): void }).on("context", onContext);
   pi.on("tool_result", onToolResult);
   pi.on("agent_end", onAgentEnd);
-  pi.on("session_shutdown", onSessionShutdown);
+  pi.on("session_shutdown", async () => {
+    subagentRuntime?.dispose();
+    await onSessionShutdown();
+  });
 }

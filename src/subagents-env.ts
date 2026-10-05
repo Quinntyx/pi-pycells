@@ -40,7 +40,7 @@ import {
   writeFileSync,
   writeSync,
 } from "fs";
-import { dirname } from "path";
+import { dirname, isAbsolute, resolve, relative } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
 import { join } from "path";
@@ -108,6 +108,52 @@ function resolvePaths(options: SubagentsEnvOptions): Paths {
     logFile: join(cacheRoot, "subagents-sync.log"),
     stampFile: join(extensionRoot, ".ptc-subagents-sync.json"),
   };
+}
+
+/** Strict policy parsing: malformed depth must never turn a child into a root. */
+export function subagentDepthPolicy(env: NodeJS.ProcessEnv = process.env): { depth: number; maxDepth: number } {
+  const parse = (name: string, fallback: string, minimum: number): number => {
+    const text = env[name] ?? fallback;
+    const value = Number(text);
+    if (!/^\d+$/.test(text) || !Number.isSafeInteger(value) || value < minimum) {
+      throw new Error(`${name} must be a ${minimum ? "positive" : "nonnegative"} integer`);
+    }
+    return value;
+  };
+  return { depth: parse("PI_SUBAGENT_DEPTH", "0", 0), maxDepth: parse("PI_SUBAGENTS_MAX_DEPTH", "1", 1) };
+}
+
+export function isNestedSubagent(): boolean {
+  // Never reinterpret inherited child identity as flat/root bootstrap, even if
+  // someone lowers the local depth setting. Root admission validates the state.
+  return subagentDepthPolicy().depth > 0 || process.env.PI_SUBAGENTS_PARENT_TOKEN !== undefined;
+}
+
+/** Children reuse only the explicitly inherited runtime; no uv, sync, or locks. */
+export function inheritedSubagentsRuntime(requestedVersion?: string): SubagentsEnvResult {
+  const python = process.env.PTC_PYTHON_EXECUTABLE;
+  const source = process.env.PTC_SUBAGENTS_SOURCE;
+  if (!python || !isAbsolute(python) || !existsSync(python) || !source || !isAbsolute(source)) {
+    throw new Error("Nested PTC requires inherited absolute PTC_PYTHON_EXECUTABLE and PTC_SUBAGENTS_SOURCE; bootstrap is disabled in children");
+  }
+  const pkgDir = resolveSourceDir(source);
+  if (!pkgDir) throw new Error(`Inherited pi_subagents source is unavailable: ${source}`);
+  let info: { version: string; module: string };
+  try {
+    info = JSON.parse(execFileSync(python, ["-c",
+      "import sys,json,importlib.util,IPython; s=importlib.util.find_spec('pi_subagents'); print(json.dumps({'version':sys.version.split()[0], 'module':s.origin if s else None}))",
+    ], { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] }));
+  } catch {
+    throw new Error(`Inherited PTC interpreter is incompatible or unavailable: ${python}`);
+  }
+  const moduleRelative = info.module ? relative(resolve(pkgDir), resolve(info.module)) : "..";
+  if (moduleRelative === ".." || moduleRelative.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(moduleRelative)) {
+    throw new Error(`Inherited interpreter does not load pi_subagents from ${pkgDir}`);
+  }
+  if (requestedVersion && !(info.version === requestedVersion || info.version.startsWith(`${requestedVersion}.`))) {
+    throw new Error(`Nested PTC requested Python ${requestedVersion}, but inherited interpreter is Python ${info.version}; no fallback or provisioning is allowed`);
+  }
+  return { status: "ok", venvPython: python, editablePath: pkgDir, managed: false };
 }
 
 /** Pure: where the pip package lives inside a pi-subagents checkout. */
@@ -190,6 +236,7 @@ export function venvPythonPath(cacheRoot: string = defaultCacheRoot()): string {
  * to system python.
  */
 export function sharedVenvPythonPath(cacheRoot: string = defaultCacheRoot()): string {
+  if (isNestedSubagent()) return inheritedSubagentsRuntime().venvPython!;
   const versioned = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION, cacheRoot);
   if (existsSync(versioned)) return versioned;
   const legacy = process.platform === "win32"
@@ -212,6 +259,7 @@ export function versionedVenvPythonPath(version: string, cacheRoot: string = def
  * the host lacks that version). Used to honor .ipynb python pins.
  */
 export async function ensurePythonForVersion(version: string): Promise<string> {
+  if (isNestedSubagent()) return inheritedSubagentsRuntime(version).venvPython!;
   const cacheRoot = defaultCacheRoot();
   const python = versionedVenvPythonPath(version, cacheRoot);
   if (existsSync(python)) return python;
@@ -393,12 +441,14 @@ function releaseLock(paths: Paths): void {
 let envPromise: Promise<SubagentsEnvResult> | undefined;
 
 /**
- * Venv-only provisioning: create the shared CPython venv if missing, skipping
- * the pi_subagents clone/install. Used in spawned subagent windows
- * (PI_SUBAGENT_DEPTH set), where the full sync is skipped but kernels still
- * need their interpreter — no system-python fallback exists anymore.
+ * Root-only venv provisioning. Children validate their inherited existing
+ * interpreter/source without creating directories, taking locks, or installing.
  */
 export async function ensurePtcVenv(): Promise<boolean> {
+  if (isNestedSubagent()) {
+    inheritedSubagentsRuntime();
+    return true;
+  }
   const paths = resolvePaths({});
   if (existsSync(paths.venvPython)) return true;
   if (!hasCommand("uv")) return false;
@@ -447,6 +497,11 @@ export async function waitForSubagentsEnv(timeoutMs = 120_000): Promise<void> {
 export async function ensureSubagentsEnv(
   options: SubagentsEnvOptions = {},
 ): Promise<SubagentsEnvResult> {
+  try {
+    if (isNestedSubagent()) return inheritedSubagentsRuntime();
+  } catch (error) {
+    return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
+  }
   const paths = resolvePaths(options);
   mkdirSync(paths.cacheRoot, { recursive: true });
   const nowMs = options.now?.() ?? Date.now();

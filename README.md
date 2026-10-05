@@ -115,6 +115,18 @@ Cells can import `pi_subagents`, create an `AgentPool`, submit tasks to stages, 
 
 Agents share your current Pi configuration by default. Installing pi-pycells also installs and loads **pi-sock** (agent communication) and **pi-activity** (activity tracking API). No separate installation is needed in this case, and **pi-tool-tree is not required**. If your configuration already loads standalone copies of these extensions, disable those copies with `pi config` to avoid duplicate loading; keep the copies supplied by pi-pycells enabled.
 
+### Opt-in recursion
+
+The default `PI_SUBAGENTS_MAX_DEPTH=1` keeps orchestration flat: the root is depth 0 and its children are depth 1. Set `PI_SUBAGENTS_MAX_DEPTH=2` before starting Pi to permit grandchildren, or `3` to permit another generation. A task must still explicitly authorize nested work. Importing `pi_subagents` is legal at the maximum depth; only spawning is blocked. Depth must be a nonnegative integer and the maximum a positive integer; malformed values fail rather than bypass the policy.
+
+Recursive workflows share one root admission budget across all kernels and descendants. `PI_SUBAGENTS_MAX_CONCURRENT` remains a **per-process** cap. Immutable root limits are `PI_SUBAGENTS_ROOT_MAX_CONCURRENT` (live windows, default the process cap), `PI_SUBAGENTS_ROOT_MAX_TASKS` (window admissions/reopens, default 512, not all conversation turns), and `PI_SUBAGENTS_ROOT_TIMEOUT` (root deadline, default 1800 seconds, bounding admissions and waits). Independent workflows from the same primary Pi voice share these limits, not a fresh budget per pool.
+
+A parent awaiting children still occupies a live window. When root capacity is saturated, recursive admission **fails fast** rather than deadlocking behind that parent. Plan descendant headroom. Retained failure windows remain charged until explicit close confirms termination; a Python launcher's exit does not release a live-window permit. Only successful validated dormancy unloads automatically. Cancellation and close recursively terminate owned descendants, never the caller or unrelated panes.
+
+Children must use the parent's existing compatible interpreter and `pi_subagents` source. The launcher explicitly forwards `PTC_PYTHON_EXECUTABLE` and `PTC_SUBAGENTS_SOURCE` through tmux's child environment, alongside root identity and immutable limits; Python environment changes are not automatically inherited by tmux windows. Children do not sync repositories, bootstrap venvs, run installers, or take provisioning locks. An incompatible requested Python version fails explicitly without fallback.
+
+The in-process PTC runtime subscription API emits local kernel snapshots with session/root identity. It does **not** relay descendant snapshots across processes through pi-sock, and local totals are not a root-wide telemetry aggregate.
+
 ### Separate subagents configuration
 
 Set `PI_CODING_SUBAGENT_DIR` to a separate Pi agent directory for a leaner extension set or a different default model. **That configuration must load pi-sock and pi-activity** to provide agent communication and activity snapshots: installing pi-pycells in the main configuration does not install extensions into a separate profile. For an existing standalone subagents configuration, install both there:

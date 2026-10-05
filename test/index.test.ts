@@ -1353,3 +1353,96 @@ test("provision_dependency targets the requested kernel's venv and bootstraps pi
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
+
+test("subagent subscription receives the real manager hook and expires on reload/shutdown", async () => {
+  const restore = restoreInjectedModules({ cleanup: async () => {} });
+  const runtimeKey = Symbol.for("pi-pycells:subagent-runtime");
+  try {
+    const extension = await loadExtension();
+    const handlers = new Map();
+    const { pi } = buildPi({ eventHandlers: handlers, registered: [], activeTools: [] });
+    await extension(pi);
+    const first = globalThis[runtimeKey];
+    const received = [];
+    const unsubscribe = first.subscribe((payload) => received.push(payload));
+    first.subscribe(() => { throw new Error("broken consumer"); });
+    const snapshot = { rootId: "root-a", scope: "process", agents: [], totals: { running: 1 } };
+    globalThis.__ptcPythonSessionManager.hooks.onSubagentSnapshot("kernel-a", "exec-a", snapshot);
+    assert.deepEqual(received, [{ sessionId: "kernel-a", snapshot }]);
+    unsubscribe();
+    unsubscribe();
+    globalThis.__ptcPythonSessionManager.hooks.onSubagentSnapshot("kernel-b", "exec-b", snapshot);
+    assert.equal(received.length, 1);
+    first.subscribe((payload) => received.push(payload));
+    const oldManager = globalThis.__ptcPythonSessionManager;
+    await extension(pi);
+    oldManager.hooks.onSubagentSnapshot("old-kernel", "old-exec", snapshot);
+    assert.equal(received.length, 1, "reload retires subscribers owned by the previous runtime");
+    assert.equal(first.getSnapshot(), null);
+    const second = globalThis[runtimeKey];
+    second.subscribe((payload) => received.push(payload));
+    await handlers.get("session_shutdown")();
+    globalThis.__ptcPythonSessionManager.hooks.onSubagentSnapshot("closed", "closed", snapshot);
+    assert.equal(received.length, 1);
+    assert.equal(second.getSnapshot(), null);
+  } finally { restore(); }
+});
+
+test("runtime totals count local sessions once and preserve root/session scope", async () => {
+  const restore = restoreInjectedModules({});
+  try {
+    await loadExtension();
+    const { createSubagentRuntime } = require("../dist/index.js");
+    const snapshots = [
+      { sessionId: "a", snapshot: { rootId: "root", scope: "process", depth: 0,
+        agents: [], totals: { running: 2, settled: 1 } } },
+      { sessionId: "b", snapshot: { rootId: "root", scope: "process", depth: 0,
+        agents: [], totals: { running: 1, failed: 1 } } },
+    ];
+    const runtime = createSubagentRuntime({ allSubagentSnapshots: () => snapshots });
+    runtime.publish("a", snapshots[0].snapshot);
+    runtime.publish("a", snapshots[0].snapshot);
+    assert.deepEqual(runtime.getSnapshot(), {
+      sessions: snapshots, totals: { running: 3, settled: 1, failed: 1 },
+    });
+    runtime.dispose();
+    let calls = 0;
+    runtime.subscribe(() => calls++);
+    runtime.publish("a", snapshots[0].snapshot);
+    assert.equal(calls, 0);
+  } finally { restore(); }
+});
+
+test("nested policy prompt describes opt-in spawning and legal boundary imports", async () => {
+  const restore = restoreInjectedModules({ cleanup: async () => {} });
+  const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+  const previousMaximum = process.env.PI_SUBAGENTS_MAX_DEPTH;
+  try {
+    const extension = await loadExtension();
+    const handlers = new Map();
+    const { pi } = buildPi({ eventHandlers: handlers, registered: [], activeTools: [] });
+    await extension(pi);
+    process.env.PI_SUBAGENT_DEPTH = "1";
+    delete process.env.PI_SUBAGENTS_MAX_DEPTH;
+    const flat = handlers.get("before_agent_start")({ systemPrompt: "base" });
+    assert.match(flat.systemPrompt, /Importing pi_subagents remains legal/);
+    assert.match(flat.systemPrompt, /Spawning is blocked at this depth boundary/);
+    assert.doesNotMatch(flat.systemPrompt, /NotImplementedError/);
+    process.env.PI_SUBAGENTS_MAX_DEPTH = "3";
+    const optedIn = handlers.get("before_agent_start")({ systemPrompt: "base" });
+    assert.match(optedIn.systemPrompt, /Spawning is enabled by the opt-in depth policy/);
+    assert.match(optedIn.systemPrompt, /explicit task authorization/);
+    assert.match(optedIn.systemPrompt, /saturated root admission fails fast/);
+    process.env.PI_SUBAGENT_DEPTH = "3";
+    assert.match(handlers.get("before_agent_start")({ systemPrompt: "base" }).systemPrompt,
+      /Spawning is blocked at this depth boundary/);
+    process.env.PI_SUBAGENT_DEPTH = "1junk";
+    assert.throws(() => handlers.get("before_agent_start")({ systemPrompt: "base" }), /nonnegative integer/);
+  } finally {
+    if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+    else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    if (previousMaximum === undefined) delete process.env.PI_SUBAGENTS_MAX_DEPTH;
+    else process.env.PI_SUBAGENTS_MAX_DEPTH = previousMaximum;
+    restore();
+  }
+});
