@@ -302,6 +302,7 @@ class PersistentSessionProtocol {
       totalLines: this.totalLines,
       userCode: this.chunkLines,
       activeTool: this.activeTool,
+      subagentSnapshot: this.lastSubagentSnapshot,
       ...overrides,
     };
   }

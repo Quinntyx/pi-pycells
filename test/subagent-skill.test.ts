@@ -98,6 +98,8 @@ test("capacity is distinct from roster size and completion-driven ready headroom
     /await pool\.pop\(/, /(?:each|every) completion/i,
     /release gates[^.]*prerequisite[^.]*complete[^.]*checks pass/i,
     /refill.*immediate/i, /(?:avoid|no).*batch barriers/i,
+    /work stealing[^.]*ready stages/i, /slots[^.]*not fixed worker partitions/i,
+    /idle slots[^.]*borrowed/i, /zero-slot[^.]*no starvation-freedom promise/i,
     /queued tasks[^.]*exceed C/i, /(?:admitted|active) work[^.]*bounded/i,
     /starting[^.]*waiting[^.]*admission/i,
     /blocked tasks[^.]*not[^.]*ready headroom/i,
@@ -105,6 +107,93 @@ test("capacity is distinct from roster size and completion-driven ready headroom
     /integrat/i, /checks succeed/i, /integration owner/i,
     /(?:intermediate|evolving)[^.]*snapshots/i, /snapshot identity/i,
     /metadata\["rounds"\]/, /increment/i, /cap/i,
+  ]);
+});
+
+test("runtime compatibility preflight rejects old APIs before constructing or dispatching work", () => {
+  concepts(section("Input Contract"), [
+    /loaded runtime[^.]*Stage 3 compatibility preflight/i,
+    /skill edit[^.]*not upgrade[^.]*runtime/i,
+  ]);
+  const author = stage(3, "Author");
+  orderedConcepts(author, [
+    /import pi_subagents as subagents/i,
+    /before constructing any tasks or pools/i,
+    /subagents\.__file__/,
+    /inspect\.signature\(subagents\.Task\)/,
+    /inspect\.signature\(subagents\.AgentStage\.submit\)/,
+    /inspect\.signature\(subagents\.AgentStage\.submit_all\)/,
+    /stop blocked before dispatch/i,
+    /write_cell[^.]*constants cell/i,
+  ]);
+  concepts(author, [
+    /Task fields[^.]*agentDir[^.]*not[^.]*profile/i,
+    /submit must accept parent, session_handle, and session_name/i,
+    /submit_all accepts parent, not session-reuse arguments/i,
+    /public exports[^.]*AgentPoolFailureError[^.]*PiSockSessionEnded/i,
+    /SchemaValidationError/, /agent_dir_defaults/,
+    /runtime source\/revision[^.]*installed distribution identity/i,
+    /loaded skill path/i, /package version alone[^.]*not sufficient/i,
+    /lifecycle and failure semantics[^.]*source[^.]*validation evidence/i,
+    /matching signatures alone cannot prove success-only dormancy/i,
+    /required authorized runtime\/skill update/i,
+    /(?:not|never)[^.]*translate agentDir to profile/i,
+    /(?:not|never)[^.]*silently drop arguments/i,
+    /constants cell[^.]*compatibility checks[^.]*runtime\/skill identity/i,
+  ]);
+  orderedConcepts(stage(5, "Run"), [
+    /constants cell[^.]*run_cell/i,
+    /revalidate[^.]*compatibility checks[^.]*actually imported module/i,
+    /before pool creation or dispatch/i,
+    /without launching work/i,
+    /execute[^.;]*workflow[^.;]*run_cell/i,
+  ]);
+});
+
+test("runtime defaults distinguish strict workflow policy from library fallback behavior", () => {
+  const defaults = section("Runtime compatibility and defaults");
+  concepts(defaults, [
+    /runtime C defaults to 8/i,
+    /parser falls back to 8 for invalid text/i,
+    /clamps integers below 1 to 1/i,
+    /procedure[^.]*rejects invalid[^.]*non-positive[^.]*C/i,
+    /AgentPool\(\) uses C/i,
+    /explicit concurrency[^.]*integer from 1 through C[^.]*not a boolean/i,
+    /regardless of queued roster size/i,
+    /Task\.timeout=None[^.]*PI_SUBAGENTS_SETTLE_TIMEOUT[^.]*1800 seconds/i,
+    /startup separately[^.]*PI_SUBAGENTS_STARTUP_TIMEOUT[^.]*90 seconds/i,
+    /pool\.pop\(timeout=None\)[^.]*no waiting deadline/i,
+    /explicit positive task and pop timeouts/i,
+    /task timeout[^.]*not a queue-wait deadline/i,
+    /schema repair defaults to three follow-ups after the initial reply/i,
+    /PI_SUBAGENTS_SCHEMA_RETRIES[^.]*0 through 3[^.]*3 for invalid text/i,
+    /record effective limits without changing the environment/i,
+    /omitted Task\.agentDir[^.]*PI_CODING_SUBAGENT_DIR[^.]*PI_CODING_AGENT_DIR/i,
+    /otherwise ~\/\.pi\/agent/i, /no implicit dedicated subagents profile/i,
+    /bare explicit agentDir[^.]*~\/\.config\/pi\/profiles/i,
+    /model and thinking omissions inherit[^.]*settings[^.]*not a hard-coded model/i,
+    /agent_dir_defaults\(\)[^.]*default directory[^.]*not a per-task agentDir override/i,
+  ]);
+  concepts(section("Model, lifecycle, and replay discipline"), [
+    /inherit the selected agent directory\/profile's default/i,
+    /PI_SUBAGENTS_CATALOG_TTL[^.]*120 seconds/i,
+    /list_models\(refresh=True\)/,
+  ]);
+});
+
+test("installed skill lag and cached imports require authorized deployment and a fresh kernel", () => {
+  concepts(section("Runtime compatibility and defaults"), [
+    /repository skill, profile-installed skill, installed Python runtime, and live kernel/i,
+    /newer checkout or edited skill[^.]*not change an editable install/i,
+    /already-imported module/i, /subagents\.__file__/, /direct_url\.json/,
+    /loaded APIs\/source rather than a main or dev label/i,
+    /installed skill[^.]*removed arguments[^.]*premature pool close/i,
+    /report that lag[^.]*authorized skill deployment[^.]*compatible runtime installation/i,
+    /(?:not|never)[^.]*change profiles, configuration, environment variables, or dependencies/i,
+    /authorized runtime update[^.]*fresh kernel[^.]*rerun the preflight/i,
+    /cached imports[^.]*not acquire new code from a skill edit or disk update/i,
+    /never reset an active kernel or hot-reload modules with live pools/i,
+    /retain[^.]*namespace[^.]*inspection\/continuation[^.]*block incompatible new work/i,
   ]);
 });
 

@@ -5,6 +5,7 @@ const {
   NORMAL_VIEWPORT_LINES,
   applyViewport,
   diffLines,
+  executionIndicator,
   moreLinesHint,
   renderClearedCell,
   renderDeletedCell,
@@ -105,6 +106,142 @@ test("line-number field width comes from the full line count, so scrolling canno
   assert.equal(top.indexOf("┌"), scrolled[0].indexOf("┌"));
   // 20 lines -> 2-digit number field for both windows.
   assert.match(scrolled[1], /│12 │ line 12/);
+});
+
+// ---------------------------------------------------------------------------
+// Execution indicator: pure frame selection and pending-only label plumbing
+// ---------------------------------------------------------------------------
+
+test("executionIndicator cycles deterministic single-column frames every 120ms", () => {
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  for (let i = 0; i < frames.length; i++) {
+    const now = i * 120;
+    assert.equal(executionIndicator(now), frames[i]);
+    assert.equal(executionIndicator(now + 119.999), frames[i]);
+    assert.equal(executionIndicator(now + 1200), frames[i], "cycle wraps");
+    assert.equal(executionIndicator(now - 1200), frames[i], "negative times wrap");
+    assert.equal(visibleWidth(executionIndicator(now)), 1);
+    assert.ok(!/[\p{C}\p{Zl}\p{Zp}]/u.test(executionIndicator(now)));
+  }
+  // Reading a later frame never advances an earlier snapshot's frame.
+  assert.equal(executionIndicator(0), frames[0]);
+  assert.equal(executionIndicator(120), frames[1]);
+  assert.equal(executionIndicator(0), frames[0]);
+  assert.equal(executionIndicator(-1), frames.at(-1));
+  for (const now of [NaN, Infinity, -Infinity]) {
+    assert.equal(executionIndicator(now), frames[0]);
+  }
+  assert.ok(frames.includes(executionIndicator()), "default selects a wall-clock frame");
+});
+
+test("pending In and Out show the supplied frame; static unexecuted cells stay blank", () => {
+  for (const render of [renderInCell, renderOutCell]) {
+    const label = render === renderInCell ? "In" : "Out";
+    const options = { ...OPTS, cellNumber: null };
+    assert.ok(render("value", options)[1].includes(`${label}[ ]:`));
+    for (let now = 0; now < 1200; now += 120) {
+      const frame = executionIndicator(now);
+      const lines = render("value", { ...options, executionIndicator: frame });
+      assert.ok(lines[1].includes(`${label}[${frame}]:`));
+      assert.equal(lines.length, 3, "indicator adds no rows");
+      assert.ok(lines.every((line) => visibleWidth(line) === options.width));
+    }
+  }
+});
+
+test("execution counts and scratch labels ignore executionIndicator", () => {
+  const frame = executionIndicator(0);
+  for (const cellNumber of [undefined, 0, 1, 99, 999, 1000]) {
+    const options = { ...OPTS, cellNumber };
+    const plain = renderExecutedCell("x = 1", "1", options);
+    const indicated = renderExecutedCell("x = 1", "1", {
+      ...options, executionIndicator: frame,
+    });
+    assert.deepEqual(indicated, plain);
+    if (cellNumber === undefined) {
+      assert.match(indicated[1], /^ In: /);
+      assert.match(indicated[4], /^ Out: /);
+    } else {
+      assert.ok(indicated[1].includes(`In[${cellNumber}]:`));
+      assert.ok(indicated[4].includes(`Out[${cellNumber}]:`));
+    }
+  }
+});
+
+test("invalid indicators cannot inject control sequences or change blank-cell geometry", () => {
+  const invalid = [
+    "", "ab", "⠋⠙", "界", "😀", "\u0301", "\u0000", "\u0007", "\u007f", "\u009b",
+    "*\n", "\r*", "\t*", "\u001b[31m*\u001b[0m", "\u001b]8;;url\u0007*",
+    "\u009b31m*", "*\u200b", "*\u202e", "*\u2028", "*\u2029", "\ud800",
+  ];
+  for (const render of [renderInCell, renderOutCell]) {
+    const options = { ...OPTS, cellNumber: null };
+    const blank = render("value", options);
+    for (const executionIndicator of invalid) {
+      assert.deepEqual(render("value", { ...options, executionIndicator }), blank,
+        `reject ${JSON.stringify(executionIndicator)}`);
+    }
+  }
+});
+
+test("printable one-column indicators use visible width, not UTF-16 padding", () => {
+  for (const executionIndicator of ["*", "|", "⠋", "e\u0301", "\u{1d400}"]) {
+    assert.equal(visibleWidth(executionIndicator), 1);
+    const options = { ...OPTS, cellNumber: null, executionIndicator };
+    const lines = renderExecutedCell("x", "1", options);
+    assert.ok(lines[1].includes(`In[${executionIndicator}]:`));
+    assert.ok(lines[4].includes(`Out[${executionIndicator}]:`));
+    assert.ok(lines.every((line) => visibleWidth(line) === options.width));
+    for (const line of [lines[1], lines[4]]) {
+      assert.equal(visibleWidth(line.slice(0, line.indexOf("│"))), 14);
+    }
+  }
+});
+
+test("frames and final counts preserve fences, content, and viewport geometry", () => {
+  for (const mode of ["normal", "fullscreen", "expanded"]) {
+    for (const width of [18, 20, 40, 80]) {
+      const options = { ...OPTS, mode, width, viewStart: 4, cellNumberWidth: 7 };
+      const code = codeOf(12);
+      const output = codeOf(10);
+      const blank = renderExecutedCell(code, output, { ...options, cellNumber: null });
+      const variants = [
+        ...Array.from({ length: 10 }, (_, i) => ({
+          cellNumber: null, executionIndicator: executionIndicator(i * 120),
+        })),
+        ...[0, 1, 9, 99, 999, 1000, 9999999].map((cellNumber) => ({
+          cellNumber, executionIndicator: executionIndicator(0),
+        })),
+      ];
+      for (const variant of variants) {
+        const lines = renderExecutedCell(code, output, { ...options, ...variant });
+        assert.equal(lines.length, blank.length);
+        for (let i = 0; i < lines.length; i++) {
+          assert.equal(visibleWidth(lines[i]), visibleWidth(blank[i]));
+          // Both fence columns and everything inside them are unchanged.
+          const fence = /[┌│└]/.exec(blank[i]);
+          if (!fence) continue; // existing below-box more-lines hint
+          assert.ok(visibleWidth(lines[i]) <= width);
+          assert.equal(lines[i].slice(fence.index), blank[i].slice(fence.index));
+        }
+      }
+    }
+  }
+});
+
+test("executionIndicator flows through edit/delete/clear without changing body styles", () => {
+  const renderers = [
+    (options) => renderEditedCell("old", "new", options),
+    (options) => renderDeletedCell("old", options),
+    (options) => renderClearedCell("old", options),
+  ];
+  for (const render of renderers) {
+    const options = { ...OPTS, cellNumber: null, theme: stubTheme() };
+    const blank = render(options);
+    const frame = executionIndicator(0);
+    const running = render({ ...options, executionIndicator: frame });
+    assert.deepEqual(running.map((line) => line.replace(frame, " ")), blank);
+  }
 });
 
 // ---------------------------------------------------------------------------

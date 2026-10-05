@@ -3,9 +3,12 @@ const assert = require("node:assert/strict");
 const {
   buildExecutingCodeLines,
   currentViewportMode,
+  renderNotebookCall,
   renderNotebookResult,
   setNotebookTuiModeProvider,
 } = require("../dist/execution/notebook-render.js");
+const { executionIndicator, visibleWidth } = require("../dist/execution/cell-view.js");
+const panelModule = require("../dist/execution/subagent-panel.js");
 
 function stubTheme() {
   return {
@@ -408,4 +411,148 @@ test("long streaming cells tail-pin the live Out box across updates", () => {
   assert.equal(first.filter((l) => l.includes("┌")).length, second.filter((l) => l.includes("┌")).length);
   // The newest output line is visible in the second frame (tail-pinned).
   assert.ok(second.some((l) => l.includes("out 14")), second.join("\n"));
+});
+
+// ---------------------------------------------------------------------------
+// Live bracket frames and below-Out panel integration
+// ---------------------------------------------------------------------------
+
+test("executing unknown counts animate on the same component and settle to reported counts", (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  for (const tool of ["exec_cell", "run_cell"]) {
+    for (const cellIdx of [undefined, null]) {
+      now = 0;
+      const details = {
+        execId: "exec_live", cellIdx, userCode: ["print(1)"], liveOutput: ["1"],
+        highlightLines: ["\x1b[32mprint(1)\x1b[0m"],
+      };
+      const state = {};
+      const component = renderNotebookResult(tool, textResult("", details),
+        { isPartial: true }, PLAIN_THEME, { state });
+      const first = component.render(50);
+      const indicator = executionIndicator(now);
+      assert.ok(first.some((line) => line.startsWith(` In[${indicator}]:`)));
+      assert.ok(first.some((line) => line.startsWith(` Out[${indicator}]:`)));
+      assert.ok(first.some((line) => line.includes("\x1b[32mprint(1)")));
+      now = 119;
+      assert.strictEqual(component.render(50), first, "same frame keeps the cache warm");
+      now = 120;
+      const second = component.render(50);
+      assert.notStrictEqual(second, first, "clock frame invalidates cached lines");
+      assert.ok(second.some((line) => line.startsWith(` In[${executionIndicator(now)}]:`)));
+      assert.deepEqual(second.map((line) => line.replace(executionIndicator(now), " ")),
+        first.map((line) => line.replace(indicator, " ")), "animation preserves geometry/colors");
+      const settled = renderNotebookResult(tool, textResult("1", { ...details, cellIdx: 23 }),
+        {}, PLAIN_THEME, { state }).render(50);
+      assert.ok(settled.some((line) => line.startsWith(" In[23]:")));
+      assert.ok(settled.some((line) => line.startsWith(" Out[23]:")));
+      const reported = renderNotebookResult(tool, textResult("", { ...details, cellIdx: 23 }),
+        { isPartial: true }, PLAIN_THEME).render(50);
+      assert.ok(reported.some((line) => line.startsWith(" In[23]:")), "known live count wins");
+      for (const width of [0, 1, 2, 8, 14, 20, 50]) {
+        assert.ok(component.render(width).every((line) => visibleWidth(line) <= width));
+      }
+    }
+  }
+});
+
+test("queued cells stay blank; scratch previews and partial/final cells stay unnumbered", () => {
+  const details = { userCode: ["print(1)"], liveOutput: ["1"] };
+  for (const tool of ["exec_cell", "run_cell"]) {
+    const queued = renderPlain(tool, textResult("", details), { isPartial: true });
+    assert.ok(queued.some((line) => line.startsWith(" In[ ]:")));
+    assert.ok(queued.some((line) => line.startsWith(" Out[ ]:")));
+    const unreported = renderPlain(tool, textResult("1", { ...details, execId: "exec_done" }));
+    assert.ok(unreported.some((line) => line.startsWith(" In[ ]:")), "never invent a final count");
+  }
+  const preview = renderNotebookCall("print(1)", { toolName: "scratch_run" }, PLAIN_THEME).render(50);
+  assert.ok(preview.some((line) => line.startsWith(" In:")));
+  assert.ok(!preview.some((line) => /In\[/.test(line)));
+  for (const isPartial of [true, false]) {
+    const scratch = renderPlain("scratch_run", textResult("1", { ...details, execId: "exec_scratch" }),
+      { isPartial });
+    assert.ok(scratch.some((line) => line.startsWith(" In:")));
+    assert.ok(scratch.some((line) => line.startsWith(" Out:")));
+    assert.ok(!scratch.some((line) => /(?:In|Out)\[/.test(line)));
+  }
+});
+
+test("snapshot panels append after the Out fence, even with no live stdout, without changing content", (t) => {
+  const now = 1_200;
+  t.mock.method(Date, "now", () => now);
+  const snapshot = {
+    timestamp: now,
+    agents: [{ id: "a", name: "auditor", execScope: "exec_panel", status: "running",
+      startedAt: 0, label: "reviewing", liveTool: "read src/example.ts" }],
+  };
+  for (const tool of ["exec_cell", "run_cell", "scratch_run"]) {
+    for (const isPartial of [true, false]) {
+      for (const expanded of [false, true]) {
+        for (const liveOutput of [[], ["user_stdout"]]) {
+          const details = {
+            execId: "exec_panel", cellIdx: isPartial ? null : 4, userCode: ["await work()"],
+            liveOutput, subagentSnapshot: snapshot,
+          };
+          const result = textResult("output:\n  user_stdout\n\nsubagents:\n  model_only_digest", details);
+          const original = structuredClone(result);
+          const lines = renderNotebookResult(tool, result, { isPartial, expanded }, PLAIN_THEME).render(80);
+          const expected = panelModule.renderSubagentPanel(snapshot, {
+            width: 80, theme: PLAIN_THEME, execId: details.execId, expanded, now,
+          });
+          assert.ok(expected.length > 0, "fixture must produce a panel");
+          const panelStart = lines.length - expected.length;
+          assert.deepEqual(lines.slice(panelStart), expected, "panel is a separate suffix");
+          assert.equal(lines[panelStart - 1], "");
+          assert.ok(lines[panelStart - 2].includes("┘"), "Out closes before the panel opens");
+          assert.ok(lines.slice(0, panelStart).some((line) => /^ Out/.test(line)), "Out exists for pure awaits");
+          assert.ok(!lines.slice(0, panelStart).some((line) => line.includes("auditor")));
+          assert.ok(!lines.some((line) => line.includes("model_only_digest")));
+          assert.deepEqual(result, original, "rendering never changes model-facing content/details");
+        }
+      }
+    }
+  }
+});
+
+test("panel clock invalidates known-count live frames; completed snapshots/time survive reconstruction", (t) => {
+  let now = 240;
+  t.mock.method(Date, "now", () => now);
+  const calls = [];
+  t.mock.method(panelModule, "renderSubagentPanel", (snapshot, options) => {
+    calls.push({ snapshot: structuredClone(snapshot), options });
+    return snapshot ? [`panel ${snapshot.agents[0].status} at ${options.now}`] : [];
+  });
+  const snapshot = { agents: [{ id: "a", name: "agent", status: "running", elapsedMs: 10 }] };
+  const details = { execId: "exec_freeze", userCode: ["await work()"], cellIdx: 8, subagentSnapshot: snapshot };
+  const result = textResult("output", details);
+  const live = renderNotebookResult("exec_cell", result, { isPartial: true }, PLAIN_THEME);
+  const first = live.render(50);
+  assert.strictEqual(live.render(50), first);
+  now += 120;
+  assert.notStrictEqual(live.render(50), first, "known-count panels still receive animation ticks");
+  assert.equal(calls.at(-1).options.now, now);
+  const state = {};
+  const final = renderNotebookResult("exec_cell", result, {}, PLAIN_THEME, { state });
+  const frozen = final.render(50);
+  const frozenTime = now;
+  now += 60_000;
+  snapshot.agents[0].status = "failed";
+  snapshot.agents[0].elapsedMs = 60_010;
+  assert.strictEqual(final.render(50), frozen, "clock alone never invalidates history");
+  final.invalidate();
+  assert.deepEqual(final.render(50), frozen, "explicit invalidation cannot advance the final panel");
+  for (const expanded of [true, false]) {
+    renderNotebookResult("exec_cell", result, { expanded }, PLAIN_THEME, { state }).render(60);
+    const call = calls.at(-1);
+    assert.equal(call.snapshot.agents[0].status, "running", "freeze faithfully, never infer outcomes");
+    assert.equal(call.snapshot.agents[0].elapsedMs, 10);
+    assert.equal(call.options.now, frozenTime, "missing timestamp freezes across Ctrl+o/resize");
+    assert.equal(call.options.execId, "exec_freeze");
+    assert.equal(call.options.expanded, expanded);
+    assert.equal(call.options.width, 60);
+  }
+  const timestamped = { ...details, subagentSnapshot: { ...snapshot, timestamp: 120 } };
+  renderNotebookResult("exec_cell", textResult("output", timestamped), {}, PLAIN_THEME).render(50);
+  assert.equal(calls.at(-1).options.now, 120, "recorded snapshot time is authoritative");
 });

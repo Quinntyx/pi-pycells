@@ -56,6 +56,13 @@ export interface CellRenderOptions {
    */
   cellNumber?: number | null;
   /**
+   * One visible column replacing the blank in `In[ ]:` / `Out[ ]:` only when
+   * `cellNumber` is null. Callers supply a frame while executing; static cells
+   * remain blank when omitted. Invalid (wide, empty, or control) tokens are
+   * ignored. Actual execution counts and unnumbered scratch labels always win.
+   */
+  executionIndicator?: string;
+  /**
    * Pad the cell number to this many digits so separately rendered cells
    * (e.g. a `run_all` sequence) keep their fences in one column even when
    * digit counts differ. Defaults to three digits (grows safely past 999).
@@ -354,8 +361,9 @@ function renderBox(spec: BoxSpec): string[] {
     spec.wholeCellError ? applyStyle(text, "error", theme) : applyStyle(text, style, theme);
 
   const gutterFor = (isLabelRow: boolean, metadataIndex = -1): string => {
-    const text = (isLabelRow ? label : spec.metadata?.[metadataIndex] ?? "").padEnd(gutterChars, " ");
-    return " ".repeat(leftPadding) + gutterText(text) + " ";
+    const text = isLabelRow ? label : spec.metadata?.[metadataIndex] ?? "";
+    const padded = text + " ".repeat(Math.max(0, gutterChars - visibleWidth(text)));
+    return " ".repeat(leftPadding) + gutterText(padded) + " ";
   };
 
   const fenceBody = (left: string, right: string): string =>
@@ -408,9 +416,17 @@ function renderBox(spec: BoxSpec): string[] {
     );
   }
 
-  if (!spec.labelBackground || !theme?.bg) return lines;
+  // Ordinary rows already clip their body before styling. Only clip whole
+  // rows when the fixed gutter itself cannot fit, or the omission hint overflows.
+  const bounded = lines.map((line, index) => {
+    const narrow = prefixWidth + 3 > width;
+    const hint = hidden > 0 && spec.showMoreHint && index === lines.length - 1;
+    const hintOverflows = hint && prefixWidth + visibleWidth(`... ${hidden} more lines >...`) > width;
+    return narrow || hintOverflows ? truncateVisible(line, Math.max(0, width)) : line;
+  });
+  if (!spec.labelBackground || !theme?.bg) return bounded;
   const background = theme.getBgAnsi?.(spec.labelBackground);
-  return lines.map((line) => {
+  return bounded.map((line) => {
     const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
     const content = background ? restoreBackground(padded, background) : padded;
     return theme.bg(spec.labelBackground!, content);
@@ -449,8 +465,14 @@ export function applyViewport(
 
 function gutterLabels(opts: CellRenderOptions, kind: "in" | "out"): { label: string; labelWidth: number } {
   const numbered = opts.cellNumber !== undefined;
+  const indicator = opts.executionIndicator;
+  // Width alone would accept ANSI-wrapped characters, newlines, or bidi
+  // controls. Keep the bracket token printable and on a single terminal row.
+  const pendingNumber = opts.cellNumber === null && typeof indicator === "string" &&
+    !/[\p{C}\p{Zl}\p{Zp}]/u.test(indicator) && visibleWidth(indicator) === 1
+    ? indicator : " ";
   const numberPart =
-    opts.cellNumber === null ? "[ ]" : numbered ? `[${opts.cellNumber}]` : "";
+    opts.cellNumber === null ? `[${pendingNumber}]` : numbered ? `[${opts.cellNumber}]` : "";
   const label = (kind === "in" ? "In" : "Out") + numberPart + ":";
   // The gutter width must fit the widest label that ANY cell rendered with the
   // same cellNumberWidth setting can produce, so In and Out fences align
@@ -518,6 +540,21 @@ function buildBox(
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+const EXECUTION_INDICATOR_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * Select a single-column execution frame at 120ms intervals, with no timers
+ * or mutable animation state. Pass a timestamp for deterministic rendering;
+ * the default uses wall-clock time. Negative timestamps wrap around the
+ * cycle; non-finite timestamps fall back to the first frame.
+ */
+export function executionIndicator(now = Date.now()): string {
+  const tick = Number.isFinite(now) ? Math.floor(now / 120) : 0;
+  const index = ((tick % EXECUTION_INDICATOR_FRAMES.length) +
+    EXECUTION_INDICATOR_FRAMES.length) % EXECUTION_INDICATOR_FRAMES.length;
+  return EXECUTION_INDICATOR_FRAMES[index]!;
+}
 
 /**
  * Render the `In[N]:` code box (fresh write, exec input, or standalone).

@@ -6,7 +6,8 @@
  * Design constraints honored here:
  * - **Synchronous, zero-jitter.** No shiki, no async swaps, no
  *   `context.invalidate()` from continuations. Everything renders in one phase;
- *   the output is a pure function of `(toolName, result, options, state)`, so
+ *   historical output is a pure function of `(toolName, result, options, state)`.
+ *   Live animation samples the existing execution ticker without new timers;
  *   resumed sessions and ctrl+o toggles reproduce the exact same geometry.
  * - **Width at paint time.** `renderResult` has no width argument, so every
  *   box is built inside `Component.render(width)`: terminal resizes re-truncate
@@ -28,6 +29,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { parseSectionedOutput } from "../utils";
 import {
   FULLSCREEN_VIEWPORT_LINES,
+  executionIndicator,
   renderClearedCell,
   renderDeletedCell,
   renderEditedCell,
@@ -44,7 +46,8 @@ import {
   computeCodeViewStart,
   type CodeViewState,
 } from "./code-view";
-import type { ExecutionDetails, NotebookCellSummary, NotebookRunStep } from "../contracts/execution-types";
+import type { ExecutionDetails, NotebookCellSummary, NotebookRunStep, SubagentRuntimeSnapshot } from "../contracts/execution-types";
+import { renderSubagentPanel } from "./subagent-panel";
 
 /** Structural view of the result pi hands to renderResult. */
 export interface NotebookToolResult {
@@ -71,6 +74,8 @@ export interface NotebookRenderState {
   streamingHighlights?: StreamingCellHighlights;
   highlightRevision?: number;
   lastHighlights?: { code: string; themeKey: string; lines: string[]; revision: number };
+  /** Frozen final panel survives renderer reconstruction (Ctrl+o/theme/resize). */
+  completedSubagentPanel?: { snapshot: SubagentRuntimeSnapshot; now: number; execId?: string };
 }
 
 /** Structural view of pi's ToolRenderResultOptions. */
@@ -318,21 +323,34 @@ function renderExecutingFrame(
   expanded: boolean,
   redraw?: () => void,
 ): Component {
-  return new NotebookComponent((width, layout) => {
+  const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
+  // Queued frames do not have an execution id yet. Their blank brackets are
+  // not evidence of execution; scratch cells never acquire brackets at all.
+  const animating = cellNumber === null && !!details.execId;
+  return new NotebookComponent((width, layout, now) => {
     const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const mode = currentViewportMode(expanded);
-    const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
-    const opts = { width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const };
+    const opts = {
+      width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const,
+      executionIndicator: animating ? executionIndicator(now) : undefined,
+    };
+    const panel = renderSubagentPanel(details.subagentSnapshot, {
+      width, theme, execId: details.execId, expanded, now,
+    });
     const lines = layout.box("input", bodyLineCount(code), {
       ...opts, mode: inputViewportMode(expanded, state), viewStart: state.viewStartLine,
       highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
     }, (options) => renderInCell(code, options));
-    if (details.activeTool) lines.push(theme.fg("muted", `· calling ${details.activeTool}()`));
+    if (details.activeTool) {
+      lines.push(truncateToWidth(theme.fg("muted", `· calling ${details.activeTool}()`), width));
+    }
     const liveText = (details.liveOutput ?? []).join("\n");
     const hidden = details.liveOutputHidden ?? 0;
-    if (!liveText && !hidden) return lines;
+    if (!liveText && !hidden && !panel.length && !details.execId) return lines;
     lines.push("");
-    if (hidden > 0) lines.push(theme.fg("muted", `... ${hidden} earlier output lines`));
+    if (hidden > 0) {
+      lines.push(truncateToWidth(theme.fg("muted", `... ${hidden} earlier output lines`), width));
+    }
     const total = bodyLineCount(liveText);
     // Retain the live tail in regular mode; fullscreen additionally allows
     // independent wheel scrolling, suspended while the user inspects history.
@@ -340,8 +358,15 @@ function renderExecutingFrame(
       ...opts, mode: expanded ? "expanded" : "fullscreen", followTail: true,
       viewStart: Math.max(1, total - FULLSCREEN_VIEWPORT_LINES + 1),
     }, (options) => renderOutCell(liveText, options), lines.length, true, mode === "fullscreen"));
+    if (panel.length) lines.push("", ...panel);
     return lines;
-  }, state, redraw, () => currentViewportMode(expanded));
+  }, state, redraw, (now) => {
+    // Live frames are often repainted on the SAME component. Include their
+    // bracket frame and panel clock in the key, leaving completed rows warm.
+    const indicator = animating ? executionIndicator(now) : "";
+    const panelTick = details.subagentSnapshot ? Math.floor(now / 120) : "";
+    return `${currentViewportMode(expanded)}:${indicator}:${panelTick}`;
+  });
 }
 // ---------------------------------------------------------------------------
 // Call phase (renderCall): the In box for the submitted code. During
@@ -371,7 +396,7 @@ export function renderNotebookCall(
       width: options?.width ?? width,
       mode: inputViewportMode(false, state),
       followTail: true,
-      cellNumber: null,
+      cellNumber: options?.toolName === "scratch_run" ? undefined : null,
       theme,
       labelBackground: "toolPendingBg",
       highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate, true),
@@ -393,6 +418,14 @@ function renderExecCompleted(
   redraw?: () => void,
 ): Component {
   if (details.userCode === undefined && state.callCode === undefined) return renderFallback(result, theme);
+  // Freeze both data and time at completion. Later registry mutations, resize,
+  // expansion, or transcript redraws must not advance a historical panel.
+  const completedPanel = state.completedSubagentPanel ?? (details.subagentSnapshot
+    ? state.completedSubagentPanel = {
+      snapshot: structuredClone(details.subagentSnapshot),
+      now: details.subagentSnapshot.timestamp ?? Date.now(),
+      execId: details.execId,
+    } : undefined);
   return new NotebookComponent((width, layout) => {
     const opts = boxOptions(details, expanded, theme, state);
     const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
@@ -407,6 +440,10 @@ function renderExecCompleted(
     lines.push("");
     lines.push(...layout.box("output", bodyLineCount(text), { ...base, viewStart: 1, outputStyle },
       (options) => renderOutCell(text, options), lines.length));
+    const panel = renderSubagentPanel(completedPanel?.snapshot, {
+      width, theme, execId: completedPanel?.execId, expanded, now: completedPanel?.now,
+    });
+    if (panel.length) lines.push("", ...panel);
     return lines;
   }, state, redraw, () => currentViewportMode(expanded));
 }

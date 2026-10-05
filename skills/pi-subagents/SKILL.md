@@ -22,7 +22,11 @@ metadata:
   permission. A standalone profile does not inherit the parent's extensions.
 - `PI_SUBAGENTS_MAX_CONCURRENT`, defining C, the admitted active-capacity ceiling
   shared by pools in this process. Read it without changing the environment. If
-  unset, use the library default of 8; reject invalid or non-positive values.
+  unset, use the library default of 8; reject invalid or non-positive values as
+  workflow policy rather than silently accepting the runtime's fallback/clamp.
+- A loaded runtime that passes the Stage 3 compatibility preflight. Repository
+  documentation, installed skills, and an imported Python module may differ;
+  a skill edit does not upgrade the runtime.
 - An approved baseline identity, file and shared-resource ownership, dependency
   gates, and explicit permission for any worktree allocation or integration.
 - A narrowly declared recoverable-completion policy, or a policy that all task
@@ -93,27 +97,42 @@ metadata:
 ## Stage 3: Author
 
 1. Provision one durable notebook-backed kernel. Import `pi_subagents as subagents`.
-   Inspect unfamiliar public APIs with `help()` or `dir()` rather than using older
-   argument names or internal socket/RPC plumbing.
-2. Use `write_cell` to save a constants cell containing imports, prompts, schemas,
-   paths, input roster, C, limits, and model requests. Saving does not execute it;
-   do not construct tasks or launch work here.
-3. Save the opening workflow cell with `write_cell`. Keep construction of every
+   Before constructing any tasks or pools, record `subagents.__file__` and inspect
+   `inspect.signature(subagents.Task)`, `inspect.signature(subagents.AgentStage.submit)`,
+   and `inspect.signature(subagents.AgentStage.submit_all)` using Python's `inspect`.
+   Require the Task fields in the API contract, specifically `agentDir`, not the
+   older `profile`; submit must accept `parent`, `session_handle`, and `session_name`,
+   while submit_all accepts `parent`, not session-reuse arguments. Check the public
+   exports `AgentPoolFailureError`, `PiSockSessionEnded`, `SchemaValidationError`,
+   and `agent_dir_defaults`. Record runtime source/revision or installed distribution
+   identity and the loaded skill path; a package version alone is not sufficient.
+2. Verify the loaded runtime's lifecycle and failure semantics against this contract
+   from its source or applicable scoped validation evidence; matching signatures
+   alone cannot prove success-only dormancy or retained-session continuation safety.
+   If any requirement is absent, stop blocked before dispatch and report the mismatch
+   and required authorized runtime/skill update. Do not translate `agentDir` to
+   `profile` or silently drop arguments to make an old runtime appear compatible.
+   Otherwise continue Stage 3: Author. Inspect unfamiliar public APIs with `help()`
+   or `dir()` rather than using older argument names or internal socket/RPC plumbing.
+3. Use `write_cell` to save a constants cell containing imports, compatibility checks,
+   runtime/skill identity, prompts, schemas, paths, input roster, C, limits, and model
+   requests. Saving does not execute it; do not construct tasks or launch work here.
+4. Save the opening workflow cell with `write_cell`. Keep construction of every
    `Task`, prompt composition, explicit `cwd`, schema, timeout, ownership routing,
    pool/stage creation, completion consumption, and round gates visible in this
    cell. Do not hide reviewable effects in an opaque wrapper.
-4. Guard replay: reuse an existing open pool when resuming an interrupted workflow.
+5. Guard replay: reuse an existing open pool when resuming an interrupted workflow.
    Check that its recorded inputs match the current workflow before submitting
    anything new. Replay cached reports only when all required outcomes/checks
    succeeded and their identity matches inputs, prompts, paths, schemas, limits,
    approved baseline, resource ownership, and integration state. Schema validity
    alone cannot qualify a blocked report for replay. Never cache partial or failed
    work as done or duplicate already-submitted units.
-5. Save a separate final teardown cell using synchronous `pool.close()` without
+6. Save a separate final teardown cell using synchronous `pool.close()` without
    `await`. Leave the pool open in all substantial workflow cells. Constants,
    workflow, and teardown require at least three recorded cells; later recorded
    cells may inspect results, continue work, or steer agents.
-6. Go to Stage 4: Review. Scratch probes are allowed, but workflow execution must
+7. Go to Stage 4: Review. Scratch probes are allowed, but workflow execution must
    not depend on variables or functions existing only in scratch or deleted cells.
 
 ## Stage 4: Review
@@ -136,14 +155,17 @@ metadata:
 
 1. First execute the saved constants cell with `run_cell`; validate its successful
    execution and initialized prompts, schemas, paths, roster, C, limits, and model
-   requests against the approved inputs. If execution or validation fails, return
-   to Stage 3: Author without launching work. Otherwise execute the saved approved
-   workflow with `run_cell`; it executes only the selected cell, not prerequisites.
+   requests against the approved inputs. Revalidate the recorded compatibility
+   checks against the actually imported module before pool creation or dispatch.
+   If execution or validation fails, return to Stage 3: Author without launching work.
+   Otherwise execute the saved approved workflow with `run_cell`; it executes only
+   the selected cell, not prerequisites.
    Use one orchestration consumer per pool and ordered cell execution; never split
    a workflow across concurrent execution calls. Top-level `await` is available;
    do not use `asyncio.run(...)` or scratch execution to launch the workflow.
 2. Create stages with `pool.stage(name, slots=...)`. Stage slots are soft priorities
-   whose sum cannot exceed pool concurrency; idle slots are borrowed. Give
+   whose sum cannot exceed pool concurrency; idle slots are borrowed through work
+   stealing across ready stages. Slots are not fixed worker partitions. Give
    latency-critical review, fix, or integration stages positive reservations.
    A zero-slot stage may borrow capacity, but has no starvation-freedom promise.
    Submit only ready work through `stage.submit(task)` or `stage.submit_all(tasks)`.
@@ -207,6 +229,41 @@ metadata:
    when deliberate cleanup of all live pools is intended.
 2. Report the notebook path, completed deliverables, checks, failures, blockers,
    remaining risks, and required follow-ups. Do not describe cleanup as validation.
+
+# Runtime compatibility and defaults
+
+- Keep the repository skill, profile-installed skill, installed Python runtime, and
+  live kernel import identities separate. A newer checkout or edited skill does not
+  change an editable install pointing elsewhere or an already-imported module.
+  Inspect `subagents.__file__` and the installed distribution's `direct_url.json`
+  when available; trust the loaded APIs/source rather than a `main` or `dev` label.
+- If an installed skill still uses removed arguments, premature pool close, or
+  older failure/continuation semantics, report that lag and request an authorized
+  skill deployment plus a compatible runtime installation. Do not change profiles,
+  configuration, environment variables, or dependencies merely to pass preflight.
+- After an authorized runtime update, use a fresh kernel and rerun the preflight
+  for new work: cached imports do not acquire new code from a skill edit or disk
+  update. Never reset an active kernel or hot-reload modules with live pools;
+  retain its namespace for inspection/continuation and block incompatible new work.
+- Runtime C defaults to 8. Its environment parser falls back to 8 for invalid text
+  and clamps integers below 1 to 1; this procedure instead rejects invalid or
+  non-positive configured C. `AgentPool()` uses C; explicit concurrency must be an
+  integer from 1 through C, not a boolean, regardless of queued roster size.
+- `Task.timeout=None` uses `PI_SUBAGENTS_SETTLE_TIMEOUT`, default 1800 seconds,
+  for settling a turn; startup separately uses `PI_SUBAGENTS_STARTUP_TIMEOUT`,
+  default 90 seconds. `pool.pop(timeout=None)` has no waiting deadline. Set explicit
+  positive task and pop timeouts; a task timeout is not a queue-wait deadline or a
+  promise that the entire workflow, startup, and repair sequence finish within it.
+- Schema repair defaults to three follow-ups after the initial reply. Compatible
+  runtimes clamp `PI_SUBAGENTS_SCHEMA_RETRIES` to 0 through 3 and fall back to 3
+  for invalid text. Record effective limits without changing the environment.
+- An omitted `Task.agentDir` uses `PI_CODING_SUBAGENT_DIR`, otherwise the parent's
+  `PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`; there is no implicit dedicated
+  subagents profile. A bare explicit agentDir names a directory under
+  `~/.config/pi/profiles`; an explicit path selects that directory. Model and
+  thinking omissions inherit the selected agent directory's settings, not a
+  hard-coded model. `agent_dir_defaults()` describes the default directory, not
+  a per-task agentDir override; inspect that override's settings separately.
 
 # Prompt contracts
 
@@ -320,9 +377,10 @@ metadata:
 
 # Model, lifecycle, and replay discipline
 
-- Unless the user names a model, inherit the subagents profile's default; do not
-  select one manually. Resolve named models with `best_model_match`, `model_slugs`,
-  `resolve_models`, or `list_models`; use a full provider/model slug when needed.
+- Unless the user names a model, inherit the selected agent directory/profile's
+  default; do not select one manually. Resolve named models with `best_model_match`,
+  `model_slugs`, `resolve_models`, or `list_models`; use a full provider/model slug
+  when needed.
   Catalog TTL is `PI_SUBAGENTS_CATALOG_TTL` (default 120 seconds); misses refresh,
   and `list_models(refresh=True)` forces a reread. Set thinking when appropriate.
 - `with AgentPool(...)` closes on clean exit; reserve it for trivial fixtures

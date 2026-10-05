@@ -1541,3 +1541,43 @@ test("session manager: live screen resets between cells", async () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+
+test("session manager: snapshot survives ordinary frames and resets for the next execution", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-snapshot-flow-"));
+  const snapshot = { pools: [], agents: [{ agentId: "a1", name: "worker", status: "running" }] };
+  let cell = 0;
+  const onFrame = (frame: { type: string; id?: string }, proc: {
+    emitFrame: (frame: Record<string, unknown>) => void;
+  }) => {
+    if (frame.type !== "exec") return;
+    cell += 1;
+    if (cell === 1) setTimeout(() => proc.emitFrame({ type: "subagent_state", snapshot }), 0);
+    setTimeout(() => proc.emitFrame({ type: "stdout", text: "tick\n" }), 5);
+    setTimeout(() => proc.emitFrame({ type: "execution_progress", line: 1, total_lines: 1 }), 10);
+    setTimeout(() => proc.emitFrame({
+      type: "exec_done", id: frame.id, output: "ok", cell, total_output_chars: 2,
+    }), 80);
+  };
+  const { manager } = makeFakeManager({ onFrame });
+  try {
+    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const updates: any[] = [];
+    const first = await manager.execForeground(id, "first", {
+      cwd: tempDir, onUpdate: (update: any) => updates.push(update),
+    });
+    const seen = updates.findIndex((update) => update.details?.subagentSnapshot);
+    assert.ok(seen >= 0);
+    for (const update of updates.slice(seen)) assert.deepEqual(update.details.subagentSnapshot, snapshot);
+    assert.deepEqual(first.details.subagentSnapshot, snapshot);
+    const next: any[] = [];
+    const second = await manager.execForeground(id, "second", {
+      cwd: tempDir, onUpdate: (update: any) => next.push(update),
+    });
+    assert.equal(second.details.subagentSnapshot, undefined);
+    assert.ok(next.every((update) => update.details?.subagentSnapshot === undefined));
+  } finally {
+    await manager.disposeAll();
+    require("node:child_process").execFileSync("trash", ["--", tempDir]);
+  }
+});

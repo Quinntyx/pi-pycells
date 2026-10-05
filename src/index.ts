@@ -50,6 +50,7 @@ import {
 	setNotebookTuiModeProvider,
 } from "./execution/notebook-render";
 import { highlightCellCode } from "./execution/code-highlight";
+import { createLiveRepaint } from "./execution/live-repaint";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   CodeExecutionResult,
@@ -874,37 +875,22 @@ function execCellTool(
         sessionState.activeForegroundExecutions.set(toolCallId, sessionId);
         sessionState.lastSubagentSnapshot = null;
 
-        // Keep the viewer animating during pure awaits: subagent state frames
-        // only arrive on registry mutations, so a 120ms repaint ticker merges
-        // the latest snapshot into the streamed details (pi-tool-tree does the
-        // same for its shimmer).
-        let lastUpdate: { content: Array<{ type: "text"; text: string }>; details: ExecutionDetails } | undefined;
+        // Repaint silent awaits without adding timers to the pure renderers.
         const streamingOnUpdate: typeof onUpdate = (update) => {
           const patched = highlightLines
             ? ({ ...update, details: { ...(update.details ?? {}), highlightLines } } as typeof update)
             : update;
-          lastUpdate = patched as never;
           onUpdate?.(patched);
         };
-        const repaint = setInterval(() => {
-          if (!lastUpdate || !onUpdate) return;
-          const snapshot = lastUpdate.details.subagentSnapshot ?? sessionState.lastSubagentSnapshot ?? undefined;
-          onUpdate?.({
-            content: lastUpdate.content,
-            details: { ...lastUpdate.details, subagentSnapshot: snapshot } as ExecutionDetails,
-          });
-        }, 120);
-        repaint.unref?.();
-
-        const execPromise = sessionManager.execForeground(sessionId, cellCode as string, {
-          ...execOptions,
-          onUpdate: streamingOnUpdate,
-        });
+        const liveUpdates = createLiveRepaint(onUpdate ? streamingOnUpdate : undefined);
         let result: Awaited<ReturnType<typeof sessionManager.execForeground>>;
         try {
-          result = await execPromise;
+          result = await sessionManager.execForeground(sessionId, cellCode as string, {
+            ...execOptions,
+            onUpdate: liveUpdates.onUpdate,
+          });
         } finally {
-          clearInterval(repaint);
+          liveUpdates.stop();
         }
         noteCodeExecutionSuccess(recoveryState);
         if (result.details.estimatedAvoidedTokens > 0) {
@@ -1050,12 +1036,13 @@ function scratchRunTool(
       }
       sessionState.lastCtx = ctx;
       sessionState.activeForegroundExecutions.set(toolCallId, target.id);
+      const liveUpdates = createLiveRepaint(onUpdate);
       try {
         const result = await sessionManager.scratchRun(target.id, code, {
           cwd: ctx.cwd,
           ctx,
           signal,
-          onUpdate,
+          onUpdate: liveUpdates.onUpdate,
           parentToolCallId: toolCallId,
         });
         if (result.details.estimatedAvoidedTokens > 0) {
@@ -1063,6 +1050,7 @@ function scratchRunTool(
         }
         return completedCellContent(result, target.id, settings);
       } finally {
+        liveUpdates.stop();
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
@@ -1320,12 +1308,13 @@ function runCellTool(
       }
       sessionState.lastCtx = ctx;
       sessionState.activeForegroundExecutions.set(toolCallId, target.id);
+      const liveUpdates = createLiveRepaint(onUpdate);
       try {
         const result = await sessionManager.runCell(target.id, n, {
           cwd: ctx.cwd,
           ctx,
           signal,
-          onUpdate,
+          onUpdate: liveUpdates.onUpdate,
           parentToolCallId: toolCallId,
         });
         if (result.details.estimatedAvoidedTokens > 0) {
@@ -1339,6 +1328,7 @@ function runCellTool(
           details: { sessionId: target.id, n },
         };
       } finally {
+        liveUpdates.stop();
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },

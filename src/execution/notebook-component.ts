@@ -87,14 +87,18 @@ export class NotebookComponent implements Component {
     lines: string[];
   };
   constructor(
-    private readonly build: (width: number, layout: NotebookBoxLayout) => string[],
+    private readonly build: (width: number, layout: NotebookBoxLayout, now: number) => string[],
     private readonly state: NotebookRenderState = {},
     private readonly redraw?: () => void,
-    private readonly renderKey?: () => unknown,
+    private readonly renderKey?: (now: number) => unknown,
   ) {}
 
   render(width: number): string[] {
-    const renderKey = this.renderKey?.();
+    // One clock sample drives both the cache key and the painted animation.
+    // The execution owner's existing repaint ticker schedules live redraws;
+    // components never create timers or advance historical rows themselves.
+    const now = Date.now();
+    const renderKey = this.renderKey?.(now);
     const cached = this.cached;
     // Transcript redraws revisit every historical tool. Reuse the painted
     // rows instead of reparsing output, allocating body rows, and restyling
@@ -111,7 +115,7 @@ export class NotebookComponent implements Component {
       return cached.lines;
     }
     const layout = new NotebookBoxLayout(this.state);
-    const lines = this.build(width, layout);
+    const lines = this.build(width, layout, now);
     this.regions = layout.regions;
     this.inputLabels = layout.inputLabels;
     // Snapshot after build: rendering may resolve already-cached highlights.

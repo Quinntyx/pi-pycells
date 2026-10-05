@@ -101,7 +101,7 @@ test("named input previews use a compact bold tool-title header and clamp to pan
     const painted = call.render(80);
     const lines = painted.map(stripAnsi);
     assert.equal(lines[0], ` ${name}`);
-    assert.equal(labelRow(lines, "In[ ]:"), 2);
+    assert.equal(labelRow(lines, name === "scratch_run" ? "In:" : "In[ ]:"), 2);
     assert.strictEqual(call.render(80), painted, "unchanged titled previews retain the row cache");
     state.resultOwnsInput = true;
     const titleOnly = call.render(80);
@@ -583,7 +583,8 @@ test("only unmodified left clicks on visible In text are handled", () => {
     assert.ok(component.handleMouse({ ...click, x: 9 })?.handled, "the label's final colon is clickable");
     const narrow = frame({ userCode: source, cellIdx: 1234 }, {});
     const clipped = narrow.render(2);
-    assert.equal(narrow.handleMouse({ ...inputLabelClick(clipped, "In[1234]:"), x: 2 }), undefined);
+    assert.ok(clipped.every((line) => visibleWidth(line) <= 2));
+    assert.equal(narrow.handleMouse({ ...click, x: 2 }), undefined, "clipped labels are not hit regions");
   } finally { setNotebookTuiModeProvider(undefined); }
 });
 
