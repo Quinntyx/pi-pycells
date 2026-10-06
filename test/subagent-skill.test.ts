@@ -389,3 +389,23 @@ test("nested authorization and decreasing fuel prevent depth, fanout, and contin
     /forbid spawning in leaf assignments/i]);
   assert.ok(skill.split(/\r?\n/).length <= 500, "canonical skill stays below 500 lines");
 });
+
+test("fanout branches integrate and clean up by default without unsolicited PRs", () => {
+  concepts(section("Delivery and branch lifecycle"), [
+    /internal orchestration details, not deliverables/i,
+    /do not create PRs unless the user explicitly asks/i,
+    /unless the user specifies another end state.*merge every contributing branch/i,
+    /intended integration branch, validate, and push it before finishing/i,
+    /root owns integration and cleanup/i,
+    /ancestor of the published integration tip/i,
+    /closing a PR is not a substitute for merging/i,
+    /after workers stop, delete only owned temporary fan-out branches from the remote/i,
+    /local branches.worktrees when safe, preserving user data/i,
+    /never delete main, dev, the integration branch, canonical worktrees, or unrelated work/i,
+    /do not discard unmerged work/i,
+    /keep blocked branches intact and report the blocker/i,
+    /report delivered behavior, not an internal branch roster/i,
+  ]);
+  concepts(stage(6, "Inspect"), [/delivery and branch lifecycle integration gate/i]);
+  concepts(stage(7, "Teardown"), [/cleanup after workers stop/i, /unrelated or unmerged work/i]);
+});

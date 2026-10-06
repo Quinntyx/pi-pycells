@@ -230,16 +230,17 @@ metadata:
    authorize their deletion. Count them in any later allocation budget.
 3. If continuation is needed and authorized, submit or send bounded follow-ups
    using the continuation contract below, then return to Stage 5: Run. If scope
-   expands, return to Stage 4: Review instead. Otherwise go to Stage 7: Teardown
-   only after inspection is complete and no retained session is still needed.
+   expands, return to Stage 4: Review instead. Otherwise apply the Delivery and
+   branch lifecycle integration gate, then go to Stage 7: Teardown only after
+   inspection is complete and no retained session is still needed.
 
 ## Stage 7: Teardown
 
 1. Execute the dedicated teardown cell calling `pool.close()` without `await`.
    Inspect its `PoolSummary`; retain the notebook's reports, outputs, and failed
-   workspaces. Filesystem/worktree cleanup requires separate explicit permission
-   after inspection; never infer it from pool close. Use `subagents.finish()` only
-   when deliberate cleanup of all live pools is intended.
+   workspaces. Apply Delivery and branch lifecycle cleanup after workers stop;
+   pool close never authorizes deleting unrelated or unmerged work. Use
+   `subagents.finish()` only when deliberate cleanup of all live pools is intended.
 2. Report the notebook path, completed deliverables, checks, failures, blockers,
    remaining risks, and required follow-ups. Do not describe cleanup as validation.
 
@@ -342,6 +343,20 @@ metadata:
 - B, L, and authorization are orchestration policy, not extra runtime-enforced
   capabilities. Runtime depth and immutable root admission/deadline limits remain
   the hard backstop; do not describe prompt-only fuel as a security boundary.
+
+# Delivery and branch lifecycle
+
+- Worktrees and task branches are internal orchestration details, not deliverables.
+  Do not create PRs unless the user explicitly asks for them.
+- Unless the user specifies another end state, merge every contributing branch
+  into the intended integration branch, validate, and push it before finishing.
+- The root owns integration and cleanup. Verify each task tip is an ancestor of
+  the published integration tip; closing a PR is not a substitute for merging.
+- After workers stop, delete only owned temporary fan-out branches from the
+  remote. Clean owned local branches/worktrees when safe, preserving user data.
+  Never delete main, dev, the integration branch, canonical worktrees, or unrelated work.
+- Do not discard unmerged work to claim completion. Keep blocked branches intact
+  and report the blocker. Report delivered behavior, not an internal branch roster.
 
 # Prompt contracts
 
