@@ -35,9 +35,7 @@ export function relevantAgents(
 
 const COMPACT_AGENTS = 4;
 const EXPANDED_AGENTS = 12;
-const COMPACT_POOLS = 1;
 const EXPANDED_POOLS = 3;
-const COMPACT_STAGES = 2;
 const EXPANDED_STAGES = 6;
 // Cell boxes reserve a 12-column label/metadata gutter plus inset and separator.
 const CELL_INSET = 14;
@@ -45,6 +43,9 @@ const CELL_INSET = 14;
 interface PanelRow {
   text: string;
   color?: ThemeColor;
+  bold?: boolean;
+  tail?: string;
+  tailColor?: ThemeColor;
 }
 
 type Counts = Record<
@@ -92,7 +93,7 @@ function rowCounts(agents: SubagentAgentRow[]): Counts {
   return counts;
 }
 
-/** Pack whole count phrases; even a one-column viewport has bounded row count. */
+/** Pack whole, nonzero count phrases with bounded wrapping even in narrow panes. */
 function phrases(parts: string[], width: number): PanelRow[] {
   const rows: PanelRow[] = [];
   let line = "";
@@ -109,9 +110,15 @@ function phrases(parts: string[], width: number): PanelRow[] {
   return rows;
 }
 
+function countPhrases(values: Record<string, number>): string[] {
+  return Object.entries(values).filter(([, value]) => value > 0)
+    .map(([name, value]) => `${value} ${name}`);
+}
+
 function priority(agent: SubagentAgentRow): number {
-  return ["running", "starting", "queued", "idle", "failed", "cancelled",
-    "stopped", "closed", "other", "settled"].indexOf(state(agent));
+  // Actionable failures stay visible even with a very large live roster.
+  return ["failed", "cancelled", "stopped", "running", "starting", "queued", "idle",
+    "other", "closed", "settled"].indexOf(state(agent));
 }
 
 /** Keep only the bounded best rows, stable within each status, without sorting the roster. */
@@ -130,84 +137,80 @@ function visibleAgents(agents: SubagentAgentRow[], limit: number): SubagentAgent
   return selected;
 }
 
-function agentRow(agent: SubagentAgentRow, width: number): PanelRow {
-  const kind = state(agent);
-  const status = kind === "other" ? label(agent.status) || "unknown" : kind;
-  const name = clip(label(agent.name) || label(agent.id) || "unnamed",
-    Math.min(18, Math.floor(width / 4)));
-  const base = `${clip(status, 12)} ${name}`;
-  // Idle and terminal sessions must not advertise a stale tool as currently executing.
-  const active = kind === "running" || kind === "starting";
-  const fields = [
-    ["phase", label(agent.phase) || label(agent.group)],
-    ["activity", label(agent.label)],
-    ["tool", active ? label(agent.liveTool) : ""],
-  ].filter((field) => field[1]);
-  let text = base;
-  if (fields.length) {
-    const overhead = fields.reduce((sum, field) => sum + field[0]!.length + 5, 0);
-    const budget = Math.floor((width - visibleWidth(base) - overhead) / fields.length);
-    if (budget >= 3) {
-      text += fields.map(([key, value]) => ` · ${key}: ${clip(value!, budget)}`).join("");
-    } else {
-      // At narrow widths prioritize the live tool, then activity, then phase.
-      text += [...fields].reverse().map(([key, value]) => ` · ${key}: ${value}`).join("");
-    }
+function group(agent: SubagentAgentRow): string {
+  switch (state(agent)) {
+    case "failed": case "cancelled": case "stopped": return "Needs attention";
+    case "running": case "starting": return "Working";
+    case "queued": return "Queued";
+    case "idle": return "Idle sessions";
+    case "settled": case "closed": return "Finished";
+    default: return "Other";
   }
-  const color: ThemeColor = kind === "failed" ? "error"
-    : kind === "cancelled" || kind === "stopped" ? "warning"
-    : kind === "settled" ? "success" : active ? "accent" : "muted";
-  return { text, color };
 }
 
-function poolRows(pools: SubagentPoolState[], expanded: boolean): PanelRow[] {
+function agentRows(agent: SubagentAgentRow, expanded: boolean): PanelRow[] {
+  const kind = state(agent);
+  const status = kind === "other" ? label(agent.status) || "unknown" : kind;
+  const color: ThemeColor = kind === "failed" ? "error"
+    : kind === "cancelled" || kind === "stopped" ? "warning"
+    : kind === "settled" ? "success" : kind === "running" ? "accent" : "muted";
+  const rows: PanelRow[] = [{
+    text: `  ${label(agent.name) || label(agent.id) || "unnamed"}`,
+    color: "text", bold: true, tail: status, tailColor: color,
+  }];
+  // Never advertise a stale activity/tool on idle, queued, or terminal sessions.
+  const active = kind === "running" || kind === "starting";
+  const details = active ? [label(agent.liveTool), label(agent.label)] : [];
+  if (expanded) details.push(label(agent.phase) || label(agent.group));
+  const detail = [...new Set(details.filter(Boolean))].join(" · ");
+  if (detail) rows.push({ text: `    ${detail}`, color: "muted" });
+  return rows;
+}
+
+/** Expanded-only diagnostics: no repeated per-pool/per-stage totals in the default view. */
+function poolRows(pools: SubagentPoolState[], width: number): PanelRow[] {
   const rows: PanelRow[] = [];
-  const poolLimit = expanded ? EXPANDED_POOLS : COMPACT_POOLS;
-  const stageLimit = expanded ? EXPANDED_STAGES : COMPACT_STAGES;
   let shownStages = 0;
   let totalStages = 0;
   for (const [index, pool] of pools.entries()) {
     const stages = Array.isArray(pool.stages) ? pool.stages.filter(Boolean) : [];
     totalStages += stages.length;
-    if (index >= poolLimit) continue;
+    if (index >= EXPANDED_POOLS) continue;
+    const status = label(pool.status);
     rows.push({
-      text: `pool ${label(pool.name) || label(pool.id) || "unnamed"} (${label(pool.status)}): ` +
-        `${count(pool.running)} running/starting · ${count(pool.queued)} queued · ` +
-        `${count(pool.results)} ready`,
-      color: "muted",
+      text: (label(pool.name) || label(pool.id) || "unnamed") + (status ? ` (${status})` : ""),
+      color: "text", bold: true,
     });
+    rows.push(...phrases(countPhrases({
+      active: count(pool.running), queued: count(pool.queued), "results ready": count(pool.results),
+    }), width));
     for (const stage of stages) {
-      if (shownStages >= stageLimit) break;
+      if (shownStages >= EXPANDED_STAGES) break;
       shownStages++;
-      const running = count(stage.running);
-      const queued = count(stage.queued);
-      const settled = count(stage.settled);
-      const failed = count(stage.failed);
-      const cancelled = count(stage.cancelled);
-      const activity = running || queued ? `${running} running/starting · ${queued} queued` : "idle";
+      const stats = countPhrases({
+        failed: count(stage.failed), cancelled: count(stage.cancelled),
+        active: count(stage.running), queued: count(stage.queued), settled: count(stage.settled),
+      });
       rows.push({
-        text: `phase ${label(stage.name) || label(stage.id) || "unnamed"}: ${activity}` +
-          ` · ${settled} settled · ${failed} failed · ${cancelled} cancelled`,
-        color: "muted",
+        text: `  ${label(stage.name) || label(stage.id) || "unnamed"}`,
+        tail: stats.join(" · ") || "idle", color: "muted",
+        tailColor: count(stage.failed) ? "error" : "dim",
       });
     }
   }
-  if (pools.length > poolLimit || totalStages > shownStages) {
-    rows.push({
-      text: `${Math.max(0, pools.length - poolLimit)} pools / ` +
-        `${totalStages - shownStages} phases hidden`,
-      color: "dim",
-    });
-  }
+  const hidden = countPhrases({
+    "pools hidden": Math.max(0, pools.length - EXPANDED_POOLS),
+    "stages hidden": totalStages - shownStages,
+  });
+  if (hidden.length) rows.push({ text: hidden.join(" · "), color: "dim" });
   return rows;
 }
 
 /**
- * Pure square-fence panel. Counts describe all pools when pool metrics exist,
- * otherwise the relevant retained rows (never snapshot.totals, which folds
- * starting/idle into running and cancelled/stopped into failed). `ready` is
- * an unconsumed result queue, not a terminal outcome count. No clock-derived
- * durations or mutable caches: a completed snapshot stays frozen at any now.
+ * Pure square-fence panel. Aggregate counts describe all local kernel pools when
+ * metrics exist, otherwise the relevant retained rows; never snapshot.totals.
+ * `active` includes running/starting; `ready` is unconsumed results, not settled.
+ * No clock-derived durations or mutable caches: completed snapshots stay frozen.
  */
 export function renderSubagentPanel(
   snapshot: SubagentRuntimeSnapshot | undefined,
@@ -220,16 +223,16 @@ export function renderSubagentPanel(
   const pools = Array.isArray(snapshot.pools)
     ? snapshot.pools.filter((pool) => pool && typeof pool === "object") : [];
   if (!agents.length && !pools.length) return [];
-  // Preserve the normal Out fence column, but sacrifice the gutter in narrow panes.
   const inset = width >= CELL_INSET + 24 ? CELL_INSET : 0;
   const interior = Math.max(0, width - inset - 2);
-  const rows: PanelRow[] = [{ text: pools.length ? "Subagents · pool totals" : "Subagents · row totals",
-    color: "accent" }];
+  const padding = interior >= 4 ? 1 : 0;
+  const content = Math.max(0, interior - padding * 2);
+  const rows: PanelRow[] = [{ text: "Subagents", color: "text", bold: true }];
   const counts = rowCounts(agents);
   if (pools.length) {
-    let running = 0, queued = 0, ready = 0, settled = 0, failed = 0, cancelled = 0;
+    let active = 0, queued = 0, ready = 0, settled = 0, failed = 0, cancelled = 0;
     for (const pool of pools) {
-      running += count(pool.running);
+      active += count(pool.running);
       queued += count(pool.queued);
       ready += count(pool.results);
       for (const stage of Array.isArray(pool.stages) ? pool.stages : []) {
@@ -239,36 +242,52 @@ export function renderSubagentPanel(
         cancelled += count(stage.cancelled);
       }
     }
-    rows.push(...phrases([
-      `${running} running/starting`, `${queued} queued`, `${ready} ready`,
-      `${settled} settled`, `${failed} failed`, `${cancelled} cancelled`,
-    ], interior));
-    if (counts.idle) rows.push({ text: `${counts.idle} idle retained sessions`, color: "muted" });
-    rows.push(...poolRows(pools, !!options.expanded));
+    rows.push(...phrases(countPhrases({
+      active, queued, "results ready": ready, failed, cancelled, settled, "idle sessions": counts.idle,
+    }), content));
   } else {
-    rows.push(...phrases(Object.entries(counts)
-      .filter(([key, value]) => value || key === "running" || key === "queued")
-      .map(([key, value]) => `${value} ${key}`), interior));
+    rows.push(...phrases(countPhrases(counts), content));
   }
   const shown = visibleAgents(agents, options.expanded ? EXPANDED_AGENTS : COMPACT_AGENTS);
-  rows.push(...shown.map((agent) => agentRow(agent, interior)));
+  let currentGroup = "";
+  for (const agent of shown) {
+    const heading = group(agent);
+    if (heading !== currentGroup) {
+      rows.push({ text: "" }, { text: heading, bold: true,
+        color: heading === "Needs attention" ? "warning" : "muted" });
+      currentGroup = heading;
+    }
+    rows.push(...agentRows(agent, !!options.expanded));
+  }
   if (agents.length > shown.length) {
-    rows.push({ text: `${agents.length - shown.length} agents hidden` +
-      (options.expanded ? " (panel limit)" : " · expand for more"), color: "dim" });
+    rows.push({ text: "" }, { text: `${agents.length - shown.length} agents hidden` +
+      (options.expanded ? " · panel limit" : " · expand for more"), color: "dim" });
+  }
+  if (options.expanded && pools.length) {
+    rows.push({ text: "" }, { text: "Pool detail · this kernel", bold: true, color: "muted" },
+      ...poolRows(pools, content));
   }
   const theme = options.theme;
-  const paint = (text: string, color: ThemeColor = "muted"): string =>
-    theme ? theme.fg(color, text) : text;
-  // One column cannot hold both fences; use a bounded minimal marker instead.
+  const paint = (text: string, color: ThemeColor = "muted", bold = false): string => {
+    if (!theme) return text;
+    const styled = theme.fg(color, text);
+    return bold && typeof theme.bold === "function" ? theme.bold(styled) : styled;
+  };
   if (width === 1) return [paint("…")];
   const prefix = " ".repeat(inset);
+  const blank = { text: "" };
   return [
-    prefix + paint(`┌${"─".repeat(interior)}┐`),
-    ...rows.map((row) => {
-      const text = clip(row.text, interior);
-      return prefix + paint("│") + paint(text, row.color) +
-        " ".repeat(Math.max(0, interior - visibleWidth(text))) + paint("│");
+    prefix + paint(`┌${"─".repeat(interior)}┐`, "borderMuted"),
+    ...[blank, ...rows, blank].map((row: PanelRow) => {
+      // On narrow panes, preserve the name rather than spending all space on status.
+      const tail = row.tail && content >= 20 ? clip(row.tail, Math.floor(content / 2)) : "";
+      const nameWidth = tail ? content - visibleWidth(tail) - 2 : content;
+      const text = clip(row.text, nameWidth);
+      const gap = Math.max(0, content - visibleWidth(text) - visibleWidth(tail));
+      return prefix + paint("│", "borderMuted") + " ".repeat(padding) +
+        paint(text, row.color, row.bold) + " ".repeat(gap) +
+        paint(tail, row.tailColor) + " ".repeat(padding) + paint("│", "borderMuted");
     }),
-    prefix + paint(`└${"─".repeat(interior)}┘`),
+    prefix + paint(`└${"─".repeat(interior)}┘`, "borderMuted"),
   ];
 }
