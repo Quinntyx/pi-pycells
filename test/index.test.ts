@@ -285,6 +285,13 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
       { cwd: process.cwd() }
     );
     assert.equal(readResult.content[0].text, "cell 3 offset 2 limit 4");
+    assert.equal(typeof readCellOutput.renderResult, "function");
+    const readLines = readCellOutput.renderResult(readResult, { expanded: true }, {
+      fg: (_color, text) => text,
+    }).render(80).join("\n");
+    assert.match(readLines, /Out\[3\]:/);
+    assert.match(readLines, /cell 3 offset 2 limit 4/);
+    assert.ok(!readLines.includes("In["));
 
     const provisionKernel = registered.find((tool) => tool.name === "provision_kernel");
     assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["notebook", "source", "version"]);

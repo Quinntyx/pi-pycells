@@ -559,6 +559,31 @@ function renderReadOneCompleted(
     return lines;
   }, state, redraw, () => currentViewportMode(expanded));
 }
+/** read_cell_output: the requested durable page, verbatim, in an Out[N] box. */
+function renderReadOutput(
+  result: NotebookToolResult,
+  details: CellOpDetails,
+  options: NotebookRenderOptions,
+  theme: Theme,
+  state: NotebookRenderState,
+  redraw?: () => void,
+): Component {
+  const expanded = options.expanded ?? false;
+  return new NotebookComponent((width, layout) => {
+    // A page can begin inside a section or traceback. Do not strip markers,
+    // reinterpret the text as an execution response, or fabricate an In box.
+    const text = resultText(result) || (options.isPartial ? "Reading output…" : "(No output)");
+    const outputStyle = result.isError ? "error" as const
+      : options.isPartial || text === "(No output)" ? "muted" as const : undefined;
+    const labelBackground = result.isError ? "toolErrorBg" as const
+      : options.isPartial ? "toolPendingBg" as const : "toolSuccessBg" as const;
+    return layout.box("output", bodyLineCount(text), {
+      ...boxOptions(details, expanded, theme, state), width,
+      cellNumber: details.cellIdx ?? null, viewStart: 1, outputStyle, labelBackground,
+    }, (opts) => renderOutCell(text, opts));
+  }, state, redraw, () => currentViewportMode(expanded));
+}
+
 /** read_cells: compact per-cell list (headers muted, sources plain). */
 function renderReadManyCompleted(
   details: CellOpDetails,
@@ -619,6 +644,9 @@ export function renderNotebookResult(
         ? details.cellSource !== undefined
         : details.userCode !== undefined || state.callCode !== undefined;
       if (state.resultOwnsInput) state.streamingHighlights?.cancelPending();
+    }
+    if (toolName === "read_cell_output") {
+      return renderReadOutput(result, details, options, theme, state, context?.invalidate);
     }
     if (options.isPartial) {
       return renderExecutingFrame(toolName, details, theme, state, options.expanded ?? false, context?.invalidate);

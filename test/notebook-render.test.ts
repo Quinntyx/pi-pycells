@@ -556,3 +556,52 @@ test("panel clock invalidates known-count live frames; completed snapshots/time 
   renderNotebookResult("exec_cell", textResult("output", timestamped), {}, PLAIN_THEME).render(50);
   assert.equal(calls.at(-1).options.now, 120, "recorded snapshot time is authoritative");
 });
+
+
+// read_cell_output uses the persisted execution number, never a synthetic input.
+test("read_cell_output renders only Out[N] and preserves a requested page verbatim", () => {
+  const page = "kernel:\n    literal user output\n... next page: offset=9 ...";
+  const lines = renderPlain("read_cell_output", textResult(page, { cellIdx: 23 }), { expanded: true });
+  const text = lines.join("\n");
+  assert.match(text, /Out\[23\]:/);
+  assert.ok(!text.includes("In["));
+  assert.ok(text.includes("kernel:"));
+  assert.ok(text.includes("literal user output"));
+  assert.ok(text.includes("offset=9"));
+});
+
+test("read_cell_output collapse and expansion use the shared output viewport", () => {
+  const page = Array.from({ length: 40 }, (_, i) => `page_line_${i + 1}`).join("\n");
+  const result = textResult(page, { cellIdx: 9 });
+  const collapsed = renderPlain("read_cell_output", result).join("\n");
+  const expanded = renderPlain("read_cell_output", result, { expanded: true }).join("\n");
+  assert.match(collapsed, /Out\[9\]:/);
+  assert.ok(!collapsed.includes("page_line_40"));
+  assert.ok(expanded.includes("page_line_40"));
+});
+
+test("read_cell_output errors are red and retain the requested cell number", () => {
+  const lines = renderLines("read_cell_output", textResult("read_cell_output failed: no such cell", { cellIdx: 17 }, true));
+  assert.ok(lines.join("\n").includes("Out[17]:"));
+  const row = lines.find((line) => line.includes("read_cell_output failed"));
+  assert.ok(row.includes("\u0001error\u0002"), JSON.stringify(row));
+  assert.ok(!lines.join("\n").includes("In["));
+});
+
+test("read_cell_output pending and empty frames do not masquerade as execution", () => {
+  const partial = renderPlain("read_cell_output", textResult("", { cellIdx: 4 }), { isPartial: true }).join("\n");
+  assert.match(partial, /Out\[4\]:/);
+  assert.match(partial, /Reading output/);
+  assert.ok(!partial.includes("In["));
+  const empty = renderPlain("read_cell_output", textResult("", { cellIdx: 4 })).join("\n");
+  assert.match(empty, /Out\[4\]:/);
+  assert.match(empty, /No output/);
+});
+
+test("read_cell_output remains width-bounded across narrow and wide terminals", () => {
+  const result = textResult("漢字 " + "very long output ".repeat(30), { cellIdx: 123 });
+  for (const width of [0, 1, 2, 8, 14, 20, 40, 80]) {
+    const component = renderNotebookResult("read_cell_output", result, { expanded: true }, PLAIN_THEME);
+    assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `width ${width}`);
+  }
+});

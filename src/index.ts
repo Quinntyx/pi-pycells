@@ -282,9 +282,11 @@ function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefini
         return {
           content: [{ type: "text", text: `read_cell_output failed: ${error instanceof Error ? error.message : String(error)}` }],
           details: { cellIdx, kernel },
+          isError: true,
         };
       }
     },
+    renderResult: notebookResultRenderer("read_cell_output"),
   });
 }
 
