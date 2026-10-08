@@ -6,9 +6,9 @@ const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
 
-test("pi-activity is a pinned runtime dependency, not optional or peer-only", () => {
-  assert.match(manifest.dependencies["pi-activity"],
-    /^https:\/\/git\.quinntyx\.dev\/quinntyx\/pi-activity\/archive\/[a-f0-9]{40}\.tar\.gz$/);
+test("pi-activity tracks dev as a runtime dependency, not optional or peer-only", () => {
+  assert.equal(manifest.dependencies["pi-activity"],
+    "git+https://git.quinntyx.dev/quinntyx/pi-activity.git#dev");
   assert.equal(manifest.peerDependencies?.["pi-activity"], undefined);
   assert.equal(manifest.optionalDependencies?.["pi-activity"], undefined);
 });
@@ -24,7 +24,12 @@ test("Pi loads the bundled activity API before the transport and notebook extens
 test("lockfile pins and bundles pi-activity consistently with the manifest", () => {
   const bundled = lock.packages["node_modules/pi-activity"];
   assert.deepEqual(lock.packages[""].dependencies, manifest.dependencies);
-  assert.equal(bundled.resolved, manifest.dependencies["pi-activity"]);
+  assert.match(bundled.resolved,
+    /^git\+https:\/\/git\.quinntyx\.dev\/quinntyx\/pi-activity\.git#[a-f0-9]{40}$/);
   assert.equal(bundled.inBundle, true);
-  assert.match(bundled.integrity, /^sha512-/);
+});
+
+test("project npm policy permits only directly declared Git dependencies", () => {
+  const config = fs.readFileSync(path.join(root, ".npmrc"), "utf8");
+  assert.match(config, /^allow-git=root$/m);
 });
