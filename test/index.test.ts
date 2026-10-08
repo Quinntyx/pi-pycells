@@ -1662,3 +1662,25 @@ test("kernel directory rejects opaque aliases and shares the manager's name vali
     assert.throws(() => directory.assertAvailable(name));
   }
 });
+
+
+test("provision_kernel forwards the validated kernel name to the manager", async () => {
+  const { KernelDirectory } = require("../dist/tools/kernel-directory.js");
+  let receivedName;
+  const manager = {
+    list: () => [],
+    resolveLibraryDir: () => "/tmp",
+    provision: async (options) => {
+      receivedName = options.name;
+      return { name: options.name, id: "session-forward-1", notebookPath: options.notebookPath };
+    },
+    disposeAll: async () => {},
+  };
+  const directory = new KernelDirectory(manager);
+  const { provisionKernelTool } = require("../dist/index.js");
+  const tool = provisionKernelTool(manager, directory, {});
+  const result = await tool.execute("call-1", { name: "analysis" }, undefined, undefined, { cwd: "/tmp" });
+  assert.equal(result.isError, undefined);
+  assert.equal(receivedName, "analysis");
+  assert.match(JSON.stringify(result.details), /analysis/);
+});

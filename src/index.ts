@@ -710,7 +710,7 @@ function execFilePtc(
 }
 
 /** provision_kernel tool: spawn a persistent notebook-backed kernel (optionally sourcing a workflow). */
-function provisionKernelTool(
+export function provisionKernelTool(
   sessionManager: PythonSessionManager,
   directory: KernelDirectory,
   sessionState: PtcSessionState
@@ -812,6 +812,7 @@ function provisionKernelTool(
         const { id, sourcedFrom, sourceError, scriptError } = await sessionManager.provision({
           cwd: ctx.cwd,
           ctx,
+          name,
           signal,
           onUpdate,
           parentToolCallId: toolCallId,
