@@ -1344,14 +1344,14 @@ test("provision_dependency targets the requested kernel's venv and bootstraps pi
   );
   fs.chmodSync(path.join(binDir, "uv"), 0o755);
   // fixture: a pi_subagents source dir the pinned bootstrap can install from
-  const subagentsSource = path.join(tmp, "subagents-src", "main");
+  const subagentsSource = path.join(tmp, "installed-subagents");
   fs.mkdirSync(subagentsSource, { recursive: true });
   fs.writeFileSync(path.join(subagentsSource, "pyproject.toml"), "[project]\nname='pi-subagents'\n");
 
   const previousPath = process.env.PATH;
   const previousSource = process.env.PTC_SUBAGENTS_SOURCE;
   process.env.PATH = binDir + path.delimiter + previousPath;
-  process.env.PTC_SUBAGENTS_SOURCE = path.join(tmp, "subagents-src");
+  process.env.PTC_SUBAGENTS_SOURCE = subagentsSource;
 
   const sharedPython = "/shared/venv/python";
   const pinnedPython = "/pinned/venv/python";

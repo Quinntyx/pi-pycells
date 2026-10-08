@@ -27,8 +27,8 @@ function makeOptions(cacheRoot, extensionRoot, extra = {}) {
   return {
     cacheRoot,
     extensionRoot: extensionRoot ?? cacheRoot,
-    // Keep every test off the real dev checkout / managed clone.
-    devSource: path.join(cacheRoot, "no-such-dev-checkout"),
+    // Keep every test off the host installed package.
+    installedSource: path.join(cacheRoot, "missing-installed-package"),
     ...extra,
   };
 }
@@ -66,27 +66,18 @@ function makeCheckout(layout, tmpRoot) {
   return dir;
 }
 
-test("resolvePackageDir prefers the main/ layout", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ptc-subagents-"));
+test("resolvePackageDir uses the installed package without worktree discovery", () => {
+  const tmp = tmpDir("ptc-installed-");
   try {
     const flat = makeCheckout("flat", tmp);
-    const nested = makeCheckout("main", tmp);
+    const container = makeCheckout("main", tmp);
     assert.equal(resolvePackageDir(flat), flat);
-    assert.equal(resolvePackageDir(nested), path.join(nested, "main"));
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test("resolveSourceDir resolves the dev checkout in either layout, else undefined", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ptc-subagents-"));
-  try {
+    assert.equal(resolvePackageDir(container), container);
+    assert.equal(resolveSourceDir(flat), flat);
+    assert.equal(resolveSourceDir(container), undefined);
+    assert.equal(resolveSourceDir(undefined), undefined);
     assert.equal(resolveSourceDir(path.join(tmp, "missing")), undefined);
-    const nested = makeCheckout("main", tmp);
-    assert.equal(resolveSourceDir(nested), path.join(nested, "main"));
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
 test("isStampStale honors the interval and tolerates garbage stamps", () => {
@@ -114,7 +105,7 @@ test("shouldAttemptSync retries a fresh failed stamp only when the runtime is mi
   assert.equal(shouldAttemptSync(freshFailed, interval, now, false), true);
 });
 
-test("sourceAvailable accepts a dev checkout or a managed clone", () => {
+test("sourceAvailable accepts an installed package or a managed cache clone", () => {
   const tmp = tmpDir("ptc-src-avail-");
   try {
     assert.equal(sourceAvailable(path.join(tmp, "missing"), path.join(tmp, "clone")), false);
@@ -319,5 +310,97 @@ test("defaultCacheRoot and venvPythonPath agree on the canonical layout", () => 
   assert.equal(venvPythonPath(), expected);
   if (process.platform === "win32") {
     assert.match(venvPythonPath(root), /Scripts[\\/]python\.exe$/);
+  }
+});
+
+// Isolated runners let these regressions exercise source changes without
+// installing anything into the user's interpreter or contacting a remote.
+function fakeInstalledRuntime(cacheRoot) {
+  const python = venvPythonPath(cacheRoot);
+  fs.mkdirSync(path.dirname(python), { recursive: true });
+  fs.writeFileSync(python, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const commands = path.join(cacheRoot, "commands");
+  fs.mkdirSync(commands);
+  fs.writeFileSync(path.join(commands, "uv"), "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$PTC_TEST_UV_LOG\"\nexit 0\n", { mode: 0o755 });
+  return commands;
+}
+
+for (const change of ["editable-path", "package-metadata"]) {
+  test(`fresh stamps cannot hide installed SDK ${change} changes`, { skip: process.platform === "win32" }, async () => {
+    const tmp = tmpDir("ptc-package-update-");
+    const oldPath = process.env.PATH;
+    const oldLog = process.env.PTC_TEST_UV_LOG;
+    try {
+      const source = makeCheckout("flat", tmp);
+      const cache = path.join(tmp, "cache");
+      const commands = fakeInstalledRuntime(cache);
+      const hash = require("node:crypto").createHash("sha256")
+        .update(fs.readFileSync(path.join(source, "pyproject.toml"))).digest("hex").slice(0, 16);
+      writeStamp(cache, { syncedAt: Date.now(), ok: true,
+        editablePath: change === "editable-path" ? path.join(tmp, "previous-source") : source,
+        pyprojectHash: change === "package-metadata" ? "old-package-hash" : hash });
+      process.env.PATH = commands + path.delimiter + oldPath;
+      process.env.PTC_TEST_UV_LOG = path.join(tmp, "uv.log");
+      const result = await ensureSubagentsEnv(makeOptions(cache, cache, { installedSource: source }));
+      assert.equal(result.status, "ok");
+      assert.equal(result.editablePath, source);
+      assert.match(fs.readFileSync(process.env.PTC_TEST_UV_LOG, "utf8"), /--editable/);
+      assert.equal(readStamp(cache).editablePath, source);
+      assert.equal(readStamp(cache).pyprojectHash, hash);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+      if (oldLog === undefined) delete process.env.PTC_TEST_UV_LOG; else process.env.PTC_TEST_UV_LOG = oldLog;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+}
+
+test("fallback clone selects remote dev even when main is the default", { skip: process.platform === "win32" }, async () => {
+  const tmp = tmpDir("ptc-remote-dev-");
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.PTC_TEST_UV_LOG;
+  try {
+    const git = require("node:child_process").execFileSync;
+    const remote = path.join(tmp, "remote");
+    fs.mkdirSync(remote);
+    git("git", ["init", "-b", "main", remote], { stdio: "ignore" });
+    fs.writeFileSync(path.join(remote, "pyproject.toml"), '[project]\nname="pi-subagents"\n');
+    git("git", ["-C", remote, "add", "pyproject.toml"]);
+    git("git", ["-C", remote, "-c", "user.name=Runtime Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture"], { stdio: "ignore" });
+    git("git", ["-C", remote, "branch", "dev"]);
+    fs.writeFileSync(path.join(remote, "default-branch-only"), "main");
+    git("git", ["-C", remote, "add", "default-branch-only"]);
+    git("git", ["-C", remote, "-c", "user.name=Runtime Test", "-c", "user.email=test@example.invalid", "commit", "-m", "main only"], { stdio: "ignore" });
+    const cache = path.join(tmp, "cache");
+    const commands = fakeInstalledRuntime(cache);
+    process.env.PATH = commands + path.delimiter + oldPath;
+    process.env.PTC_TEST_UV_LOG = path.join(tmp, "uv.log");
+    const result = await ensureSubagentsEnv(makeOptions(cache, cache, { repoUrl: remote }));
+    assert.equal(result.status, "ok");
+    assert.equal(result.managed, true);
+    const clone = path.join(cache, "pi-subagents");
+    assert.equal(git("git", ["-C", clone, "branch", "--show-current"], { encoding: "utf8" }).trim(), "dev");
+    assert.equal(fs.existsSync(path.join(clone, "default-branch-only")), false);
+    assert.equal(readStamp(cache).managedRef, "dev");
+
+    // A successful, fresh stamp from the previous main-based bootstrap must
+    // migrate immediately instead of waiting for the normal sync interval.
+    const legacyCache = path.join(tmp, "legacy-cache");
+    const legacyCommands = fakeInstalledRuntime(legacyCache);
+    const legacyClone = path.join(legacyCache, "pi-subagents");
+    git("git", ["clone", "--branch", "main", remote, legacyClone], { stdio: "ignore" });
+    const hash = require("node:crypto").createHash("sha256")
+      .update(fs.readFileSync(path.join(legacyClone, "pyproject.toml"))).digest("hex").slice(0, 16);
+    writeStamp(legacyCache, { syncedAt: Date.now(), ok: true,
+      editablePath: legacyClone, pyprojectHash: hash });
+    process.env.PATH = legacyCommands + path.delimiter + oldPath;
+    const migrated = await ensureSubagentsEnv(makeOptions(legacyCache, legacyCache, { repoUrl: remote }));
+    assert.equal(migrated.status, "ok");
+    assert.equal(fs.existsSync(path.join(legacyClone, "default-branch-only")), false);
+    assert.equal(readStamp(legacyCache).managedRef, "dev");
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldLog === undefined) delete process.env.PTC_TEST_UV_LOG; else process.env.PTC_TEST_UV_LOG = oldLog;
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

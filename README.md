@@ -16,10 +16,24 @@ session is never a kernel argument.
 First, make sure Pi can answer a normal prompt and that [`uv`](https://docs.astral.sh/uv/) is on your PATH.
 
 ```bash
-pi install git:github.com/Quinntyx/pi-pycells
+pi install git:git.quinntyx.dev/quinntyx/pi-pycells@dev
 ```
 
-For local development, use `pi install /path/to/pi-pycells` instead. Restart Pi after installing, then try:
+For subagent orchestration, install the Python runtime as a separate Pi package:
+
+```bash
+pi install git:git.quinntyx.dev/quinntyx/pi-subagents@dev
+pi update --extensions
+```
+
+Both packages track remote `dev`. After pushing changes to `pi-subagents/dev`,
+`pi update --extensions` refreshes its installed package even when `pi-pycells`
+has not changed. Restart Pi afterward; fresh kernels import the updated runtime.
+No `~/docs/src` checkout or local runtime-loader extension is needed. The package
+exports its installed location; children retain the parent's already-pinned
+runtime without updating or installing anything.
+
+Restart Pi after installing, then try:
 
 ```bash
 pi -p "Create a Python kernel, execute a cell containing 1 + 1, and show the result."
@@ -28,7 +42,7 @@ pi -p "Create a Python kernel, execute a cell containing 1 + 1, and show the res
 To remove the package:
 
 ```bash
-pi remove git:github.com/Quinntyx/pi-pycells
+pi remove git:git.quinntyx.dev/quinntyx/pi-pycells@dev
 ```
 
 ### Requirements

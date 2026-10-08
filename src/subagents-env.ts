@@ -10,17 +10,17 @@
  *   1. venv: create ~/.cache/pi-pycells/python-env-<ver> when missing (uv when
  *      available, else `python3 -m venv`) — resolvePythonExecutable()
  *      prefers this venv for all provision_kernel interpreters.
- *   2. source: PTC_SUBAGENTS_SOURCE (dev checkout, e.g. ~/docs/src/pi-subagents)
- *      when present, else a managed git clone at ~/.cache/pi-pycells/pi-subagents
- *      (cloned from PTC_SUBAGENTS_REPO_URL, fetched + reset on each sync).
+ *   2. source: the installed pi-subagents Pi package, exported through
+ *      PTC_SUBAGENTS_SOURCE. A managed cache clone of the remote dev branch is
+ *      the fallback; local development checkouts are never discovered.
  *   3. editable install of pi_subagents into the venv when first set up, when
  *      the editable path changes, or when pyproject.toml changed since the
  *      last sync; pure code updates only need the git pull/editable path.
  *
  * Sync trigger: the stamp file lives INSIDE this package's clone
- * (<extensionRoot>/.ptc-subagents-sync.json) — `pi update` resets and cleans
- * package clones, wiping the stamp, so updating extensions re-syncs
- * pi_subagents. Between updates the stamp throttles syncs to once per
+ * (<extensionRoot>/.ptc-subagents-sync.json). Updating changed extensions clears
+ * it; an independently updated SDK bypasses the throttle when its package
+ * metadata or installed source changes. Between updates syncs run once per
  * PTC_SUBAGENTS_SYNC_INTERVAL_HOURS (default 24). Runs are serialized by a
  * pid-tagged lock file (atomic O_CREAT|O_EXCL acquire; a lock whose holder has
  * died is broken). Successes are stamped; failures are stamped too but retry
@@ -46,8 +46,8 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { debugLog, logWarning } from "./utils";
 
-const DEFAULT_REPO_URL = "https://github.com/Quinntyx/pi-subagents";
-const DEV_SOURCE_DEFAULT = join(homedir(), "docs", "src", "pi-subagents");
+const DEFAULT_REPO_URL = "https://git.quinntyx.dev/quinntyx/pi-subagents.git";
+const DEFAULT_REPO_REF = "dev";
 const LOCK_MAX_AGE_MS = 5 * 60 * 1000;
 /** Rotate subagents-sync.log once it exceeds this size (keeps one .1 backup). */
 const MAX_LOG_BYTES = 1_000_000;
@@ -58,8 +58,8 @@ export interface SubagentsEnvOptions {
   /** This package's clone dir — hosts the sync stamp; wiped by `pi update`. */
   extensionRoot?: string;
   repoUrl?: string;
-  /** Dev checkout to install editable instead of the managed clone. */
-  devSource?: string;
+  /** Installed Pi package source (otherwise use the managed cache clone). */
+  installedSource?: string;
   syncIntervalMs?: number;
   now?: () => number;
 }
@@ -73,7 +73,7 @@ export interface SubagentsEnvResult {
   venvPython?: string;
   /** Directory the editable install points at. */
   editablePath?: string;
-  /** True when pi_subagents came from the managed clone, not a dev checkout. */
+  /** True when pi_subagents came from the managed cache clone. */
   managed?: boolean;
   /** Short git HEAD of the installed pi-subagents checkout. */
   commit?: string;
@@ -83,6 +83,7 @@ interface Stamp {
   syncedAt: number;
   editablePath?: string;
   pyprojectHash?: string;
+  managedRef?: string;
   ok?: boolean;
 }
 
@@ -158,22 +159,21 @@ export function inheritedSubagentsRuntime(requestedVersion?: string): SubagentsE
 
 /** Pure: where the pip package lives inside a pi-subagents checkout. */
 export function resolvePackageDir(checkout: string): string {
-  return existsSync(join(checkout, "main", "pyproject.toml")) ? join(checkout, "main") : checkout;
+  return checkout;
 }
 
-/** Pure: which source dir to install editable from (dev checkout wins). */
+/** Pure: validate an installed package source, without worktree discovery. */
 export function resolveSourceDir(
-  devSource: string | undefined,
+  installedSource: string | undefined,
 ): string | undefined {
-  const root = devSource ?? DEV_SOURCE_DEFAULT;
-  if (existsSync(join(root, "main", "pyproject.toml"))) return join(root, "main");
-  if (existsSync(join(root, "pyproject.toml"))) return root;
+  if (installedSource && existsSync(join(installedSource, "pyproject.toml"))) return installedSource;
   return undefined;
 }
 
 /** The pi_subagents package dir a venv bootstrap should install from. */
-export function resolvePiSubagentsSource(devSource?: string): string | undefined {
-  return resolveSourceDir(devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT);
+export function resolvePiSubagentsSource(installedSource?: string): string | undefined {
+  return resolveSourceDir(installedSource ?? process.env.PTC_SUBAGENTS_SOURCE) ??
+    resolveSourceDir(join(defaultCacheRoot(), "pi-subagents"));
 }
 
 /** Pure: stamps older than the interval (or missing) trigger a sync. */
@@ -206,9 +206,9 @@ export function shouldAttemptSync(
   return stamp?.ok === false && !runtimeReady;
 }
 
-/** Pure: is a usable pi_subagents source available (dev checkout or managed clone)? */
-export function sourceAvailable(devSource: string | undefined, cloneDir: string): boolean {
-  return resolveSourceDir(devSource) !== undefined || existsSync(join(cloneDir, ".git"));
+/** Pure: is an installed package source or managed cache clone available? */
+export function sourceAvailable(installedSource: string | undefined, cloneDir: string): boolean {
+  return resolveSourceDir(installedSource) !== undefined || existsSync(join(cloneDir, ".git"));
 }
 
 /** Pure: default cache root shared with sandbox-manager's venv lookup. */
@@ -563,10 +563,19 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
     stamp = undefined;
   }
   const intervalMs = syncIntervalFromEnv();
-  const devSource = options.devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT;
+  const installedSource = options.installedSource ?? process.env.PTC_SUBAGENTS_SOURCE;
+  const selectedSource = resolveSourceDir(installedSource) ?? resolveSourceDir(paths.cloneDir);
+  // Package updates and migration away from an old editable path bypass the
+  // throttle. Pure code updates are visible immediately through the editable.
+  const sourceChanged = !!selectedSource && stamp?.ok === true &&
+    (stamp.editablePath !== selectedSource ||
+     stamp.pyprojectHash !== sha256File(join(selectedSource, "pyproject.toml")));
   const runtimeReady =
-    existsSync(paths.venvPython) && sourceAvailable(devSource, paths.cloneDir);
-  if (!shouldAttemptSync(stamp, intervalMs, options.now?.() ?? Date.now(), runtimeReady)) {
+    existsSync(paths.venvPython) && sourceAvailable(installedSource, paths.cloneDir);
+  const managedRefChanged = !!selectedSource && !resolveSourceDir(installedSource) &&
+    stamp?.ok === true && stamp.managedRef !== DEFAULT_REPO_REF;
+  if (!sourceChanged && !managedRefChanged &&
+      !shouldAttemptSync(stamp, intervalMs, options.now?.() ?? Date.now(), runtimeReady)) {
     return { status: "skipped", reason: "recently synced", venvPython: paths.venvPython };
   }
 
@@ -584,14 +593,14 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
     }
   }
 
-  // 2. resolve the source dir (dev checkout wins, else managed clone)
-  let pkgDir = resolveSourceDir(devSource);
+  // 2. use the installed Pi package, otherwise the managed remote dev clone.
+  let pkgDir = resolveSourceDir(installedSource);
   let managed = false;
   if (!pkgDir) {
     managed = true;
     if (!existsSync(join(paths.cloneDir, ".git"))) {
       const cloned = await runLogged(paths.logFile, "git", [
-        "clone",
+        "clone", "--branch", DEFAULT_REPO_REF, "--single-branch",
         options.repoUrl ?? process.env.PTC_SUBAGENTS_REPO_URL ?? DEFAULT_REPO_URL,
         paths.cloneDir,
       ]);
@@ -600,7 +609,10 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
       }
     } else if (!(await updateManagedClone(paths))) {
       // keep working with the existing checkout; the editable install is fine
-      logWarning("pi-subagents env: managed clone update failed, using the existing checkout");
+      if (stamp?.managedRef !== DEFAULT_REPO_REF) {
+        return finish({ status: "failed", reason: "could not update the managed pi-subagents clone to remote dev" });
+      }
+      logWarning("pi-subagents env: managed dev clone update failed, using the existing checkout");
     }
     pkgDir = resolvePackageDir(paths.cloneDir);
   }
@@ -630,7 +642,7 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
 
   return finish(
     { status: "ok", venvPython: paths.venvPython, editablePath: pkgDir, managed, commit: gitHead(pkgDir ?? "") },
-    { pyprojectHash, editablePath: pkgDir },
+    { pyprojectHash, editablePath: pkgDir, managedRef: managed ? DEFAULT_REPO_REF : undefined },
   );
 }
 
@@ -658,13 +670,10 @@ async function pipEditableInstall(paths: Paths, pkgDir: string): Promise<boolean
   return runLogged(paths.logFile, paths.venvPython, ["-m", "pip", "install", "--editable", pkgDir]);
 }
 
-/** Fetch + hard-reset the managed clone onto the remote's default branch. */
+/** Fetch the remote dev ref and reset only our disposable managed cache clone. */
 async function updateManagedClone(paths: Paths): Promise<boolean> {
-  if (!(await runLogged(paths.logFile, "git", ["-C", paths.cloneDir, "fetch", "origin"]))) {
+  if (!(await runLogged(paths.logFile, "git", ["-C", paths.cloneDir, "fetch", "origin", DEFAULT_REPO_REF]))) {
     return false;
   }
-  if (await runLogged(paths.logFile, "git", ["-C", paths.cloneDir, "reset", "--hard", "origin/HEAD"])) {
-    return true;
-  }
-  return runLogged(paths.logFile, "git", ["-C", paths.cloneDir, "reset", "--hard", "origin/main"]);
+  return runLogged(paths.logFile, "git", ["-C", paths.cloneDir, "reset", "--hard", "FETCH_HEAD"]);
 }

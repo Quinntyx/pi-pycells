@@ -1974,42 +1974,44 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   subagentRuntime = createSubagentRuntime(sessionManager);
   (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = subagentRuntime;
 
-  // Provision the pi_subagents runtime in the background — but only when the
-  // user opted in: subagents are OFF unless PI_SUBAGENTS_MAX_CONCURRENT is set
-  // to a positive number (which also becomes the per-process pool cap). An
-  // "optional" dependency that installs itself before you asked is just an
-  // unrequested install; nothing downloads until you enable it.
-  if (isNestedSubagent()) {
-    // tmux must explicitly forward the interpreter/source exported by the parent
-    // kernel. A child must never enter the bootstrap lock or run installers.
-    const result = await startSubagentsEnv({ extensionRoot });
-    if (result.status === "failed") console.warn(`[PTC] nested runtime unavailable: ${result.reason}`);
-  } else if (subagentsProvisioningEnabled()) {
-    // Memoized and shared: the session manager's readiness gate awaits this
-    // same promise before its first kernel spawn, so a first-install kernel
-    // does not lock in system python3 while packages land in the venv.
-    // Provisioning is best-effort, but its failure must not be fully silent:
-    // log one warning (details live in ~/.cache/pi-pycells/subagents-sync.log).
-    void startSubagentsEnv({ extensionRoot }).then((result) => {
-      if (result.status === "failed") {
-        console.warn(
-          `[PTC] pi_subagents provisioning failed: ${result.reason}. ` +
-          "Core Python kernels are unaffected; see ~/.cache/pi-pycells/subagents-sync.log for details."
-        );
-      }
+  const bootstrapRuntime = async (): Promise<void> => {
+    // Provision the pi_subagents runtime in the background — but only when the
+    // user opted in: subagents are OFF unless PI_SUBAGENTS_MAX_CONCURRENT is set
+    // to a positive number (which also becomes the per-process pool cap). An
+    // "optional" dependency that installs itself before you asked is just an
+    // unrequested install; nothing downloads until you enable it.
+    if (isNestedSubagent()) {
+      // tmux must explicitly forward the interpreter/source exported by the parent
+      // kernel. A child must never enter the bootstrap lock or run installers.
+      const result = await startSubagentsEnv({ extensionRoot });
+      if (result.status === "failed") console.warn(`[PTC] nested runtime unavailable: ${result.reason}`);
+    } else if (subagentsProvisioningEnabled()) {
+      // Memoized and shared: the session manager's readiness gate awaits this
+      // same promise before its first kernel spawn, so a first-install kernel
+      // does not lock in system python3 while packages land in the venv.
+      // Provisioning is best-effort, but its failure must not be fully silent:
+      // log one warning (details live in ~/.cache/pi-pycells/subagents-sync.log).
+      void startSubagentsEnv({ extensionRoot }).then((result) => {
+        if (result.status === "failed") {
+          console.warn(
+            `[PTC] pi_subagents provisioning failed: ${result.reason}. ` +
+            "Core Python kernels are unaffected; see ~/.cache/pi-pycells/subagents-sync.log for details."
+          );
+        }
+        });
+    } else {
+      // Root with orchestration disabled: only provision the notebook interpreter.
+      // Children took the validation-only branch above; never bootstrap them.
+      void ensurePtcVenv().then((ok) => {
+        if (!ok) {
+          console.warn(
+            "[PTC] could not create the shared Python venv (uv is required — " +
+            "https://docs.astral.sh/uv/). Python kernels will fail to start here."
+          );
+        }
       });
-  } else {
-    // Root with orchestration disabled: only provision the notebook interpreter.
-    // Children took the validation-only branch above; never bootstrap them.
-    void ensurePtcVenv().then((ok) => {
-      if (!ok) {
-        console.warn(
-          "[PTC] could not create the shared Python venv (uv is required — " +
-          "https://docs.astral.sh/uv/). Python kernels will fail to start here."
-        );
-      }
-    });
-  }
+    }
+  };
 
   registerPtcCommand(pi, sessionManager, kernelDirectory);
   registerWorkflowCommand(pi);
@@ -2045,7 +2047,10 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   const onAgentEnd = handleAgentEnd.bind(undefined, pi, sessionState);
   const onSessionShutdown = handleSessionShutdown.bind(undefined, customToolManager, sandboxManager, sessionManager);
 
-  pi.on("session_start", onSessionStart);
+  pi.on("session_start", async (event, ctx) => {
+    await bootstrapRuntime();
+    await onSessionStart(event, ctx);
+  });
   pi.on("before_agent_start", onBeforeAgentStart);
   (pi as unknown as { on(event: "context", handler: typeof onContext): void }).on("context", onContext);
   pi.on("tool_result", onToolResult);
