@@ -1,7 +1,8 @@
-/** Flat, bounded subagent status appended by the notebook renderer below Out. */
+/** Full working roster and bounded queue appended by the notebook renderer below Out. */
 
-import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { Theme, ThemeBg, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { restoreBackground } from "./cell-view";
 import type {
   SubagentAgentRow,
   SubagentPoolState,
@@ -13,6 +14,8 @@ export interface SubagentPanelOptions {
   theme?: Theme;
   execId?: string;
   expanded?: boolean;
+  /** Host tool background, matching the enclosing Out box. */
+  background?: ThemeBg;
   /** Accepted for the shared render contract; snapshot rows never tick forward. */
   now?: number;
 }
@@ -33,8 +36,8 @@ export function relevantAgents(
   );
 }
 
-const COMPACT_AGENTS = 4;
-const EXPANDED_AGENTS = 12;
+const COMPACT_QUEUED = 4;
+const EXPANDED_QUEUED = 12;
 const EXPANDED_POOLS = 3;
 const EXPANDED_STAGES = 6;
 // Cell boxes reserve a 12-column label/metadata gutter plus inset and separator.
@@ -113,39 +116,6 @@ function phrases(parts: string[], width: number): PanelRow[] {
 function countPhrases(values: Record<string, number>): string[] {
   return Object.entries(values).filter(([, value]) => value > 0)
     .map(([name, value]) => `${value} ${name}`);
-}
-
-function priority(agent: SubagentAgentRow): number {
-  // Actionable failures stay visible even with a very large live roster.
-  return ["failed", "cancelled", "stopped", "running", "starting", "queued", "idle",
-    "other", "closed", "settled"].indexOf(state(agent));
-}
-
-/** Keep only the bounded best rows, stable within each status, without sorting the roster. */
-function visibleAgents(agents: SubagentAgentRow[], limit: number): SubagentAgentRow[] {
-  const selected: SubagentAgentRow[] = [];
-  for (const agent of agents) {
-    const rank = priority(agent);
-    const index = selected.findIndex((row) => priority(row) > rank);
-    if (index < 0) {
-      if (selected.length < limit) selected.push(agent);
-    } else {
-      selected.splice(index, 0, agent);
-      if (selected.length > limit) selected.pop();
-    }
-  }
-  return selected;
-}
-
-function group(agent: SubagentAgentRow): string {
-  switch (state(agent)) {
-    case "failed": case "cancelled": case "stopped": return "Needs attention";
-    case "running": case "starting": return "Working";
-    case "queued": return "Queued";
-    case "idle": return "Idle sessions";
-    case "settled": case "closed": return "Finished";
-    default: return "Other";
-  }
 }
 
 function agentRows(agent: SubagentAgentRow, expanded: boolean): PanelRow[] {
@@ -248,20 +218,28 @@ export function renderSubagentPanel(
   } else {
     rows.push(...phrases(countPhrases(counts), content));
   }
-  const shown = visibleAgents(agents, options.expanded ? EXPANDED_AGENTS : COMPACT_AGENTS);
-  let currentGroup = "";
-  for (const agent of shown) {
-    const heading = group(agent);
-    if (heading !== currentGroup) {
-      rows.push({ text: "" }, { text: heading, bold: true,
-        color: heading === "Needs attention" ? "warning" : "muted" });
-      currentGroup = heading;
+  // Every working agent gets a row, even when concurrency exceeds the old
+  // panel limits. Only the queue is capped; idle/terminal sessions stay in totals.
+  const working: SubagentAgentRow[] = [];
+  const queued: SubagentAgentRow[] = [];
+  const queuedLimit = options.expanded ? EXPANDED_QUEUED : COMPACT_QUEUED;
+  let queuedCount = 0;
+  for (const agent of agents) {
+    const kind = state(agent);
+    if (kind === "running" || kind === "starting") working.push(agent);
+    else if (kind === "queued") {
+      queuedCount++;
+      if (queued.length < queuedLimit) queued.push(agent);
     }
-    rows.push(...agentRows(agent, !!options.expanded));
   }
-  if (agents.length > shown.length) {
-    rows.push({ text: "" }, { text: `${agents.length - shown.length} agents hidden` +
-      (options.expanded ? " · panel limit" : " · expand for more"), color: "dim" });
+  for (const [heading, members] of [["Working", working], ["Queued", queued]] as const) {
+    if (!members.length) continue;
+    rows.push({ text: "" }, { text: heading, bold: true, color: "muted" });
+    for (const agent of members) rows.push(...agentRows(agent, !!options.expanded));
+    if (heading === "Queued" && queuedCount > queued.length) {
+      rows.push({ text: `${queuedCount - queued.length} queued hidden` +
+        (options.expanded ? " · panel limit" : " · expand for more"), color: "dim" });
+    }
   }
   if (options.expanded && pools.length) {
     rows.push({ text: "" }, { text: "Pool detail · this kernel", bold: true, color: "muted" },
@@ -273,10 +251,15 @@ export function renderSubagentPanel(
     const styled = theme.fg(color, text);
     return bold && typeof theme.bold === "function" ? theme.bold(styled) : styled;
   };
-  if (width === 1) return [paint("…")];
+  const backgroundName = options.background ?? "toolSuccessBg";
+  const background = theme?.bg ? theme.getBgAnsi?.(backgroundName) : undefined;
+  const paintBackground = (lines: string[]): string[] => !theme?.bg ? lines
+    : lines.map((line) => theme.bg(backgroundName,
+      background ? restoreBackground(line, background) : line));
+  if (width === 1) return paintBackground([paint("…")]);
   const prefix = " ".repeat(inset);
   const blank = { text: "" };
-  return [
+  return paintBackground([
     prefix + paint(`┌${"─".repeat(interior)}┐`, "borderMuted"),
     ...[blank, ...rows, blank].map((row: PanelRow) => {
       // On narrow panes, preserve the name rather than spending all space on status.
@@ -289,5 +272,5 @@ export function renderSubagentPanel(
         paint(tail, row.tailColor) + " ".repeat(padding) + paint("│", "borderMuted");
     }),
     prefix + paint(`└${"─".repeat(interior)}┘`, "borderMuted"),
-  ];
+  ]);
 }

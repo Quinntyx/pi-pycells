@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { relevantAgents } = require("../dist/execution/subagent-panel.js");
 
-// The panel is flat and bounded, with aggregate metrics separate from retained
+// The working roster is uncapped and the queue is bounded, with aggregate metrics separate from retained
 // session rows. Snapshot filtering is also used by the status-bar footer.
 
 test("relevantAgents returns all rows when no exec id is given", () => {
@@ -41,7 +41,7 @@ test("relevantAgents tolerates missing or malformed snapshots", () => {
 const { renderSubagentPanel } = require("../dist/execution/subagent-panel.js");
 const { visibleWidth } = require("../dist/execution/cell-view.js");
 
-test("flat panel is bounded for 1000 rows and reports hidden population", () => {
+test("queue stays bounded for 1000 rows and reports only hidden queued tasks", () => {
   const snapshot = { agents: Array.from({ length: 1000 }, (_, i) => ({
     id: `a${i}`, name: `worker-${i}`, status: i < 2 ? "running" : "queued",
     label: "implementing", liveTool: "read", phase: "building",
@@ -51,7 +51,7 @@ test("flat panel is bounded for 1000 rows and reports hidden population", () => 
     const text = lines.join("\n");
     assert.match(text, /2 running/);
     assert.match(text, /998 queued/);
-    assert.match(text, expanded ? /988 agents hidden/ : /996 agents hidden/);
+    assert.match(text, expanded ? /986 queued hidden/ : /994 queued hidden/);
     assert.match(text, /read · implementing/);
     assert.ok(!/phase:|activity:|tool:/.test(text), "no repeated field-label soup");
     assert.ok(lines.length <= (expanded ? 60 : 30));
@@ -99,7 +99,8 @@ test("collapsed panel has a sparse header and no duplicated pool/stage diagnosti
   assert.match(text, /Subagents/);
   assert.match(text, /7 active · 1 queued/);
   assert.match(text, /Working/);
-  assert.match(text, /4 agents hidden · expand for more/);
+  for (let i = 0; i < 8; i++) assert.ok(text.includes(`deus-${i}-build`));
+  assert.ok(!text.includes("hidden"));
   assert.ok(!/pool totals|row totals|deus-v1|phase:|phase build|phase review/.test(text));
   assert.ok(!/\b0 (?:queued|ready|settled|failed|cancelled|pools|stages)/.test(text));
   const header = lines.findIndex((line) => line.includes("Subagents"));
@@ -139,15 +140,24 @@ test("primary names use available width and tools appear only for active rows", 
   assert.ok(lines.every((line) => visibleWidth(line) <= 120));
 });
 
-test("attention states are not buried behind a large active roster", () => {
-  const snapshot = { agents: [...Array.from({ length: 1000 }, (_, i) => ({
-    id: `a${i}`, name: `running-${i}`, status: "running",
-  })), { id: "failure", name: "critical-failure", status: "failed" }] };
-  const text = renderSubagentPanel(snapshot, { width: 100 }).join("\n");
-  assert.match(text, /Needs attention/);
-  assert.match(text, /critical-failure\s+failed/);
-  assert.ok(text.indexOf("critical-failure") < text.indexOf("running-0"));
-  assert.match(text, /997 agents hidden/);
+test("idle and terminal sessions contribute totals but never working entries", () => {
+  const snapshot = { agents: [
+    { id: "w", name: "active-worker", status: "running" },
+    { id: "i", name: "idle-worker", status: "running", idle: true },
+    ...["settled", "closed", "failed", "cancelled", "stopped", "dead", "unknown"].map((status) => ({
+      id: status, name: `retained-${status}`, status,
+    })),
+  ] };
+  for (const expanded of [false, true]) {
+    const text = renderSubagentPanel(snapshot, { width: 120, expanded }).join("\n");
+    assert.ok(text.includes("active-worker"));
+    assert.ok(!text.includes("idle-worker"));
+    assert.ok(!text.includes("retained-"));
+    for (const total of ["1 idle", "1 settled", "1 closed", "2 failed", "1 cancelled", "1 stopped", "1 other"]) {
+      assert.ok(text.includes(total), total);
+    }
+    assert.ok(!/Needs attention|Idle sessions|Finished|Other|agents hidden/.test(text));
+  }
 });
 
 test("heading and primary names are bold while status colors stay restrained", () => {
@@ -167,7 +177,7 @@ test("heading and primary names are bold while status colors stay restrained", (
   assert.ok(lines.every((line) => visibleWidth(line) <= 100));
 });
 
-test("expanded malicious diagnostics and dense populations stay width/height bounded", () => {
+test("expanded diagnostics and dense working rosters remain sanitized and width bounded", () => {
   const snapshot = { agents: Array.from({ length: 1000 }, (_, i) => ({
     id: `a${i}`, name: `漢字-${i}\nBAD\x1b]0;injected\x07\u202e`, status: "running",
     label: "activity\r\nlabel", liveTool: "read\x1b[31m", phase: "phase\u2028bad",
@@ -180,8 +190,109 @@ test("expanded malicious diagnostics and dense populations stay width/height bou
   })) };
   for (const width of [0, 1, 2, 3, 8, 16, 20, 38, 40, 80, 120]) {
     const lines = renderSubagentPanel(snapshot, { width, expanded: true });
-    assert.ok(lines.length <= 90, `height at width ${width}`);
+    if (width >= 40) assert.ok(lines.length >= 1000, "working rows are never height-capped");
     assert.ok(lines.every((line) => visibleWidth(line) <= width), `width ${width}`);
     assert.ok(lines.every((line) => !/[\n\r\x1b\x07\u202e\u2028]/.test(line)));
   }
+});
+
+
+test("all working entries precede a separately capped queue in either view", () => {
+  const working = Array.from({ length: 24 }, (_, i) => ({
+    id: `w${i}`, name: `worker-${i}`, status: i % 2 === 0 ? "running" : "starting",
+  }));
+  const queued = Array.from({ length: 20 }, (_, i) => ({
+    id: `q${i}`, name: `queued-${i}`, status: "queued",
+  }));
+  // A queue-first input must not displace any working agent.
+  const snapshot = { agents: [...queued, ...working] };
+  for (const expanded of [false, true]) {
+    const text = renderSubagentPanel(snapshot, { width: 120, expanded }).join("\n");
+    const limit = expanded ? 12 : 4;
+    const workingStart = text.indexOf("Working");
+    const queueStart = text.indexOf("Queued");
+    assert.ok(workingStart >= 0 && queueStart > workingStart);
+    for (let i = 0; i < working.length; i++) {
+      const match = text.match(new RegExp(`worker-${i}\\b`, "g")) || [];
+      assert.equal(match.length, 1, `worker-${i} appears exactly once`);
+      assert.ok(text.indexOf(`worker-${i}`) > workingStart);
+      assert.ok(text.indexOf(`worker-${i}`) < queueStart);
+    }
+    for (let i = 0; i < queued.length; i++) {
+      const match = text.match(new RegExp(`queued-${i}\\b`, "g")) || [];
+      assert.equal(match.length, i < limit ? 1 : 0, `queued-${i}`);
+    }
+    assert.match(text, new RegExp(`${queued.length - limit} queued hidden`));
+    assert.ok(!text.includes("agents hidden"));
+    assert.ok(text.indexOf("queued-0") > queueStart);
+  }
+});
+
+test("a queue below its cap still follows every working agent without a hidden note", () => {
+  const snapshot = { agents: [
+    { id: "q", name: "pending", status: "queued" },
+    { id: "w", name: "working", status: "running" },
+  ] };
+  for (const expanded of [false, true]) {
+    const text = renderSubagentPanel(snapshot, { width: 80, expanded }).join("\n");
+    assert.ok(text.indexOf("Working") < text.indexOf("Queued"));
+    assert.ok(!text.includes("hidden"));
+  }
+});
+
+
+test("panel background fills each line and survives nested foreground/style resets", () => {
+  const backgrounds = {
+    toolPendingBg: "\x1b[48;2;10;20;30m",
+    toolSuccessBg: "\x1b[48;2;40;50;60m",
+    toolErrorBg: "\x1b[48;5;123m",
+  };
+  const theme = {
+    fg: (_color, text) => `\x1b[38;2;49;0;17m${text}\x1b[0m`,
+    bold: (text) => `\x1b[1m${text}\x1b[0m`,
+    bg: (name, text) => backgrounds[name] + text + "\x1b[49m",
+    getBgAnsi: (name) => backgrounds[name],
+  };
+  const snapshot = { agents: [
+    { id: "w", name: "worker", status: "running", liveTool: "read", label: "building" },
+    { id: "q", name: "queued", status: "queued" },
+  ] };
+  for (const width of [1, 2, 3, 20, 38, 80, 120]) {
+    for (const background of Object.keys(backgrounds)) {
+      for (const expanded of [false, true]) {
+        const lines = renderSubagentPanel(snapshot, { width, theme, background, expanded });
+        for (const line of lines) {
+          assert.equal(visibleWidth(line), width, "background covers the full available width");
+          assert.ok(line.startsWith(backgrounds[background]));
+          assert.ok(line.endsWith("\x1b[49m"));
+          let active = false;
+          for (const token of line.split(/(\x1b\[[0-9;]*m)/)) {
+            if (!token) continue;
+            const sgr = /^\x1b\[([0-9;]*)m$/.exec(token);
+            if (!sgr) {
+              assert.ok(active, `unpainted panel text: ${JSON.stringify(token)}`);
+              continue;
+            }
+            const codes = sgr[1] === "" ? [0] : sgr[1].split(";").map(Number);
+            for (let i = 0; i < codes.length; i++) {
+              if (codes[i] === 0 || codes[i] === 49) active = false;
+              else if (codes[i] === 38 || codes[i] === 48 || codes[i] === 58) {
+                if (codes[i] === 48) active = true;
+                if (codes[i + 1] === 2) i += 4;
+                else if (codes[i + 1] === 5) i += 2;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  assert.ok(renderSubagentPanel(snapshot, { width: 80, theme })[0].startsWith(backgrounds.toolSuccessBg));
+});
+
+test("background styling remains optional for unthemed and minimal-theme panels", () => {
+  const snapshot = { agents: [{ id: "w", name: "worker", status: "running" }] };
+  assert.deepEqual(renderSubagentPanel(snapshot, { width: 80 }),
+    renderSubagentPanel(snapshot, { width: 80, theme: { fg: (_color, text) => text } }));
+  assert.deepEqual(renderSubagentPanel(snapshot, { width: 0 }), []);
 });

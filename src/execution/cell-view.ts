@@ -324,7 +324,7 @@ const FENCE_RIGHT = "│";
 const HORIZONTAL = "─";
 
 /** Restore the enclosing box background after content resets, without overwriting diff washes. */
-function restoreBackground(text: string, background: string): string {
+export function restoreBackground(text: string, background: string): string {
   return text.replace(/\x1b\[([0-9;]*)m/g, (escape, parameters: string) => {
     const codes = parameters === "" ? [0] : parameters.split(";").map(Number);
     let reset = false;

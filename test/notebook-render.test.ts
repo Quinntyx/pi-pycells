@@ -608,3 +608,22 @@ test("read_cell_output remains width-bounded across narrow and wide terminals", 
     assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `width ${width}`);
   }
 });
+
+
+test("subagent panel inherits pending, success, and error backgrounds from its output frame", (t) => {
+  const calls = [];
+  t.mock.method(panelModule, "renderSubagentPanel", (_snapshot, options) => {
+    calls.push(options.background);
+    return [];
+  });
+  const details = { cellIdx: 1, userCode: ["await work()"], execId: "exec_background",
+    subagentSnapshot: { agents: [{ id: "w", name: "worker", status: "running" }] } };
+  for (const [options, error, expected] of [
+    [{ isPartial: true }, false, "toolPendingBg"],
+    [{}, false, "toolSuccessBg"],
+    [{}, true, "toolErrorBg"],
+  ]) {
+    renderNotebookResult("exec_cell", textResult("output", details, error), options, PLAIN_THEME).render(80);
+    assert.equal(calls.at(-1), expected);
+  }
+});

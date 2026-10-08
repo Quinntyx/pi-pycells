@@ -360,7 +360,7 @@ function renderExecutingFrame(
       executionIndicator: animating ? executionIndicator(now) : undefined,
     };
     const panel = renderSubagentPanel(details.subagentSnapshot, {
-      width, theme, execId: details.execId, expanded, now,
+      width, theme, execId: details.execId, expanded, now, background: opts.labelBackground,
     });
     const lines = layout.box("input", bodyLineCount(code), {
       ...opts, mode: inputViewportMode(expanded, state), viewStart: state.viewStartLine,
@@ -473,7 +473,7 @@ function renderExecCompleted(
     lines.push(...layout.box("output", bodyLineCount(text), { ...base, viewStart: 1, outputStyle },
       (options) => renderOutCell(text, options), lines.length));
     const panel = renderSubagentPanel(completedPanel?.snapshot, {
-      width, theme, execId: completedPanel?.execId, expanded, now: completedPanel?.now,
+      width, theme, execId: completedPanel?.execId, expanded, now: completedPanel?.now, background: labelBackground,
     });
     if (panel.length) lines.push("", ...panel);
     return identity.length ? [...identity, "", ...lines] : lines;
