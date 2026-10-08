@@ -23,6 +23,7 @@
  */
 
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import * as path from "node:path";
 import { NotebookComponent } from "./notebook-component";
 import { cachedCellHighlights, cellHighlightKey, highlightCellCode, reuseCellHighlights, StreamingCellHighlights } from "./code-highlight";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -69,6 +70,9 @@ export interface NotebookRenderState {
   /** Call previews yield to the partial/final input box at paint time. */
   resultOwnsInput?: boolean;
   callCode?: string;
+  callKernelName?: string;
+  callNotebookPath?: string;
+  identityInCall?: boolean;
   highlights?: Map<string, string[] | null>;
   pendingHighlights?: Set<string>;
   streamingHighlights?: StreamingCellHighlights;
@@ -95,6 +99,12 @@ export interface NotebookRenderContext {
  * top of the exec details every frame carries.
  */
 export interface CellOpDetails extends ExecutionDetails {
+  /** Human-readable kernel name (never the internal session id). */
+  kernelName?: string;
+  /** Render-local flag; never stored in model-facing results. */
+  identityInCall?: boolean;
+  /** Notebook bound to the kernel, when it has one. */
+  notebookPath?: string;
   /** write_cell: the written source; delete_cell: the deleted cell's source. */
   cellSource?: string;
   /** write_cell: previous source when an existing cell was replaced. */
@@ -228,6 +238,20 @@ function boxOptions(
   };
 }
 
+/**
+ * Compact identity header: tool · kernel "name" · notebook.ipynb. Internal
+ * session ids and model-facing instructional prose never appear here.
+ */
+function renderIdentityHeader(
+  toolName: string,
+  details: CellOpDetails,
+  theme: Theme,
+): string[] {
+  if (!details.kernelName || details.identityInCall) return [];
+  const notebook = details.notebookPath ? ` · ${path.basename(details.notebookPath)}` : "";
+  return [theme.fg("muted", `${toolName} · kernel "${details.kernelName}"${notebook}`)];
+}
+
 // ---------------------------------------------------------------------------
 // Executing frames (isPartial): live code view + live Out box
 // ---------------------------------------------------------------------------
@@ -330,6 +354,7 @@ function renderExecutingFrame(
   return new NotebookComponent((width, layout, now) => {
     const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const mode = currentViewportMode(expanded);
+    const identity = renderIdentityHeader(toolName, details, theme);
     const opts = {
       width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const,
       executionIndicator: animating ? executionIndicator(now) : undefined,
@@ -359,7 +384,7 @@ function renderExecutingFrame(
       viewStart: Math.max(1, total - FULLSCREEN_VIEWPORT_LINES + 1),
     }, (options) => renderOutCell(liveText, options), lines.length, true, mode === "fullscreen"));
     if (panel.length) lines.push("", ...panel);
-    return lines;
+    return identity.length ? [...identity, "", ...lines] : lines;
   }, state, redraw, (now) => {
     // Live frames are often repainted on the SAME component. Include their
     // bracket frame and panel clock in the key, leaving completed rows warm.
@@ -374,20 +399,26 @@ function renderExecutingFrame(
 // call never shows a raw/truncated argument dump.
 export function renderNotebookCall(
   code: string | undefined,
-  options: { width?: number; toolName?: string } | undefined,
+  options: { width?: number; toolName?: string; kernelName?: string; notebookPath?: string } | undefined,
   theme: Theme,
   context?: NotebookRenderContext,
 ): Component {
   const state = context?.state ?? {};
   if (code !== undefined) state.callCode = code;
+  state.identityInCall = Boolean(options?.kernelName && options?.notebookPath);
   return new NotebookComponent((width, layout) => {
     // Pi retains both call and result components. Read shared state at PAINT
     // time (after both renderer callbacks), so even the first result replaces
     // this preview without a duplicate or an extra invalidation round.
     // Keep one compact, pi-tool-display-style title in the call component.
     // Only the input box transfers to the result component during execution.
-    const lines = options?.toolName
-      ? [truncateToWidth(` ${theme.fg("toolTitle", theme.bold?.(options.toolName) ?? options.toolName)}`, width)]
+    const toolLabel = options?.toolName
+      ? theme.bold?.(options.toolName) ?? options.toolName
+      : undefined;
+    const notebook = options?.notebookPath ? ` · ${path.basename(options.notebookPath)}` : "";
+    const kernelLabel = options?.kernelName ? theme.fg("muted", ` · ${options.kernelName}${notebook}`) : "";
+    const lines = toolLabel
+      ? [truncateToWidth(` ${theme.fg("toolTitle", toolLabel)}${kernelLabel}`, width)]
       : [];
     if (state.resultOwnsInput) return lines;
     const source = code ?? "";
@@ -417,7 +448,7 @@ function renderExecCompleted(
   state: NotebookRenderState,
   redraw?: () => void,
 ): Component {
-  if (details.userCode === undefined && state.callCode === undefined) return renderFallback(result, theme);
+  if (details.userCode === undefined && state.callCode === undefined) return renderFallback(toolName, result, theme, details);
   // Freeze both data and time at completion. Later registry mutations, resize,
   // expansion, or transcript redraws must not advance a historical panel.
   const completedPanel = state.completedSubagentPanel ?? (details.subagentSnapshot
@@ -428,6 +459,7 @@ function renderExecCompleted(
     } : undefined);
   return new NotebookComponent((width, layout) => {
     const opts = boxOptions(details, expanded, theme, state);
+    const identity = renderIdentityHeader(toolName, details, theme);
     const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
     const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const text = outBoxContent(resultText(result)) || "(No output)";
@@ -444,7 +476,7 @@ function renderExecCompleted(
       width, theme, execId: completedPanel?.execId, expanded, now: completedPanel?.now,
     });
     if (panel.length) lines.push("", ...panel);
-    return lines;
+    return identity.length ? [...identity, "", ...lines] : lines;
   }, state, redraw, () => currentViewportMode(expanded));
 }
 /**
@@ -480,8 +512,9 @@ function renderWriteCompleted(
   redraw?: () => void,
 ): Component {
   const source = details.cellSource;
-  if (source === undefined) return renderFallback(result, theme);
+  if (source === undefined) return renderFallback("write_cell", result, theme);
   return new NotebookComponent((width, layout) => {
+    const identity = renderIdentityHeader("write_cell", details, theme);
     const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: null, mode: inputViewportMode(expanded, state) };
     const oldSource = details.oldCellSource;
     if (details.replaced && oldSource !== undefined) {
@@ -490,9 +523,10 @@ function renderWriteCompleted(
       const count = renderEditedCell(oldSource, source, { ...opts, mode: "expanded" }).length - 2;
       return layout.box("input", count, opts, (options) => renderEditedCell(oldSource, source, options));
     }
-    return layout.box("input", bodyLineCount(source), {
+    const body = layout.box("input", bodyLineCount(source), {
       ...opts, highlightLines: renderHighlights(source, undefined, theme, state, redraw),
     }, (options) => renderInCell(source, options));
+    return identity.length ? [...identity, "", ...body] : body;
   }, state, redraw, () => currentViewportMode(expanded));
 }
 /** delete_cell: the whole cell — gutter included — in red. */
@@ -504,14 +538,17 @@ function renderDeleteCompleted(
   redraw?: () => void,
 ): Component {
   return new NotebookComponent((width, layout) => {
+    const identity = renderIdentityHeader("delete_cell", details, theme);
     const source = details.cellSource ?? "(source unavailable)";
-    return layout.box("input", bodyLineCount(source), {
+    const body = layout.box("input", bodyLineCount(source), {
       ...boxOptions(details, expanded, theme, state), width, cellNumber: details.n, mode: inputViewportMode(expanded, state),
     }, (options) => renderDeletedCell(source, options));
+    return identity.length ? [...identity, "", ...body] : body;
   }, state, redraw, () => currentViewportMode(expanded));
 }
 /** run_to / run_all: one compact per-cell status list. */
 function renderRunBatchCompleted(
+  toolName: "run_to" | "run_all",
   details: CellOpDetails,
   expanded: boolean,
   theme: Theme,
@@ -519,6 +556,7 @@ function renderRunBatchCompleted(
   redraw?: () => void,
 ): Component {
   return new NotebookComponent((width, layout) => {
+    const identity = renderIdentityHeader(toolName, details, theme);
     const rows: BodyRow[] = (details.runSteps ?? []).map((step) => {
       const glyph = step.ok ? "✓" : "✗";
       const target = step.execCount !== undefined ? ` → Out[${step.execCount}]` : "";
@@ -526,15 +564,21 @@ function renderRunBatchCompleted(
       return { text: `${glyph} cell ${step.index}${target}${failure}`, style: step.ok ? "success" : "error" };
     });
     if (!rows.length) rows.push({ text: "(no code cells executed)", style: "muted" });
-    return layout.box("run", rows.length, {
+    const body = layout.box("run", rows.length, {
       width, mode: currentViewportMode(expanded), theme,
     }, (options) => renderLabeledBox("Run:", rows, options));
+    return identity.length ? [...identity, "", ...body] : body;
   }, state, redraw, () => currentViewportMode(expanded));
 }
-/** reset_kernel: one muted line; the notebook file is untouched. */
-function renderResetCompleted(result: NotebookToolResult, theme: Theme): Component {
-  const text = resultText(result) || "Kernel restarted: fresh namespace.";
-  return new Text(theme.fg("muted", text), 0, 0);
+/** reset_kernel: compact identity plus one muted status line; notebook untouched. */
+function renderResetCompleted(
+  result: NotebookToolResult,
+  details: CellOpDetails,
+  theme: Theme,
+): Component {
+  const identity = renderIdentityHeader("reset_kernel", details, theme);
+  const status = "Kernel restarted: fresh namespace; notebook untouched.";
+  return new Text([...identity, theme.fg("muted", status)].join("\n"), 0, 0);
 }
 
 /** read_cell: the cell as an In box (line-numbered) plus its Out box when executed. */
@@ -546,8 +590,9 @@ function renderReadOneCompleted(
   redraw?: () => void,
 ): Component {
   return new NotebookComponent((width, layout) => {
+    const identity = renderIdentityHeader("read_cell", details, theme);
     const cell = details.cells?.[0];
-    if (!cell) return [theme.fg("muted", "(no cell)")];
+    if (!cell) return identity.length ? [...identity, "", theme.fg("muted", "(no cell)")] : [theme.fg("muted", "(no cell)")];
     const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: cell.executionCount };
     const lines = layout.box("input", bodyLineCount(cell.source), {
       ...opts, mode: inputViewportMode(expanded, state), highlightLines: cell.cellType === "code" ? renderHighlights(cell.source, undefined, theme, state, redraw) : undefined,
@@ -556,7 +601,7 @@ function renderReadOneCompleted(
       lines.push(...layout.box("output", bodyLineCount(cell.outputText), { ...opts, viewStart: 1 },
         (options) => renderOutCell(cell.outputText, options), lines.length));
     }
-    return lines;
+    return identity.length ? [...identity, "", ...lines] : lines;
   }, state, redraw, () => currentViewportMode(expanded));
 }
 /** read_cell_output: the requested durable page, verbatim, in an Out[N] box. */
@@ -570,6 +615,7 @@ function renderReadOutput(
 ): Component {
   const expanded = options.expanded ?? false;
   return new NotebookComponent((width, layout) => {
+    const identity = renderIdentityHeader("read_cell_output", details, theme);
     // A page can begin inside a section or traceback. Do not strip markers,
     // reinterpret the text as an execution response, or fabricate an In box.
     const text = resultText(result) || (options.isPartial ? "Reading output…" : "(No output)");
@@ -577,10 +623,11 @@ function renderReadOutput(
       : options.isPartial || text === "(No output)" ? "muted" as const : undefined;
     const labelBackground = result.isError ? "toolErrorBg" as const
       : options.isPartial ? "toolPendingBg" as const : "toolSuccessBg" as const;
-    return layout.box("output", bodyLineCount(text), {
+    const body = layout.box("output", bodyLineCount(text), {
       ...boxOptions(details, expanded, theme, state), width,
       cellNumber: details.cellIdx ?? null, viewStart: 1, outputStyle, labelBackground,
     }, (opts) => renderOutCell(text, opts));
+    return identity.length ? [...identity, "", ...body] : body;
   }, state, redraw, () => currentViewportMode(expanded));
 }
 
@@ -589,11 +636,12 @@ function renderReadManyCompleted(
   details: CellOpDetails,
   theme: Theme,
 ): Component {
+  const identity = renderIdentityHeader("read_cells", details, theme);
   const cells = details.cells ?? [];
   if (cells.length === 0) {
-    return new Text(theme.fg("muted", "(no cells)"), 0, 0);
+    return new Text([...identity, theme.fg("muted", "(no cells)")].join("\n"), 0, 0);
   }
-  const lines: string[] = [];
+  const lines: string[] = [...identity, ""];
   for (const cell of cells) {
     const out = cell.executionCount !== undefined ? ` · Out[${cell.executionCount}]` : "";
     lines.push(theme.fg("muted", `In[${cell.index}] · ${cell.cellType}${out}`));
@@ -610,10 +658,25 @@ function renderReadManyCompleted(
   return new Text(lines.join("\n"), 0, 0);
 }
 
-/** Doc-op failure or frame without op details: muted text, red on error. */
-function renderFallback(result: NotebookToolResult, theme: Theme): Component {
-  const text = resultText(result) || "(no output)";
-  return new Text(result.isError ? theme.fg("error", text) : theme.fg("muted", text), 0, 0);
+/**
+ * Doc-op failure or frame without op details. User-facing text is compact and
+ * identity-first: error results show the failure message (name-based, no
+ * internal ids); everything else renders ONLY the kernel identity header —
+ * model-facing instructional prose is never forwarded to the transcript.
+ */
+function renderFallback(
+  toolName: string,
+  result: NotebookToolResult,
+  theme: Theme,
+  details: CellOpDetails = (result.details ?? {}) as CellOpDetails,
+): Component {
+  const identity = renderIdentityHeader(toolName, details, theme);
+  if (result.isError) {
+    const text = resultText(result) || "failed";
+    return new Text([...identity, theme.fg("error", firstLine(text))].join("\n"), 0, 0);
+  }
+  if (details.identityInCall) return { render: () => [], invalidate() {} };
+  return new Text(identity.length ? identity.join("\n") : theme.fg("muted", "(no output)"), 0, 0);
 }
 
 function firstLine(text: string): string {
@@ -637,8 +700,8 @@ export function renderNotebookResult(
   context?: NotebookRenderContext,
 ): Component {
   try {
-    const details = (result.details ?? {}) as CellOpDetails;
     const state = (context?.state ?? {}) as NotebookRenderState;
+    const details = { ...(result.details ?? {}), identityInCall: state.identityInCall } as CellOpDetails;
     if (["exec_cell", "run_cell", "scratch_run", "write_cell"].includes(toolName)) {
       state.resultOwnsInput = toolName === "write_cell"
         ? details.cellSource !== undefined
@@ -662,21 +725,21 @@ export function renderNotebookResult(
         return renderDeleteCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
       case "run_to":
       case "run_all":
-        return renderRunBatchCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
+        return renderRunBatchCompleted(toolName as "run_to" | "run_all", details, options.expanded ?? false, theme, state, context?.invalidate);
       case "reset_kernel":
-        return renderResetCompleted(result, theme);
+        return renderResetCompleted(result, details, theme);
       case "read_cell":
         return renderReadOneCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
       case "read_cells":
         return renderReadManyCompleted(details, theme);
       default:
-        return renderFallback(result, theme);
+        return renderFallback(toolName, result, theme, details);
     }
   } catch {
     // Renderer exceptions are swallowed by the host anyway; degrade to plain
     // text here so the failure is visible and width-correct.
     try {
-      return new Text(resultText(result) || "(no output)", 0, 0);
+      return new Text(theme.fg("muted", `${toolName}: rendering unavailable`), 0, 0);
     } catch {
       return new Text("(no output)", 0, 0);
     }

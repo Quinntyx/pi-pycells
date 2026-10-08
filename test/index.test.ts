@@ -42,8 +42,11 @@ function makeFakeSessionManager(sandbox) {
       }
     }
 
-    async provision() {
-      return { id: "s1" };
+    async provision(options) {
+      this.provisionedKernels ??= [];
+      const id = `s${this.provisionedKernels.length + 1}`;
+      this.provisionedKernels.push({ id, name: options.name, notebookPath: options.notebookPath, chunks: 0, running: false });
+      return { id, name: options.name, notebookPath: options.notebookPath };
     }
 
     async execForeground(sessionId, code) {
@@ -68,11 +71,20 @@ function makeFakeSessionManager(sandbox) {
     }
 
     list() {
-      return [];
+      return this.provisionedKernels?.length ? this.provisionedKernels :
+        [{ id: "s1", name: "s1", notebookPath: "/tmp/test.ipynb", chunks: 1, running: false }];
+    }
+
+    get(id) {
+      return id === "s1" ? { id: "s1" } : undefined;
     }
 
     mostRecentActive() {
       return null;
+    }
+
+    getPythonExecutable(id) {
+      return id === "s1" ? "/fake/venv/python" : undefined;
     }
 
     allSubagentSnapshots() {
@@ -160,6 +172,7 @@ function restoreInjectedModules(sandbox, overrides = {}) {
     FakeSessionManager.prototype[method] = implementation;
   }
   const restoreSessions = setModuleExports("../dist/python-session-manager.js", {
+    ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
   return () => {
@@ -235,6 +248,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
   });
   const FakeSessionManager = makeFakeSessionManager(sandbox);
   const restoreSessions = setModuleExports("../dist/python-session-manager.js", {
+    ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
   const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
@@ -259,7 +273,6 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
         "delete_cell",
         "exec_cell",
         "inspect_kernel",
-        "list_kernels",
         "promote_to_skill_notebook",
         "provision_dependency",
         "provision_kernel",
@@ -279,7 +292,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     assert.deepEqual(Object.keys(readCellOutput.parameters.properties), ["cellIdx", "kernel", "offset", "limit"]);
     const readResult = await readCellOutput.execute(
       "read-output",
-      { cellIdx: 3, offset: 2, limit: 4 },
+      { cellIdx: 3, kernel: "s1", offset: 2, limit: 4 },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -294,12 +307,12 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     assert.ok(!readLines.includes("In["));
 
     const provisionKernel = registered.find((tool) => tool.name === "provision_kernel");
-    assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["notebook", "source", "version"]);
+    assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["name", "notebook", "source", "version"]);
     const promote = registered.find((tool) => tool.name === "promote_to_skill_notebook");
-    assert.deepEqual(Object.keys(promote.parameters.properties), ["name", "notebookPath", "overwrite"]);
+    assert.deepEqual(Object.keys(promote.parameters.properties), ["kernel", "name", "overwrite"]);
     const promoted = await promote.execute(
       "promote",
-      { name: "review-workflow", notebookPath: "/tmp/review.ipynb" },
+      { kernel: "s1", name: "review-workflow" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -423,7 +436,7 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -476,8 +489,8 @@ test("ptc extension resets recovery state for each user request", async () => {
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
-    const firstResult = await pythonExecTool.execute("call-1", { session_id: "s1", code: "return 1" }, undefined, undefined, { cwd: process.cwd() });
-    const secondResult = await pythonExecTool.execute("call-2", { session_id: "s1", code: "return 2" }, undefined, undefined, { cwd: process.cwd() });
+    const firstResult = await pythonExecTool.execute("call-1", { kernel: "s1", code: "return 1" }, undefined, undefined, { cwd: process.cwd() });
+    const secondResult = await pythonExecTool.execute("call-2", { kernel: "s1", code: "return 2" }, undefined, undefined, { cwd: process.cwd() });
 
     const firstTelemetry = firstResult.details.telemetry;
     assert.deepEqual(firstTelemetry, {
@@ -499,7 +512,7 @@ test("ptc extension resets recovery state for each user request", async () => {
 
     eventHandlers.get("agent_end")();
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
-    const thirdResult = await pythonExecTool.execute("call-3", { session_id: "s1", code: "return 3" }, undefined, undefined, { cwd: process.cwd() });
+    const thirdResult = await pythonExecTool.execute("call-3", { kernel: "s1", code: "return 3" }, undefined, undefined, { cwd: process.cwd() });
 
     assert.deepEqual(thirdResult.details.telemetry, {
       autoRouted: false,
@@ -560,7 +573,7 @@ test("ptc extension appends one targeted recovery message on the next turn after
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -641,7 +654,7 @@ test("ptc extension does not append a second automatic recovery message after re
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { session_id: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { kernel: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -656,7 +669,7 @@ test("ptc extension does not append a second automatic recovery message after re
     await assert.rejects(
       pythonExecTool.execute(
         "call-2",
-        { session_id: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { kernel: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -726,7 +739,7 @@ test("ptc extension includes recovery telemetry in successful exec_cell details 
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -739,7 +752,7 @@ test("ptc extension includes recovery telemetry in successful exec_cell details 
 
     const result = await pythonExecTool.execute(
       "call-2",
-      { session_id: "s1", code: "path = 'README.md'\ncontent = await read(path)\nreturn len(content)" },
+      { kernel: "s1", code: "path = 'README.md'\ncontent = await read(path)\nreturn len(content)" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -803,7 +816,7 @@ test("ptc extension includes first-path telemetry in non-recovered exec_cell det
 
     const result = await pythonExecTool.execute(
       "call-1",
-      { session_id: "s1", code: "return 1" },
+      { kernel: "s1", code: "return 1" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -871,7 +884,7 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { session_id: "s1", code: "paths = await glob('src/**/*.missing.ts')\nreturn paths[0]" },
+        { kernel: "s1", code: "paths = await glob('src/**/*.missing.ts')\nreturn paths[0]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -917,7 +930,7 @@ test("exec_cell file mode records and validates the real file contents", async (
     const execCell = registered.find((tool) => tool.name === "exec_cell");
     await execCell.execute(
       "file-call",
-      { session_id: "s1", file: "test/index.test.ts" },
+      { kernel: "s1", file: "test/index.test.ts" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -958,14 +971,14 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
         assert.equal(paint().filter((line) => /^ In/.test(line)).length, 0);
         assert.equal(paint().filter((line) => line.trim() === name).length, 1, "title is visible before arguments arrive");
         for (const code of ["first = 1", "first = 1\nsecond = 2"]) {
-          host.updateArgs({ session_id: "s1", at: 2, [field]: code });
+          host.updateArgs({ kernel: "s1", at: 2, [field]: code });
           const lines = paint();
-          assert.equal(lines.filter((line) => line.trim() === name).length, 1);
+          assert.equal(lines.filter((line) => line.trim().startsWith(name)).length, 1);
           assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "input previews must stream before execution");
           assert.ok(lines.some((line) => line.includes(code.split("\n").at(-1))));
         }
         const code = Array.from({ length: 24 }, (_, i) => `stream_line_${i} = ${i}`).join("\n");
-        host.updateArgs({ session_id: "s1", at: 2, [field]: code });
+        host.updateArgs({ kernel: "s1", at: 2, [field]: code });
         let lines = paint();
         assert.ok(lines.some((line) => line.includes("stream_line_23 =")), "streaming follows the newest line");
         assert.ok(!lines.some((line) => line.includes("stream_line_0 =")));
@@ -976,7 +989,7 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
           host.updateResult({ content: [], details: { liveOutput: ["starting"] } }, true);
           assert.ok(paint().some((line) => line.includes("stream_line_")), "progress retains the streamed input");
           assert.equal(paint().filter((line) => /^ In/.test(line)).length, 1);
-          assert.equal(paint().filter((line) => line.trim() === name).length, 1, "title survives execution progress");
+          assert.equal(paint().filter((line) => line.trim().startsWith(name)).length, 1, "title survives execution progress");
         }
         const details = name === "write_cell"
           ? { cellSource: code, cellType: "code", replaced: false, at: 2 }
@@ -984,7 +997,7 @@ test("registered source-bearing tools stream input through Pi's real tool shell"
         host.updateResult({ content: [{ type: "text", text: "done" }], details }, false);
         lines = paint();
         assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1, "result replaces the streaming preview");
-        assert.equal(lines.filter((line) => line.trim() === name).length, 1, "title survives completion without duplication");
+        assert.equal(lines.filter((line) => line.trim().startsWith(name)).length, 1, "title survives completion without duplication");
       });
     }
   } finally {
@@ -1099,7 +1112,7 @@ test("exec_cell partial rendering streams the live Out box below the code view",
   }
 });
 
-test("parallel exec_cell calls retain independent default command targets", async () => {
+test("parallel exec_cell calls require explicit named command targets", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() { throw new Error("sandbox spawn should not be used"); },
@@ -1113,8 +1126,8 @@ test("parallel exec_cell calls retain independent default command targets", asyn
     },
     list() {
       return [
-        { id: "s1", chunks: 0, running: false },
-        { id: "s2", chunks: 0, running: false },
+        { id: "s1", name: "s1", chunks: 0, running: false },
+        { id: "s2", name: "s2", chunks: 0, running: false },
       ];
     },
     mostRecentActive() { return null; },
@@ -1134,14 +1147,14 @@ test("parallel exec_cell calls retain independent default command targets", asyn
     const execCell = registered.find((tool) => tool.name === "exec_cell");
     const ctx = { cwd: process.cwd() };
 
-    const first = execCell.execute("call-1", { session_id: "s1", code: "1" }, undefined, undefined, ctx);
-    const second = execCell.execute("call-2", { session_id: "s2", code: "2" }, undefined, undefined, ctx);
-    await commands.ptc.handler("interrupt", { ui: { notify() {} } });
+    const first = execCell.execute("call-1", { kernel: "s1", code: "1" }, undefined, undefined, ctx);
+    const second = execCell.execute("call-2", { kernel: "s2", code: "2" }, undefined, undefined, ctx);
+    await commands.ptc.handler("interrupt s2", { ui: { notify() {} } });
     assert.equal(interrupted.at(-1), "s2");
 
     pending.get("s1")(successResult());
     await first;
-    await commands.ptc.handler("interrupt", { ui: { notify() {} } });
+    await commands.ptc.handler("interrupt s2", { ui: { notify() {} } });
     assert.equal(interrupted.at(-1), "s2");
 
     pending.get("s2")(successResult());
@@ -1173,7 +1186,7 @@ test("failed exec_cell tool results receive terminal telemetry", async () => {
 
     const execCell = registered.find((tool) => tool.name === "exec_cell");
     await assert.rejects(
-      execCell.execute("failed-call", { session_id: "s1", code: "1" }, undefined, undefined, { cwd: process.cwd() }),
+      execCell.execute("failed-call", { kernel: "s1", code: "1" }, undefined, undefined, { cwd: process.cwd() }),
       /kernel failed/
     );
     const transformed = eventHandlers.get("tool_result")({
@@ -1211,7 +1224,7 @@ test("provision_dependency rejects nested installers before resolving or spawnin
       process.env.PI_SUBAGENT_DEPTH = depth;
       if (token === undefined) delete process.env.PI_SUBAGENTS_PARENT_TOKEN;
       else process.env.PI_SUBAGENTS_PARENT_TOKEN = token;
-      const result = await dependency.execute("nested-dependency", { package: "pi-subagents", session_id: "missing" });
+      const result = await dependency.execute("nested-dependency", { package: "pi-subagents", kernel: "missing" });
       assert.equal(result.isError, true);
       assert.equal(result.details.error, "nested-dependency-install-blocked");
       assert.match(result.content[0].text, /root agent.*provision dependencies/);
@@ -1249,7 +1262,7 @@ test("provision_dependency does not treat spawn failures as successful installs"
     process.env.PATH = "/definitely/missing";
     const result = await provisionDependency.execute(
       "dependency-call",
-      { package: "example-package" },
+      { package: "example-package", kernel: "s1" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -1347,25 +1360,25 @@ test("provision_dependency targets the requested kernel's venv and bootstraps pi
   const { provisionDependencyTool } = require("../dist/index.js");
 
   try {
-    // unknown session id → error listing live sessions
+    // unknown kernel name → error listing live kernels
     const unknownManager = {
       get: () => false,
-      list: () => [{ id: "live-1" }],
+      list: () => [{ id: "live-1", name: "dependency-kernel" }],
       getPythonExecutable: () => undefined,
     };
     const unknown = await provisionDependencyTool(unknownManager, sandbox)
-      .execute("t", { package: "numpy", session_id: "nope" }, undefined);
-    assert.match(unknown.content[0].text, /Unknown python session: nope/);
-    assert.match(unknown.content[0].text, /live-1/);
+      .execute("t", { package: "numpy", kernel: "nope" }, undefined);
+    assert.match(unknown.content[0].text, /Unknown kernel "nope"/);
+    assert.match(unknown.content[0].text, /dependency-kernel/);
 
     // pinned kernel → installs into the pinned venv AND bootstraps pi_subagents
     const pinnedManager = {
       get: (id) => id === "k1",
-      list: () => [{ id: "k1" }],
+      list: () => [{ id: "k1", name: "default-kernel" }],
       getPythonExecutable: (id) => (id === "k1" ? pinnedPython : undefined),
     };
     const pinned = await provisionDependencyTool(pinnedManager, sandbox)
-      .execute("t", { package: "numpy", session_id: "k1" }, undefined);
+      .execute("t", { package: "numpy", kernel: "default-kernel" }, undefined);
     assert.match(pinned.content[0].text, /pinned venv/);
     assert.match(pinned.content[0].text, /pi_subagents bootstrapped/);
 
@@ -1373,23 +1386,29 @@ test("provision_dependency targets the requested kernel's venv and bootstraps pi
     fs.rmSync(logFile, { force: true });
     const sharedManager = {
       get: (id) => id === "k2",
-      list: () => [{ id: "k2" }],
+      list: () => [{ id: "k2", name: "pinned-kernel" }],
       getPythonExecutable: () => undefined,
     };
     const shared = await provisionDependencyTool(sharedManager, sandbox)
-      .execute("t", { package: "numpy", session_id: "k2" }, undefined);
+      .execute("t", { package: "numpy", kernel: "pinned-kernel" }, undefined);
     assert.match(shared.content[0].text, /shared environment/);
     assert.doesNotMatch(shared.content[0].text, /pi_subagents bootstrapped/);
 
-    // no session_id → most recently used kernel's env
+    // explicit kernel targeting still works (and is the only route)
     fs.rmSync(logFile, { force: true });
-    await provisionDependencyTool(pinnedManager, sandbox).execute("t", { package: "numpy" }, undefined);
+    await provisionDependencyTool(pinnedManager, sandbox).execute("t", { package: "numpy", kernel: "default-kernel" }, undefined);
     const logged = fs.readFileSync(logFile, "utf8");
     assert.match(logged, new RegExp(`--python ${pinnedPython.replace(/\//g, "\\/")} numpy`));
     assert.match(logged, /--editable/);
     const pinnedCalls = (logged.match(new RegExp(`--python ${pinnedPython.replace(/\//g, "\\/")}`, "g")) || []).length;
     assert.equal(pinnedCalls, 2, "package + pi_subagents both target the pinned venv");
     assert.ok(!logged.includes(sharedPython), "shared python untouched for a pinned kernel");
+
+    // no implicit fallback: the kernel is required
+    const noKernel = await provisionDependencyTool(pinnedManager, sandbox)
+      .execute("t", { package: "numpy" }, undefined);
+    assert.equal(noKernel.isError, true);
+    assert.match(noKernel.content[0].text, /kernel name (?:must be|is required)/);
   } finally {
     process.env.PATH = previousPath;
     if (previousSource === undefined) delete process.env.PTC_SUBAGENTS_SOURCE;
@@ -1489,5 +1508,157 @@ test("nested policy prompt describes opt-in spawning and legal boundary imports"
     if (previousMaximum === undefined) delete process.env.PI_SUBAGENTS_MAX_DEPTH;
     else process.env.PI_SUBAGENTS_MAX_DEPTH = previousMaximum;
     restore();
+  }
+});
+
+test("kernels are named, unique, and every operation targets an explicit kernel", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const restore = restoreInjectedModules(sandbox, {
+    async execForeground() { return successResult(); },
+  });
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const ctx = { cwd: process.cwd() };
+    const byName = (name) => registered.find((tool) => tool.name === name);
+
+    // Discovery is not a tool: there is no implicit kernel targeting route.
+    assert.ok(!byName("list_kernels"), "list_kernels must not be registered");
+
+    const provision = byName("provision_kernel");
+    const created = await provision.execute("p1", { name: "analysis" }, undefined, undefined, ctx);
+    assert.equal(created.isError, undefined);
+    assert.equal(created.details.kernelName, "analysis");
+    assert.match(created.content[0].text, /Provisioned kernel "analysis"/);
+    assert.ok(!/[0-9a-f]{16,}/.test(created.content[0].text), "no opaque session id in the provision result");
+
+    // Missing / blank / escape-character names are rejected before spawning.
+    for (const badName of [undefined, "   ", "x\u001b[31m", "line\u0000break"]) {
+      const bad = await provision.execute("p2", { name: badName }, undefined, undefined, ctx);
+      assert.equal(bad.isError, true, `expected rejection for ${JSON.stringify(badName)}`);
+      assert.match(bad.content[0].text, /kernel name/);
+    }
+
+    // Duplicate names among live kernels are rejected.
+    const duplicate = await provision.execute("p3", { name: "analysis" }, undefined, undefined, ctx);
+    assert.equal(duplicate.isError, true);
+    assert.match(duplicate.content[0].text, /already in use|duplicate/i);
+
+    // A distinct name still provisions (fake manager reuses id s1).
+    const second = await provision.execute("p4", { name: "scratch" }, undefined, undefined, ctx);
+    assert.equal(second.isError, undefined);
+
+    // Unknown kernels fail with a name-based error on every operation.
+    const ops = [
+      ["exec_cell", { kernel: "ghost", code: "1" }],
+      ["scratch_run", { kernel: "ghost", code: "1" }],
+      ["write_cell", { kernel: "ghost", at: 1, source: "1" }],
+      ["read_cell", { kernel: "ghost", n: 1 }],
+      ["read_cells", { kernel: "ghost" }],
+      ["read_cell_output", { kernel: "ghost", cellIdx: 1 }],
+      ["run_cell", { kernel: "ghost", n: 1 }],
+      ["run_to", { kernel: "ghost", n: 1 }],
+      ["run_all", { kernel: "ghost" }],
+      ["delete_cell", { kernel: "ghost", n: 1 }],
+      ["inspect_kernel", { kernel: "ghost" }],
+      ["reset_kernel", { kernel: "ghost" }],
+      ["provision_dependency", { package: "numpy", kernel: "ghost" }],
+      ["promote_to_skill_notebook", { kernel: "ghost", name: "nb" }],
+      ["request_cell_review", { kernel: "ghost", n: 1 }],
+    ];
+    for (const [name, params] of ops) {
+      const tool = byName(name);
+      assert.ok(tool, `${name} must be registered`);
+      const result = await tool.execute("op", params, undefined, undefined, ctx);
+      assert.equal(result.isError, true, `${name} must reject the unknown kernel`);
+      assert.match(result.content[0].text, /Unknown kernel "ghost"/, `${name} error names the kernel`);
+      assert.match(result.content[0].text, /Live kernels: analysis, scratch|Live kernels: analysis/, `${name} error lists live kernels`);
+      assert.ok(!/[0-9a-f]{16,}/.test(result.content[0].text), `${name} error must not leak session ids`);
+    }
+
+    // User-facing rendering never surfaces internal ids or reminders.
+    const theme = { fg(_color, text) { return text; } };
+    const provisionRendered = provision.renderResult(created, { isPartial: false }, theme).render(120)
+      .join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+    assert.match(provisionRendered, /analysis/);
+    assert.ok(!/session_id/.test(provisionRendered), "no session_id in user render");
+    assert.ok(!new RegExp(created.details.sessionId).test(provisionRendered), "no opaque id in user render");
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+
+test("every kernel tool renders named notebook identity and never exposes admin instructions", async () => {
+  const restore = restoreInjectedModules({ envVars: {}, ready: true });
+  try {
+    const extension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi, commands } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await extension(pi);
+    const ctx = { cwd: process.cwd() };
+    await eventHandlers.get("session_start")({}, ctx);
+    const tools = new Map(registered.map((tool) => [tool.name, tool]));
+    const provision = tools.get("provision_kernel");
+    const created = await provision.execute("new-kernel", { name: "review workspace", notebook: "/tmp/review.ipynb" }, undefined, undefined, ctx);
+    assert.ok(!created.isError);
+    const theme = { fg: (_color, text) => text };
+    for (const tool of tools.values()) {
+      assert.equal(tool.renderShell, "self", tool.name);
+      assert.equal(typeof tool.renderCall, "function", tool.name);
+      assert.equal(typeof tool.renderResult, "function", tool.name);
+      const state = {};
+      const params = tool.name === "provision_kernel"
+        ? { name: "review workspace", notebook: "/tmp/review.ipynb" }
+        : { kernel: "review workspace", n: 1, code: "x = 1", source: "x = 1" };
+      const call = tool.renderCall(params, theme, { state }).render(100).join("\n");
+      assert.match(call, /review workspace/, tool.name);
+      assert.match(call, /review\.ipynb/, tool.name);
+      assert.ok(!call.includes(created.details.sessionId), tool.name);
+    }
+    for (const name of ["inspect_kernel", "provision_dependency", "promote_to_skill_notebook"]) {
+      const tool = tools.get(name);
+      assert.ok(tool, name);
+      for (const expanded of [false, true]) {
+        const result = {
+          content: [{ type: "text", text: "MODEL_ONLY_REMINDER every cell is appended; use exec_cell(session_id: deadbeef1234)" }],
+          details: { kernelName: "review workspace", notebookPath: "/tmp/review.ipynb", sessionId: "deadbeef1234" },
+        };
+        const text = tool.renderResult(result, { expanded }, theme).render(100).join("\n");
+        assert.ok(!text.includes("MODEL_ONLY_REMINDER"), name);
+        assert.ok(!text.includes("deadbeef1234"), name);
+      }
+    }
+    const notices = [];
+    await commands.ptc.handler("kill", { ui: { notify: (message) => notices.push(message) } });
+    assert.match(notices.at(-1), /kernel-name/);
+    assert.match(created.content[0].text, /every cell is appended/);
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+
+test("kernel directory rejects opaque aliases and shares the manager's name validation", () => {
+  const { KernelDirectory } = require("../dist/tools/kernel-directory.js");
+  const directory = new KernelDirectory({ list: () => [
+    { id: "abcdef123456", name: "analysis", notebookPath: "/tmp/analysis.ipynb" },
+  ] });
+  assert.equal(directory.resolveKernel("analysis").id, "abcdef123456");
+  assert.throws(() => directory.resolveKernel("abcdef123456"), /Unknown kernel.*Live kernels: analysis/);
+  for (const name of ["", " \t ", "bad\u0085name", "x".repeat(65)]) {
+    assert.throws(() => directory.assertAvailable(name));
   }
 });

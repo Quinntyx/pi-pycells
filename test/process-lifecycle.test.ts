@@ -79,7 +79,7 @@ test("tight loops rate-limit progress frames and the kernel is reaped on disposa
   let progressUpdates = 0;
 
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: "lifecycle-loop", cwd: process.cwd(), ctx: fakeCtx() });
     const proc = spawnedProcess();
     const result = await manager.execForeground(
       id,
@@ -105,7 +105,7 @@ test("an idle timeout interrupts the cell without killing the persistent kernel"
   const { manager, sandbox, process: spawnedProcess } = await makeManager({ executionTimeoutMs: 200 });
 
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: "lifecycle-idle", cwd: process.cwd(), ctx: fakeCtx() });
     const proc = spawnedProcess();
     await assert.rejects(
       manager.execForeground(id, "import time\ntime.sleep(30)", { cwd: process.cwd() }),
@@ -125,7 +125,7 @@ test("Python's emergency spool valve caps output once before it reaches the host
   const { manager, sandbox } = await makeManager({ maxSpoolChars: 1_000 });
 
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: "lifecycle-output", cwd: process.cwd(), ctx: fakeCtx() });
     const result = await manager.execForeground(
       id,
       "print('x' * 500000, end='')",

@@ -80,6 +80,63 @@ export class UnknownSessionError extends PythonSessionError {
   }
 }
 
+/** Thrown when an operation names a kernel that is not live; the message lists live kernel names. */
+export class UnknownKernelError extends PythonSessionError {
+  constructor(public requestedName: string, availableNames: string[]) {
+    super(
+      `Unknown kernel: ${requestedName}. Live kernels: ${
+        availableNames.length ? availableNames.join(", ") : "(none)"
+      }`
+    );
+  }
+}
+
+/** Longest accepted kernel name; keeps user-facing rows compact. */
+const KERNEL_NAME_MAX_LENGTH = 64;
+
+/** C0/C1 controls and DEL — the characters that can fake terminal output (escapes, cursor moves). */
+const KERNEL_NAME_CONTROL_CHARS = /[\u0000-\u001F\u007F\u0080-\u009F]/;
+
+/**
+ * Validate and normalize a user-supplied kernel name: trimmed, meaningful
+ * (nonempty) after trimming, free of control/terminal escape characters, and
+ * length-capped. Throws PythonSessionError with a model-facing message.
+ */
+export function normalizeKernelName(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new PythonSessionError("kernel name is required and must be a string");
+  }
+  const name = raw.trim();
+  if (!name) {
+    throw new PythonSessionError("kernel name must be a nonempty string (whitespace-only names are rejected)");
+  }
+  if (KERNEL_NAME_CONTROL_CHARS.test(name)) {
+    throw new PythonSessionError(
+      `kernel name must not contain control or terminal escape characters: ${JSON.stringify(name)}`
+    );
+  }
+  if (name.length > KERNEL_NAME_MAX_LENGTH) {
+    throw new PythonSessionError(
+      `kernel name is too long (${name.length} characters; maximum ${KERNEL_NAME_MAX_LENGTH})`
+    );
+  }
+  return name;
+}
+
+/**
+ * User-facing handle for one live kernel, resolved by human-readable name.
+ * Internal UUIDs stay in `id` for protocol bookkeeping only.
+ */
+export interface KernelHandle {
+  id: string;
+  name: string;
+  notebookPath?: string;
+  createdAt: number;
+  lastUsedAt: number;
+  chunks: number;
+  running: boolean;
+}
+
 type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1175,8 @@ function truncateTarget(value: string): string {
 
 interface SessionRecord {
   id: string;
+  /** Human-readable, unique-among-live-kernels name (user-facing identity). */
+  name: string;
   notebookPath?: string;
   proc: ChildProcess;
   protocol: PersistentSessionProtocol;
@@ -1236,17 +1295,19 @@ export class PythonSessionManager {
   /**
    * Live sessions sorted most-recently-used first. `chunks` counts user-visible
    * cells: copied prefix cells plus user-executed chunks (provisioning retry
-   * chunks excluded).
+   * chunks excluded). Each row carries the kernel's public `name` alongside the
+   * internal `id`.
    */
-  list(): SessionSummary[] {
+  list(): Array<SessionSummary & { name: string }> {
     return [...this.sessions.values()]
       .sort((a, b) => this.recencyIndex(b.id) - this.recencyIndex(a.id))
       .map((session) => this.summarize(session));
   }
 
-  private summarize(session: SessionRecord): SessionSummary {
+  private summarize(session: SessionRecord): SessionSummary & { name: string } {
     return {
       id: session.id,
+      name: session.name,
       createdAt: session.createdAt,
       lastUsedAt: session.lastUsedAt,
       chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
@@ -1550,9 +1611,18 @@ export class PythonSessionManager {
    * failures do not throw — they are returned as sourceError/scriptError and
    * the kernel stays usable.
    */
+  /**
+   * Provision a new persistent kernel under a human-readable, unique name.
+   * `name` is required at runtime: trim-normalized, nonempty, free of
+   * control/terminal escape characters, and unique among live kernels. The
+   * result carries the public `name` plus the internal `id` (protocol
+   * bookkeeping) and the bound `notebookPath`.
+   */
   async provision(options: {
     cwd: string;
     ctx: ExtensionToolContext;
+    /** Required public kernel identity; validated and uniqueness-checked. */
+    name?: string;
     signal?: AbortSignal;
     onUpdate?: ToolUpdateCallback;
     parentToolCallId?: string;
@@ -1562,11 +1632,24 @@ export class PythonSessionManager {
     /** Explicit Python version (validated by the tool schema). Overrides a source-notebook pin; metadata is never mutated. */
     version?: string;
   }): Promise<{
+    /** Public kernel identity (validated, unique among live kernels). */
+    name: string;
+    /** Internal protocol id; never user-facing. */
     id: string;
+    /** Notebook bound to the kernel, when one was provided. */
+    notebookPath?: string;
     sourcedFrom?: string;
     sourceError?: SourceExecutionError;
     scriptError?: PtcPythonError;
   }> {
+    if (options.name === undefined || options.name === null) {
+      throw new PythonSessionError(
+        "provision requires a kernel name: a nonempty string, unique among live kernels"
+      );
+    }
+    const kernelName = normalizeKernelName(options.name);
+    this.assertKernelNameAvailable(kernelName);
+
     // Back-burner: limit disabled 2026-09-26 — revisit for provisioning churn per docs/BACK-BURNER.md §2
     // Keep maxPythonSessions parsing for compatibility, but do not reject new kernels here.
 
@@ -1614,6 +1697,7 @@ export class PythonSessionManager {
 
     const record: SessionRecord = {
       id: sessionId,
+      name: kernelName,
       proc,
       protocol,
       chunks: [],
@@ -1662,6 +1746,9 @@ export class PythonSessionManager {
       protocol.setInitialCellCount(preparedSource.prefixCellCount);
     }
 
+    // Re-check after the awaits above: a parallel provision could have claimed
+    // the name while this interpreter was starting up.
+    this.assertKernelNameAvailable(kernelName);
     this.sessions.set(sessionId, record);
     this.recency = this.recency.filter((id) => id !== sessionId);
     this.recency.push(sessionId);
@@ -1711,7 +1798,49 @@ export class PythonSessionManager {
       }
     }
 
-    return { id: sessionId, sourcedFrom: preparedSource?.path, sourceError, scriptError };
+    return {
+      name: kernelName,
+      id: sessionId,
+      notebookPath,
+      sourcedFrom: preparedSource?.path,
+      sourceError,
+      scriptError,
+    };
+  }
+
+  /** Throw when another live kernel already owns `name`. */
+  private assertKernelNameAvailable(name: string): void {
+    for (const record of this.sessions.values()) {
+      if (record.name === name) {
+        throw new PythonSessionError(
+          `kernel name already in use: ${name} (kernel names must be unique among live kernels)`
+        );
+      }
+    }
+  }
+
+  /**
+   * Resolve a kernel by its human-readable name. Synchronous; throws
+   * UnknownKernelError (listing live names) for anything not live. The handle
+   * exposes the public `name`, bound `notebookPath`, and the internal `id` for
+   * protocol bookkeeping — never render the id.
+   */
+  resolveKernel(name: string): KernelHandle {
+    const wanted = normalizeKernelName(name);
+    const record = [...this.sessions.values()].find((candidate) => candidate.name === wanted);
+    if (!record) {
+      throw new UnknownKernelError(wanted, this.list().map((kernel) => kernel.name));
+    }
+    const summary = this.summarize(record);
+    return {
+      id: summary.id,
+      name: summary.name,
+      notebookPath: summary.notebookPath,
+      createdAt: summary.createdAt,
+      lastUsedAt: summary.lastUsedAt,
+      chunks: summary.chunks,
+      running: summary.running,
+    };
   }
 
   /**

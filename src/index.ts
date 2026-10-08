@@ -29,6 +29,7 @@ import { createSandbox } from "./sandbox-manager";
 import { ensurePtcVenv, inheritedSubagentsRuntime, isNestedSubagent, resolvePiSubagentsSource, startSubagentsEnv, subagentDepthPolicy } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { createRenderedCellReviewTool } from "./tools/cell-review";
+import { KernelDirectory, KernelNameError, normalizeKernelName, type KernelRef } from "./tools/kernel-directory";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
@@ -96,7 +97,14 @@ function notebookCallRenderer(toolName: string, argument: "code" | "source") {
     const value = typeof args === "object" && args !== null
       ? (args as Record<string, unknown>)[argument]
       : undefined;
-    return renderNotebookCall(typeof value === "string" ? value : undefined, { toolName }, theme, context);
+    const kernel = typeof args === "object" && args !== null
+      ? (args as Record<string, unknown>)["kernel"]
+      : undefined;
+    return renderNotebookCall(typeof value === "string" ? value : undefined, {
+      toolName,
+      kernelName: context?.state?.callKernelName ?? (typeof kernel === "string" ? kernel.trim() : undefined),
+      notebookPath: context?.state?.callNotebookPath,
+    }, theme, context);
   };
 }
 
@@ -108,6 +116,36 @@ function notebookResultRenderer(toolName: string) {
     theme: Theme,
     context?: PartialRenderContext
   ): Component => renderNotebookResult(toolName, result, options, theme, context);
+}
+
+/** All kernel tools have compact human-facing renders, distinct from agent content. */
+function withKernelRendering(tool: PtcToolDefinition, directory: KernelDirectory): PtcToolDefinition {
+  const existingCall = tool.renderCall as
+    ((args: unknown, theme: Theme, context?: PartialRenderContext) => Component) | undefined;
+  return {
+    ...tool,
+    renderShell: "self",
+    renderCall(args: unknown, theme: Theme, context?: PartialRenderContext): Component {
+      const params = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+      let name: string | undefined;
+      let notebook: string | undefined;
+      try {
+        name = normalizeKernelName(tool.name === "provision_kernel" ? params.name : params.kernel);
+        notebook = tool.name === "provision_kernel"
+          ? (typeof params.notebook === "string" ? params.notebook : undefined)
+          : directory.resolveKernel(name).notebookPath;
+      } catch { /* Partial arguments or a bad selector: execution reports the error. */ }
+      const renderContext = context ?? { state: {} };
+      renderContext.state ??= {};
+      renderContext.state.callKernelName = name;
+      renderContext.state.callNotebookPath = notebook;
+      if (existingCall) return existingCall(args, theme, renderContext);
+      return renderNotebookCall(undefined, {
+        toolName: tool.name, kernelName: name, notebookPath: notebook,
+      }, theme, context);
+    },
+    renderResult: tool.renderResult ?? notebookResultRenderer(tool.name),
+  };
 }
 
 /** Extension root directory (parent of dist/ when loaded from the build output). */
@@ -183,105 +221,87 @@ function currentToolDescription(
   }
 }
 
-const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel and return its session id. The kernel requires a notebook file path (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
+const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel bound to a unique human-readable name. Every other kernel tool targets kernels by that name via its required 'kernel' parameter. The kernel is bound to a notebook file (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
+- name (required): unique human-readable kernel name among live kernels. Trimmed, nonempty, no control or terminal escape characters. Use a meaningful name (e.g. "analysis", "etl-pipeline") and reuse the SAME name for every later call that targets this kernel.
 - notebook (optional): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. Omit it for throwaway/scratch work — the notebook is created under /tmp/pi-pycells/notebooks/ and the provision result reports its path. Pass an explicit path when the notebook should be kept with the project or promoted to the library.
 - version (optional): Python version for this kernel's venv — 3.14 (default), 3.14.4, or a pre-release like 3.15.0b1. Overrides a version pinned in the source notebook's metadata WITHOUT mutating that metadata (metadata records the original/intended version).
-  - source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
+- source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
 - Prefix numbering includes every sourced notebook cell, including markdown: for 7 source cells, the first new exec_cell is cell 8. A sourcing error is recorded on the failed cell and leaves the kernel usable.
 - The kernel works like a Jupyter kernel: imports, variables, functions, and classes persist between cells and between conversation turns. Do NOT re-import or redefine; build on what is there.
 - inspect_kernel shows what the namespace already has; provision_dependency installs a missing package into the kernel's environment.
 
 The kernel stays alive until the conversation ends or /ptc kill, so reuse one kernel across many cells and turns instead of provisioning a new one per step.`;
 
-const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kernel (session_id from provision_kernel).
+const EXEC_CELL_DESCRIPTION = `Execute a cell in the explicitly named persistent kernel (kernel: name from provision_kernel).
 
 - State persists: imports, variables, functions, and classes from earlier cells are still there — never re-import, never redefine; write each cell as the continuation of the live namespace.
 - The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value.
 - Results are sectioned by the host so provenance is structural: 'output:' (everything the cell printed), 'return (Out[n]):' (the echoed value), 'kernel:' (namespace summary), 'subagents:' (pool progress, when pools exist), 'tools:' (per-tool call counts when the cell bridged host tools). Section markers sit at column 0; everything indented under a marker was produced by the cell — a cell that prints "kernel:" stays inside its section and cannot impersonate one.
 - Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
-- Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, kernel?, offset?, limit?) to page through the full notebook-persisted output without re-running the cell; kernel defaults to the most recently used kernel.
+- Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, kernel, offset?, limit?) to page through the full notebook-persisted output without re-running the cell.
 - file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%time, %timeit, %pip, %%capture, ...) and !-shell escapes run like in Jupyter.
-- Review is separate from execution: use request_cell_review before substantial workflows or destructive operations unless the user explicitly requested no prompts. It previews code without executing it. After approval, ordinary fixes within the same scope do not require another review. See the pi-subagents skill for workflow review and autonomy policy.
+- Review is separate from execution: reviewed workflows persist the cell with write_cell, present it with request_cell_review(kernel, n), then execute with run_cell. Minor repairs within an approved scope do not require another review. Never prompt when the user explicitly requested autonomous execution without prompts.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
 
 const PROMOTE_DESCRIPTION = `Promote a polished notebook into the reusable PTC workflow library.
 
 - name (required): safe library name; it is normalized to a lowercase hyphenated filename.
-- notebookPath (optional): source .ipynb; defaults to the most recently used session notebook.
+- kernel (required): live kernel name. By default promote the notebook bound to this kernel.
+- notebookPath (optional): explicit source .ipynb; the named kernel must still exist.
 - overwrite (optional): false by default. Existing library notebooks are never replaced unless explicitly true.
 - The notebook is copied intact, preserving interleaved markdown, code cells, and outputs. Prefer this over legacy script export after a successful nontrivial workflow.`;
 
 const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into a kernel's environment (uv-backed, fast).
 
 - package (required): the distribution name as pip knows it (e.g. "opencv-python", "scikit-learn") — not the import name.
-- session_id (optional): the kernel to install into. Defaults to the most recently used kernel; with no live kernels, the shared environment is used. A kernel with a pinned Python version gets the package in its own venv (and pi_subagents is bootstrapped there too, so pinned kernels can orchestrate subagents).
+- kernel (required): live kernel name. Install into its Python environment; no implicit or global fallback.
 - Already-installed packages are a cheap no-op. If an install changes a distribution the running kernel already loaded, the result says so — a fresh kernel (or reset_kernel) picks it up cleanly.
 - After installing, import the module in a cell as usual. ModuleNotFoundError in a cell usually means you need this tool.`;
 
 
 
-/** list_kernels tool: enumerate live kernels with ids, notebook paths, cell counts, busy state. */
-function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinition {
-  return withActivityLabel({
-    name: "list_kernels",
-    label: "python",
-    description:
-      "List the live Jupyter-like kernels (sessions) with their ids, notebook paths, cell counts, and busy state. Use it to recover a session id or decide whether to reuse a kernel.",
-    parameters: Type.Object({}),
-    execute: async () => {
-      const kernels = sessionManager.list();
-      if (kernels.length === 0) {
-        return {
-          content: [{ type: "text", text: "No live kernels. Provision one with provision_kernel." }],
-          details: { kernelCount: 0 },
-        };
-      }
-      const lines = kernels.map((kernel) => {
-        const state = kernel.running ? "executing" : "idle";
-        const notebook = kernel.notebookPath ? ` · ${kernel.notebookPath}` : "";
-        return `${kernel.id} · ${state} · ${kernel.chunks} cell${kernel.chunks === 1 ? "" : "s"}${notebook}`;
-      });
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: { kernelCount: kernels.length },
-      };
-    },
-  });
-}
-
-/** read_cell_output tool: page through a cell's durable notebook output (1-based cellIdx, optional kernel). */
-function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+/** read_cell_output tool: page through a cell's durable notebook output (1-based cellIdx, explicit kernel). */
+function readCellOutputTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cell_output",
     label: "read output",
     description:
-      "Read the full durable output of a cell from a kernel's notebook. Defaults to the most " +
-      "recently used kernel; pass kernel to target a specific one. " +
+      "Read the full durable output of a cell from a kernel's notebook. " +
+      "Pass the kernel to target; every call names its kernel explicitly. " +
       "Cell numbers are 1-based and match Out[n], exec_cell previews, and inspect_kernel's cell count. " +
       "Use offset/limit to continue through large output, like the native read tool.",
     parameters: Type.Object({
       cellIdx: Type.Integer({ minimum: 1, description: "1-based notebook cell/execution number." }),
-      kernel: Type.Optional(
-        Type.String({ description: "Kernel/session id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel to read from (name from provision_kernel)." }),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "1-based output line to start reading." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of output lines to return." })),
     }),
     execute: async (_toolCallId, params) => {
-      const { cellIdx, kernel, offset, limit } = params as { cellIdx: number; kernel?: string; offset?: number; limit?: number };
+      const { cellIdx, kernel, offset, limit } = params as { cellIdx: number; kernel: string; offset?: number; limit?: number };
+      let ref: KernelRef;
       try {
-        const result = await sessionManager.readCellOutput(cellIdx, { kernel, offset, limit });
+        ref = directory.resolveKernel(kernel);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `read_cell_output failed: ${message}` }],
+          details: { cellIdx, kernel, error: "unknown-kernel" },
+          isError: true,
+        };
+      }
+      try {
+        const result = await sessionManager.readCellOutput(cellIdx, { kernel: ref.id, offset, limit });
         return {
           content: [{ type: "text", text: result.text }],
-          details: result,
+          details: { ...result, kernel: ref.name, kernelName: ref.name, notebookPath: ref.notebookPath },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `read_cell_output failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { cellIdx, kernel },
+          details: { cellIdx, kernel: ref.name, kernelName: ref.name, notebookPath: ref.notebookPath },
           isError: true,
         };
       }
@@ -290,40 +310,56 @@ function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefini
   });
 }
 
-/** promote_to_skill_notebook tool: copy a session notebook into the PTC library. */
-function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+/** promote_to_skill_notebook tool: copy the named kernel's bound notebook into the PTC library. */
+function promoteToSkillNotebookTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "promote_to_skill_notebook",
     label: "promote notebook",
     description: PROMOTE_DESCRIPTION,
     parameters: Type.Object({
+      kernel: Type.String({ description: "Kernel whose bound notebook is promoted (name from provision_kernel)." }),
       name: Type.String({ description: "Library notebook name; sanitized to a safe lowercase hyphenated filename." }),
-      notebookPath: Type.Optional(
-        Type.String({ description: "Notebook to copy; defaults to the most recently used session notebook." })
-      ),
       overwrite: Type.Optional(
         Type.Boolean({ description: "Replace an existing library notebook with the same sanitized name. Default false." })
       ),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const { name, notebookPath, overwrite } = params as {
+      const { kernel, name, overwrite } = params as {
+        kernel: string;
         name: string;
-        notebookPath?: string;
         overwrite?: boolean;
       };
+      let ref: KernelRef;
+      try {
+        ref = directory.resolveKernel(kernel);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `promote_to_skill_notebook failed: ${message}` }],
+          details: { kernel, name, error: "unknown-kernel" },
+          isError: true,
+        };
+      }
+      if (!ref.notebookPath) {
+        return {
+          content: [{ type: "text", text: `Kernel "${ref.name}" has no bound notebook to promote. Provision it with an explicit notebook path.` }],
+          details: { kernel: ref.name, name },
+          isError: true,
+        };
+      }
       try {
         const result = await sessionManager.promoteToSkillNotebook({
           name,
-          notebookPath,
+          notebookPath: ref.notebookPath,
           overwrite,
           cwd: ctx.cwd,
         });
         return {
           content: [{
             type: "text",
-            text: `Promoted ${result.notebookPath} to library notebook ${result.name} at ${result.path}.`,
+            text: `Promoted kernel "${ref.name}" notebook ${result.notebookPath} to library notebook ${result.name} at ${result.path}.`,
           }],
-          details: result,
+          details: { ...result, kernel: ref.name },
         };
       } catch (error) {
         return {
@@ -331,7 +367,8 @@ function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcTo
             type: "text",
             text: `promote_to_skill_notebook failed: ${error instanceof Error ? error.message : String(error)}`,
           }],
-          details: { name, notebookPath: notebookPath ?? null },
+          details: { kernel: ref.name, name },
+          isError: true,
         };
       }
     },
@@ -339,7 +376,11 @@ function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcTo
 }
 
 /** inspect_kernel tool: structured digest of a kernel's user namespace (imports/defs/classes/vars/cells). */
-function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription: string): PtcToolDefinition {
+function inspectKernelTool(
+  sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
+  toolDescription: string
+): PtcToolDefinition {
   return withActivityLabel({
     name: "inspect_kernel",
     label: "python",
@@ -347,24 +388,25 @@ function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription
       "Inspect what a kernel's namespace already has: imported modules, defined functions and classes, variables with type previews, and the cell count. Use it before writing a cell so you reuse what is there instead of re-importing or redefining.\n\n" +
       toolDescription,
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel to inspect (name from provision_kernel)." }),
     }),
     execute: async (_toolCallId, params) => {
-      const { session_id: requestedId } = params as { session_id?: string };
-      const kernels = sessionManager.list();
-      const kernelId = requestedId ?? kernels[0]?.id;
-      if (!kernelId) {
+      const { kernel } = params as { kernel: string };
+      let ref: KernelRef;
+      try {
+        ref = directory.resolveKernel(kernel);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         return {
-          content: [{ type: "text", text: "No live kernels. Provision one with provision_kernel." }],
-          details: { sessionId: null },
+          content: [{ type: "text", text: `inspect_kernel failed: ${message}` }],
+          details: { kernel, error: "unknown-kernel" },
+          isError: true,
         };
       }
       try {
-        const digest = await sessionManager.inspectKernel(kernelId, { timeoutMs: 15_000 });
+        const digest = await sessionManager.inspectKernel(ref.id, { timeoutMs: 15_000 });
         const lines = [
-          `kernel ${kernelId} · ${digest.cells} cell${digest.cells === 1 ? "" : "s"}`,
+          `kernel "${ref.name}" · ${digest.cells} cell${digest.cells === 1 ? "" : "s"}`,
           digest.imports.length
             ? `imports: ${digest.imports.map((entry) => (entry.name === entry.module ? entry.name : `${entry.name} (from ${entry.module})`)).join(", ")}`
             : "imports: none yet",
@@ -376,12 +418,13 @@ function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription
         ];
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { sessionId: kernelId, digest },
+          details: { kernel: ref.name, kernelName: ref.name, notebookPath: ref.notebookPath, digest },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `inspect_kernel failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: kernelId },
+          details: { kernel: ref.name, kernelName: ref.name },
+          isError: true,
         };
       }
     },
@@ -395,7 +438,8 @@ function resolveTargetPython(sandboxManager: SandboxManager): string {
 
 export function provisionDependencyTool(
   sessionManager: PythonSessionManager,
-  sandboxManager: SandboxManager
+  sandboxManager: SandboxManager,
+  directory?: KernelDirectory
 ): PtcToolDefinition {
   return withActivityLabel({
     name: "provision_dependency",
@@ -405,14 +449,14 @@ export function provisionDependencyTool(
       package: Type.String({
         description: 'Distribution name as pip/uv knows it (e.g. "opencv-python", "scikit-learn") — not the import name.',
       }),
-      session_id: Type.Optional(Type.String({
-        description: "Kernel to install into. Defaults to the most recently used kernel; with no live kernels, the shared environment is used.",
-      })),
+      kernel: Type.String({
+        description: "Kernel to install into (name from provision_kernel). Must be a live kernel.",
+      }),
     }),
     execute: async (_toolCallId, params, signal) => {
-      const { package: packageName, session_id: sessionId } = params as {
+      const { package: packageName, kernel } = params as {
         package?: string;
-        session_id?: string;
+        kernel: string;
       };
       if (!packageName || !packageName.trim()) {
         return { content: [{ type: "text", text: "provision_dependency requires a package name." }], details: {} };
@@ -425,41 +469,31 @@ export function provisionDependencyTool(
             type: "text",
             text: "Nested subagents reuse the parent's interpreter and cannot install dependencies. Ask the root agent to provision dependencies before launching the workflow.",
           }],
-          details: { package: packageName.trim(), error: "nested-dependency-install-blocked" },
+          details: { package: packageName.trim(), kernel, error: "nested-dependency-install-blocked" },
         };
       }
 
-      // Target resolution: explicit kernel → its env (pinned venv or shared);
-      // no id → most recently used kernel; no live kernels → shared env.
-      let targetPython: string;
-      let pinned = false;
-      let targetLabel: string;
-      if (sessionId) {
-        if (!sessionManager.get(sessionId)) {
-          const live = sessionManager.list().map((s) => s.id).join(", ");
-          return {
-            content: [{
-              type: "text",
-              text: `Unknown python session: ${sessionId}. Live sessions: ${live || "(none)"}.`,
-            }],
-            details: { package: packageName.trim(), session_id: sessionId, error: "unknown-session" },
-          };
-        }
-        const pinnedPython = sessionManager.getPythonExecutable(sessionId);
-        pinned = Boolean(pinnedPython);
-        targetPython = pinnedPython ?? resolveTargetPython(sandboxManager);
-        targetLabel = pinned ? `pinned venv ${pinnedPython}` : "shared environment";
-      } else {
-        const mru = sessionManager.list()[0];
-        const pinnedPython = mru ? sessionManager.getPythonExecutable(mru.id) : undefined;
-        pinned = Boolean(pinnedPython);
-        targetPython = pinnedPython ?? resolveTargetPython(sandboxManager);
-        targetLabel = pinned
-          ? `pinned venv ${pinnedPython} (kernel ${mru!.id})`
-          : mru
-            ? `shared environment (kernel ${mru.id})`
-            : "shared environment";
+      // Explicit kernel targeting only: resolve the named kernel and install
+      // into its environment (pinned venv or the shared venv that backs it).
+      // There is no global-environment fallback and no most-recently-used guess.
+      let ref: KernelRef;
+      try {
+        ref = (directory ?? new KernelDirectory(sessionManager)).resolveKernel(kernel);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `provision_dependency failed: ${message}` }],
+          details: { package: packageName.trim(), kernel, error: "unknown-kernel" },
+          isError: true,
+        };
       }
+
+      const pinnedPython = sessionManager.getPythonExecutable(ref.id);
+      const pinned = Boolean(pinnedPython);
+      const targetPython = pinnedPython ?? resolveTargetPython(sandboxManager);
+      const targetLabel = pinned
+        ? `pinned venv of kernel "${ref.name}"`
+        : `shared environment backing kernel "${ref.name}"`;
 
       try {
         const result = await execFilePtc("uv", ["pip", "install", "--python", targetPython, packageName.trim()], {
@@ -495,7 +529,7 @@ export function provisionDependencyTool(
         );
         return {
           content: [{ type: "text", text: lines.filter(Boolean).join("\n") }],
-          details: { package: packageName.trim(), changed, session_id: sessionId, target: targetPython, pinned },
+          details: { package: packageName.trim(), changed, kernel: ref.name, kernelName: ref.name, target: targetPython, pinned },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -504,7 +538,7 @@ export function provisionDependencyTool(
             type: "text",
             text: `provision_dependency failed for ${packageName.trim()}: ${message}\nIf the distribution name looks wrong, check it (the import name and the distribution name often differ, e.g. cv2 → opencv-python, PIL → pillow, sklearn → scikit-learn).`,
           }],
-          details: { package: packageName.trim(), error: message },
+          details: { package: packageName.trim(), kernel: ref.name, error: message },
         };
       }
     },
@@ -678,6 +712,7 @@ function execFilePtc(
 /** provision_kernel tool: spawn a persistent notebook-backed kernel (optionally sourcing a workflow). */
 function provisionKernelTool(
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
   return withActivityLabel({
@@ -685,6 +720,10 @@ function provisionKernelTool(
     label: "python",
     description: PROVISION_DESCRIPTION,
     parameters: Type.Object({
+      name: Type.String({
+        description:
+          "Unique human-readable kernel name among live kernels. Trimmed, nonempty, no control/terminal escape characters. Reuse the SAME name in every later kernel parameter to target this kernel.",
+      }),
       notebook: Type.Optional(
         Type.String({
           description:
@@ -705,7 +744,25 @@ function provisionKernelTool(
       ),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { notebook, source, version } = params as { notebook?: string; source?: string; version?: string };
+      const { name: rawName, notebook, source, version } = params as {
+        name: string;
+        notebook?: string;
+        source?: string;
+        version?: string;
+      };
+
+      // Name validation and duplicate rejection happen BEFORE any spawning.
+      let name: string;
+      try {
+        name = directory.assertAvailable(rawName);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `provision_kernel: ${error instanceof Error ? error.message : String(error)}` }],
+          details: { kernelName: typeof rawName === "string" ? rawName.trim() : null, error: "invalid-kernel-name" },
+          isError: true,
+        };
+      }
+
       if (version !== undefined && !isValidPythonVersion(version)) {
         return {
           content: [{
@@ -713,7 +770,8 @@ function provisionKernelTool(
             text: `provision_kernel: invalid python version ${JSON.stringify(version)}. ` +
               "Use a plain version like 3.14, 3.14.4, or 3.15.0b1 (no flags, paths, or extra arguments).",
           }],
-          details: { sessionId: null },
+          details: { kernelName: name },
+          isError: true,
         };
       }
       // Default notebook location is /tmp: most kernels are throwaway, and
@@ -762,29 +820,45 @@ function provisionKernelTool(
           version,
         });
 
+        // Bind the claimed name to the live kernel (throws on a racing
+        // duplicate; the kernel itself is still returned for bookkeeping).
+        let boundName = name;
+        try {
+          const ref = directory.register(name, id, notebookPath);
+          boundName = ref.name;
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `provision_kernel: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { kernelName: name, sessionId: id, notebookPath, error: "duplicate-kernel-name" },
+            isError: true,
+          };
+        }
+
         const lines = [
-          `Provisioned kernel ${id} — notebook ${notebookPath}.`,
+          `Provisioned kernel "${boundName}" — notebook ${notebookPath}.`,
           sourcedFrom ? `Sourced from ${sourcedFrom}.` : "",
-          `Run cells with exec_cell (session_id: ${id}); every cell is appended to the notebook.`,
+          `Run cells with exec_cell (kernel: "${boundName}"); every cell is appended to the notebook.`,
         ].filter(Boolean);
         if (sourceError) {
           lines.push(
             `Sourcing failed in prefix cell ${sourceError.cellIdx} (the failed cell is recorded and the kernel is still usable):`,
             sourceError.message,
             ...(sourceError.traceback ? [sourceError.traceback] : []),
-            `Inspect the error with exec_cell in kernel ${id} and repair as needed.`
+            `Inspect the error with exec_cell in kernel "${boundName}" and repair as needed.`
           );
         } else if (scriptError) {
           lines.push(
             `The legacy seeding script failed (the kernel is still usable):`,
             scriptError.message,
             ...(scriptError.traceback ? [scriptError.traceback] : []),
-            `Inspect the error with exec_cell in kernel ${id} and repair as needed.`
+            `Inspect the error with exec_cell in kernel "${boundName}" and repair as needed.`
           );
         }
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
+            kernel: boundName,
+            kernelName: boundName,
             sessionId: id,
             notebookPath,
             sourcedFrom,
@@ -802,19 +876,41 @@ function provisionKernelTool(
       } catch (error) {
         return {
           content: [{ type: "text", text: `Failed to provision kernel: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: null },
+          details: { kernelName: name },
+          isError: true,
         };
       }
     },
     renderResult(result: AgentToolResult<unknown>, { isPartial }: ToolRenderResultOptions, theme: Theme) {
-      const details = result.details as { sessionId?: string; notebookPath?: string; sourcedFrom?: string; scriptError?: string } | undefined;
+      // Compact, identity-only render: kernel name + notebook. Instructional
+      // prose and internal ids stay out of the user-facing transcript.
+      const details = result.details as {
+        kernelName?: string | null;
+        notebookPath?: string;
+        sourcedFrom?: string;
+        sourceError?: { message?: string };
+        scriptError?: string;
+      } | undefined;
       if (isPartial) {
         return new Text(theme.fg("muted", "Provisioning kernel..."), 0, 0);
       }
-      const sessionLine = details?.sessionId
-        ? theme.fg("success", `kernel ${details.sessionId}`) + (details.notebookPath ? theme.fg("muted", ` · ${details.notebookPath}`) : "")
+      if (result.isError) {
+        const name = details?.kernelName ? ` "${details.kernelName}"` : "";
+        return new Text(theme.fg("error", `provision_kernel${name} failed`), 0, 0);
+      }
+      const name = details?.kernelName ?? "(unnamed)";
+      const notebook = details?.notebookPath
+        ? theme.fg("muted", ` · ${path.basename(details.notebookPath)}`)
         : "";
-      return new Text(`${sessionLine ? `${sessionLine}\n` : ""}${result.content.map((c) => (c.type === "text" ? c.text : "")).join("")}`, 0, 0);
+      const lines = [theme.fg("success", `kernel "${name}"`) + notebook];
+      if (details?.sourcedFrom) {
+        lines.push(theme.fg("muted", `sourced from ${path.basename(details.sourcedFrom)}`));
+      }
+      const failure = details?.sourceError?.message ?? details?.scriptError;
+      if (failure) {
+        lines.push(theme.fg("warning", failure.split("\n", 1)[0] ?? ""));
+      }
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
 }
@@ -823,6 +919,7 @@ function provisionKernelTool(
 function execCellTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState,
   toolDescription: string
@@ -832,7 +929,7 @@ function execCellTool(
     label: "python",
     description: `${EXEC_CELL_DESCRIPTION}\n\n${toolDescription}`,
     parameters: Type.Object({
-      session_id: Type.String({ description: "Session id from provision_kernel." }),
+      kernel: Type.String({ description: "Kernel to execute in (name from provision_kernel)." }),
       code: Type.Optional(
         Type.String({
           description:
@@ -846,51 +943,63 @@ function execCellTool(
         })
       ),
     }),
-        execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-          const { session_id: sessionId, code, file: cellFile } = params as {
-            session_id: string;
-            code?: string;
-            file?: string;
+    execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+      const { kernel, code, file: cellFile } = params as {
+        kernel: string;
+        code?: string;
+        file?: string;
+      };
+      let ref: KernelRef;
+      try {
+        ref = directory.resolveKernel(kernel);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `exec_cell failed: ${message}` }],
+          details: { kernel, error: "unknown-kernel" },
+          isError: true,
+        };
+      }
+      const sessionId = ref.id;
+      if (!code && !cellFile) {
+        return {
+          content: [{ type: "text", text: "exec_cell requires exactly one of code or file." }],
+          details: { kernel: ref.name, sessionId },
+        };
+      }
+      if (code && cellFile) {
+        return {
+          content: [{ type: "text", text: "exec_cell takes code or file, not both." }],
+          details: { kernel: ref.name, sessionId },
+        };
+      }
+      const recoveryState = getRequestRecoveryState(sessionState);
+      let cellCode = code;
+      let resolvedCellFile: string | undefined;
+      if (cellFile) {
+        resolvedCellFile = path.isAbsolute(cellFile) ? cellFile : path.resolve(ctx.cwd, cellFile);
+        try {
+          cellCode = await fs.promises.readFile(resolvedCellFile, "utf8");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `exec_cell could not read ${resolvedCellFile}: ${message}` }],
+            details: { kernel: ref.name, sessionId, sourcePath: resolvedCellFile },
           };
-          if (!code && !cellFile) {
-            return {
-              content: [{ type: "text", text: "exec_cell requires exactly one of code or file." }],
-              details: { sessionId },
-            };
-          }
-          if (code && cellFile) {
-            return {
-              content: [{ type: "text", text: "exec_cell takes code or file, not both." }],
-              details: { sessionId },
-            };
-          }
-          const recoveryState = getRequestRecoveryState(sessionState);
-          let cellCode = code;
-          let resolvedCellFile: string | undefined;
-          if (cellFile) {
-            resolvedCellFile = path.isAbsolute(cellFile) ? cellFile : path.resolve(ctx.cwd, cellFile);
-            try {
-              cellCode = await fs.promises.readFile(resolvedCellFile, "utf8");
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              return {
-                content: [{ type: "text", text: `exec_cell could not read ${resolvedCellFile}: ${message}` }],
-                details: { sessionId, sourcePath: resolvedCellFile },
-              };
-            }
-          }
+        }
+      }
 
 
-          // background/wait_for modes are WIP (deferred): synchronous runs make the
-          // live subagent viewer straightforward. The manager keeps the machinery
-          // for when it returns.
+      // background/wait_for modes are WIP (deferred): synchronous runs make the
+      // live subagent viewer straightforward. The manager keeps the machinery
+      // for when it returns.
 
-          // Pre-highlight through the existing shiki pipeline (awaited here, in
-          // execute — the renderer stays synchronous and zero-jitter: it just
-          // reads details.highlightLines during streaming and at completion).
-          const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string, ctx.ui.theme) : undefined;
+      // Pre-highlight through the existing shiki pipeline (awaited here, in
+      // execute — the renderer stays synchronous and zero-jitter: it just
+      // reads details.highlightLines during streaming and at completion).
+      const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string, ctx.ui.theme) : undefined;
 
-          // Foreground exec with the recovery flow from the legacy code_execution tool.
+      // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
       sessionState.lastCtx = ctx;
 
@@ -928,7 +1037,7 @@ function execCellTool(
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
         }
         const reportedCellIdx = result.details.cellIdx;
-        const compatibilityCellIdx = sessionManager.list().find((kernel) => kernel.id === sessionId)?.chunks ?? 1;
+        const compatibilityCellIdx = sessionManager.list().find((entry) => entry.id === sessionId)?.chunks ?? 1;
         const visibleOutput = collapseOutputPreview(
           result.output,
           settings.outputPreviewChars,
@@ -947,6 +1056,9 @@ function execCellTool(
           details: {
             ...result.details,
             sessionId,
+            kernel: ref.name,
+            kernelName: ref.name,
+            notebookPath: ref.notebookPath,
             highlightLines,
             imagesCount: result.images?.length || 0,
             telemetry: buildPtcExecutionTelemetry(recoveryState),
@@ -977,23 +1089,29 @@ function execCellTool(
 // read_cells / read_cell / run_cell / run_to / run_all / reset_kernel
 // ============================================================================
 
-/** Resolve the target kernel: an explicit id, else the most recently used one. */
-function resolveKernelId(
-  sessionManager: PythonSessionManager,
-  sessionId?: string
-): { id: string } | { error: string } {
-  if (sessionId) {
-    if (sessionManager.get(sessionId)) {
-      return { id: sessionId };
-    }
-    const live = sessionManager.list().map((kernel) => kernel.id).join(", ") || "(none)";
-    return { error: `Unknown kernel ${sessionId}. Live kernels: ${live}` };
+/**
+ * Resolve the target kernel explicitly by its human-readable name. There is no
+ * implicit most-recent-kernel fallback: every public tool names its kernel.
+ */
+function resolveKernelTarget(
+  directory: KernelDirectory,
+  kernel: unknown
+): { ref: KernelRef } | { error: string; errorDetails: Record<string, unknown> } {
+  try {
+    return { ref: directory.resolveKernel(kernel) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = typeof kernel === "string" ? kernel.trim() : undefined;
+    return {
+      error: message,
+      errorDetails: { kernel: name ?? null, error: "unknown-kernel" },
+    };
   }
-  const recent = sessionManager.list()[0];
-  if (!recent) {
-    return { error: "No live kernels. Provision one with provision_kernel." };
-  }
-  return { id: recent.id };
+}
+
+/** Identity fields every result carries so renders can show name + notebook. */
+function kernelIdentity(ref: KernelRef): Record<string, unknown> {
+  return { kernel: ref.name, kernelName: ref.name, notebookPath: ref.notebookPath };
 }
 
 /** Build the model-facing content (text + images) from a completed exec result. */
@@ -1035,13 +1153,9 @@ function renderNotebookCells(cells: NotebookCellSummary[]): string {
     .join("\n\n");
 }
 
-/**
- * scratch_run: execute code in a kernel without recording a notebook cell. The
- * namespace is mutated exactly like exec_cell; only the artifact write is
- * suppressed. Use it to define/explore state without cluttering the notebook.
- */
 function scratchRunTool(
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
@@ -1051,25 +1165,23 @@ function scratchRunTool(
     description:
       "Execute Python in a live kernel WITHOUT recording a notebook cell. The kernel namespace is mutated (variables persist for later cells), but nothing is appended to the notebook. Use it for exploration and setup that should not become cells. Output uses the same sectioned format as exec_cell (echo/return/kernel/subagents/tools).",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel to run in (name from provision_kernel)." }),
       code: Type.String({ description: "Python code to run. Top-level await works; the last bare expression echoes." }),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, code } = params as {
-        session_id?: string;
+      const { kernel, code } = params as {
+        kernel: string;
         code: string;
       };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `scratch_run failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
       sessionState.lastCtx = ctx;
-      sessionState.activeForegroundExecutions.set(toolCallId, target.id);
+      sessionState.activeForegroundExecutions.set(toolCallId, target.ref.id);
       const liveUpdates = createLiveRepaint(onUpdate);
       try {
-        const result = await sessionManager.scratchRun(target.id, code, {
+        const result = await sessionManager.scratchRun(target.ref.id, code, {
           cwd: ctx.cwd,
           ctx,
           signal,
@@ -1079,7 +1191,8 @@ function scratchRunTool(
         if (result.details.estimatedAvoidedTokens > 0) {
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
         }
-        return completedCellContent(result, target.id, settings);
+        const completed = completedCellContent(result, target.ref.id, settings);
+        return { content: completed.content, details: { ...completed.details, ...kernelIdentity(target.ref) } };
       } finally {
         liveUpdates.stop();
         sessionState.activeForegroundExecutions.delete(toolCallId);
@@ -1091,17 +1204,14 @@ function scratchRunTool(
   });
 }
 
-/** write_cell: upsert a code/markdown cell at a position without executing it. */
-function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function writeCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "write_cell",
     label: "write cell",
     description:
       "Create or replace a notebook cell at a 1-based position, without executing it. Replaces the cell already at that position (its outputs are cleared); appends a new cell when `at` is past the end. Persists to the notebook immediately and updates the same cell model the kernel writes to.",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel whose notebook is written (name from provision_kernel)." }),
       at: Type.Integer({
         minimum: 1,
         description: "1-based position: replaces the existing cell there, or appends when past the end.",
@@ -1114,16 +1224,17 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
       ),
     }),
     execute: async (_toolCallId, params) => {
-      const { session_id: sessionId, at, source, type } = params as {
-        session_id?: string;
+      const { kernel, at, source, type } = params as {
+        kernel: string;
         at: number;
         source: string;
         type?: "code" | "markdown";
       };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `write_cell failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       const cellType = type ?? "code";
       // Peek at the current cell first: its source feeds the renderer's
       // inline diff (replace) or cleared-contents red, and tells insert apart
@@ -1131,7 +1242,7 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
       let oldSource: string | undefined;
       let replaced = false;
       try {
-        const existing = await sessionManager.readCell(target.id, at);
+        const existing = await sessionManager.readCell(ref.id, at);
         if (existing.cells.length > 0) {
           replaced = true;
           oldSource = existing.cells[0]!.source;
@@ -1140,17 +1251,18 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
         // Position past the end (or read failed): treat as an append.
       }
       try {
-        const result = await sessionManager.writeCell(target.id, { at, source, cellType });
+        const result = await sessionManager.writeCell(ref.id, { at, source, cellType });
         const verb = replaced ? "Replaced" : "Appended";
         return {
           content: [
             {
               type: "text",
-              text: `${verb} ${cellType} cell at position ${at} (kernel ${target.id}; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
+              text: `${verb} ${cellType} cell at position ${at} (kernel "${ref.name}"; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
             },
           ],
           details: {
-            sessionId: target.id,
+            ...kernelIdentity(ref),
+            sessionId: ref.id,
             at,
             cellType,
             total: result.total,
@@ -1162,7 +1274,8 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
       } catch (error) {
         return {
           content: [{ type: "text", text: `write_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id, at },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, at },
+          isError: true,
         };
       }
     },
@@ -1172,49 +1285,48 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
   });
 }
 
-/** delete_cell: remove a cell; later positions shift down. */
-function deleteCellTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function deleteCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "delete_cell",
     label: "delete cell",
     description:
       "Remove cell n from the notebook; subsequent cells shift down one position. Persists immediately. The kernel namespace is untouched.",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel whose notebook cell is deleted (name from provision_kernel)." }),
       n: Type.Integer({ minimum: 1, description: "1-based position of the cell to delete." }),
     }),
     execute: async (_toolCallId, params) => {
-      const { session_id: sessionId, n } = params as { session_id?: string; n: number };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const { kernel, n } = params as { kernel: string; n: number };
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `delete_cell failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       // Capture the doomed cell's source first: the renderer draws the whole
       // deleted cell (red, gutter included) from it.
       let deletedSource: string | undefined;
       try {
-        const existing = await sessionManager.readCell(target.id, n);
+        const existing = await sessionManager.readCell(ref.id, n);
         deletedSource = existing.cells[0]?.source;
       } catch {
         // Cell may not exist; the delete below surfaces the real error.
       }
       try {
-        const result = await sessionManager.deleteCell(target.id, n);
+        const result = await sessionManager.deleteCell(ref.id, n);
         return {
           content: [
             {
               type: "text",
-              text: `Deleted cell ${n} (kernel ${target.id}; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
+              text: `Deleted cell ${n} (kernel "${ref.name}"; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
             },
           ],
-          details: { sessionId: target.id, n, total: result.total, cellSource: deletedSource },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, n, total: result.total, cellSource: deletedSource },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `delete_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id, n },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, n },
+          isError: true,
         };
       }
     },
@@ -1223,40 +1335,39 @@ function deleteCellTool(sessionManager: PythonSessionManager): PtcToolDefinition
   });
 }
 
-/** read_cells: list cells (source + current outputs) over a 1-based window. */
-function readCellsTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function readCellsTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cells",
     label: "read cells",
     description:
       "Read notebook cells with their sources and current outputs, 1-based. Use offset/limit to page. Cell numbers are notebook positions (not execution numbers).",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel whose notebook is read (name from provision_kernel)." }),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "1-based first cell to read; default 1." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of cells to read; default all." })),
     }),
     execute: async (_toolCallId, params) => {
-      const { session_id: sessionId, offset, limit } = params as {
-        session_id?: string;
+      const { kernel, offset, limit } = params as {
+        kernel: string;
         offset?: number;
         limit?: number;
       };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `read_cells failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       try {
-        const result = await sessionManager.readCells(target.id, { offset, limit });
+        const result = await sessionManager.readCells(ref.id, { offset, limit });
         return {
           content: [{ type: "text", text: renderNotebookCells(result.cells) }],
-          details: { sessionId: target.id, total: result.total, cells: result.cells },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, total: result.total, cells: result.cells },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `read_cells failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id },
+          details: { ...kernelIdentity(ref), sessionId: ref.id },
+          isError: true,
         };
       }
     },
@@ -1264,35 +1375,34 @@ function readCellsTool(sessionManager: PythonSessionManager): PtcToolDefinition 
   });
 }
 
-/** read_cell: one cell's source + current outputs (1-based position). */
-function readCellTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function readCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cell",
     label: "read cell",
     description:
       "Read one notebook cell (source plus its current outputs) by 1-based position. Use it before run_cell to see the exact code that will execute.",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel whose notebook is read (name from provision_kernel)." }),
       n: Type.Integer({ minimum: 1, description: "1-based notebook position." }),
     }),
     execute: async (_toolCallId, params) => {
-      const { session_id: sessionId, n } = params as { session_id?: string; n: number };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const { kernel, n } = params as { kernel: string; n: number };
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `read_cell failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       try {
-        const result = await sessionManager.readCell(target.id, n);
+        const result = await sessionManager.readCell(ref.id, n);
         return {
           content: [{ type: "text", text: renderNotebookCells(result.cells) }],
-          details: { sessionId: target.id, total: result.total, cells: result.cells },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, total: result.total, cells: result.cells },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `read_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id, n },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, n },
+          isError: true,
         };
       }
     },
@@ -1301,9 +1411,9 @@ function readCellTool(sessionManager: PythonSessionManager): PtcToolDefinition {
   });
 }
 
-/** run_cell: execute cell n in place, refreshing only its stored outputs. */
 function runCellTool(
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
@@ -1313,35 +1423,35 @@ function runCellTool(
     description:
       "Execute the code cell at 1-based position n in the kernel and replace that cell's stored outputs. The kernel may also be ahead of the notebook, so run_to/run_all run prerequisite cells in order. Use read_cell first to confirm the code.",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel to run in (name from provision_kernel)." }),
       n: Type.Integer({ minimum: 1, description: "1-based position of the code cell to run." }),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, n } = params as {
-        session_id?: string;
+      const { kernel, n } = params as {
+        kernel: string;
         n: number;
       };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `run_cell failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       let code = "";
       try {
-        const preview = await sessionManager.readCell(target.id, n);
+        const preview = await sessionManager.readCell(ref.id, n);
         code = preview.cells[0]?.source ?? "";
       } catch (error) {
         return {
           content: [{ type: "text", text: `run_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id, n },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, n },
+          isError: true,
         };
       }
       sessionState.lastCtx = ctx;
-      sessionState.activeForegroundExecutions.set(toolCallId, target.id);
+      sessionState.activeForegroundExecutions.set(toolCallId, ref.id);
       const liveUpdates = createLiveRepaint(onUpdate);
       try {
-        const result = await sessionManager.runCell(target.id, n, {
+        const result = await sessionManager.runCell(ref.id, n, {
           cwd: ctx.cwd,
           ctx,
           signal,
@@ -1351,12 +1461,13 @@ function runCellTool(
         if (result.details.estimatedAvoidedTokens > 0) {
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
         }
-        const content = completedCellContent(result, target.id, settings);
-        return { content: content.content, details: { ...content.details, runCellIndex: n } };
+        const content = completedCellContent(result, ref.id, settings);
+        return { content: content.content, details: { ...content.details, ...kernelIdentity(ref), runCellIndex: n } };
       } catch (error) {
         return {
           content: [{ type: "text", text: `run_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id, n },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, n },
+          isError: true,
         };
       } finally {
         liveUpdates.stop();
@@ -1368,23 +1479,19 @@ function runCellTool(
   });
 }
 
-/** run_to / run_all: execute a batch of code cells in order. */
 function runBatchTool(
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   sessionState: PtcSessionState,
   opts: { name: "run_to" | "run_all"; label: string; description: string; withN: boolean }
 ): PtcToolDefinition {
   const parameters = opts.withN
     ? Type.Object({
-        session_id: Type.Optional(
-          Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-        ),
+        kernel: Type.String({ description: "Kernel to run in (name from provision_kernel)." }),
         n: Type.Integer({ minimum: 1, description: "Run code cells 1..n in order." }),
       })
     : Type.Object({
-        session_id: Type.Optional(
-          Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-        ),
+        kernel: Type.String({ description: "Kernel to run in (name from provision_kernel)." }),
       });
   return withActivityLabel({
     name: opts.name,
@@ -1392,13 +1499,14 @@ function runBatchTool(
     description: opts.description,
     parameters,
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, n } = params as { session_id?: string; n?: number };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const { kernel, n } = params as { kernel: string; n?: number };
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `${opts.name} failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       sessionState.lastCtx = ctx;
-      sessionState.activeForegroundExecutions.set(toolCallId, target.id);
+      sessionState.activeForegroundExecutions.set(toolCallId, ref.id);
       try {
         const options = {
           cwd: ctx.cwd,
@@ -1409,17 +1517,18 @@ function runBatchTool(
         };
         const result: NotebookRunResult =
           opts.name === "run_to"
-            ? await sessionManager.runTo(target.id, n as number, options)
-            : await sessionManager.runAll(target.id, options);
+            ? await sessionManager.runTo(ref.id, n as number, options)
+            : await sessionManager.runAll(ref.id, options);
         const runSteps = result.steps;
         return {
           content: [{ type: "text", text: result.output }],
-          details: { sessionId: target.id, runSteps, failedIndex: result.failedIndex },
+          details: { ...kernelIdentity(ref), sessionId: ref.id, runSteps, failedIndex: result.failedIndex },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `${opts.name} failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id },
+          details: { ...kernelIdentity(ref), sessionId: ref.id },
+          isError: true,
         };
       } finally {
         sessionState.activeForegroundExecutions.delete(toolCallId);
@@ -1430,26 +1539,24 @@ function runBatchTool(
   });
 }
 
-/** reset_kernel: restart the interpreter (fresh namespace); the notebook file is untouched. */
-function resetKernelTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function resetKernelTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "reset_kernel",
     label: "reset kernel",
     description:
       "Restart the kernel's interpreter: the namespace is empty (all imports/variables/defined functions are gone) and execution numbering restarts at 1. The notebook file on disk is untouched, so its cells remain for run_all/run_cell. Use it to get a clean slate without changing the notebook.",
     parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
-      ),
+      kernel: Type.String({ description: "Kernel to restart (name from provision_kernel)." }),
     }),
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
-      const { session_id: sessionId } = params as { session_id?: string };
-      const target = resolveKernelId(sessionManager, sessionId);
+      const { kernel } = params as { kernel: string };
+      const target = resolveKernelTarget(directory, kernel);
       if ("error" in target) {
-        return { content: [{ type: "text", text: target.error }], details: {} };
+        return { content: [{ type: "text", text: `reset_kernel failed: ${target.error}` }], details: target.errorDetails, isError: true };
       }
+      const ref = target.ref;
       try {
-        const summary = await sessionManager.resetKernel(target.id, {
+        const summary = await sessionManager.resetKernel(ref.id, {
           cwd: ctx.cwd,
           ctx,
           parentToolCallId: toolCallId,
@@ -1459,15 +1566,16 @@ function resetKernelTool(sessionManager: PythonSessionManager): PtcToolDefinitio
           content: [
             {
               type: "text",
-              text: `Restarted kernel ${target.id}: fresh namespace, execution numbering from 1. Notebook ${notebook} untouched.`,
+              text: `Restarted kernel "${ref.name}": fresh namespace, execution numbering from 1. Notebook ${notebook} untouched.`,
             },
           ],
-          details: summary,
+          details: { ...kernelIdentity(ref), sessionId: ref.id, ...summary },
         };
       } catch (error) {
         return {
           content: [{ type: "text", text: `reset_kernel failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { sessionId: target.id },
+          details: { ...kernelIdentity(ref), sessionId: ref.id },
+          isError: true,
         };
       }
     },
@@ -1513,74 +1621,40 @@ function registerWorkflowCommand(pi: ExtensionAPI): void {
 // /ptc command
 // ============================================================================
 
-/**
- * Resolve the session a /ptc action targets: an explicit id, else the most
- * recently targeted foreground session, else the most recent active, else the
- * first live session. Returns { error } when nothing qualifies.
- */
-function resolveTargetSession(
-  sessionManager: PythonSessionManager,
-  sessionState: PtcSessionState,
-  requested?: string
-): SessionSummary | { error: string } {
-  if (requested) {
-    const found = sessionManager.list().find((s) => s.id === requested);
-    return found ?? { error: `Unknown python session ${requested}. Live: ${sessionManager.list().map((s) => s.id).join(", ") || "(none)"}` };
-  }
-  const sessions = sessionManager.list();
-  const activeSessionIds = Array.from(sessionState.activeForegroundExecutions.values()).reverse();
-  const target =
-    activeSessionIds.map((id) => sessions.find((session) => session.id === id)).find(Boolean) ??
-    sessionManager.mostRecentActive() ??
-    sessions[0];
-  return target ?? { error: "No python sessions. Provision one with provision_kernel first." };
-}
 
-/** Register the /ptc command (interrupt|stop|kill [session_id]; bg/fg are WIP-deferred). */
-function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, sessionState: PtcSessionState): void {
+/** Manual kernel controls require the same human-readable name as tools. */
+function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, directory: KernelDirectory): void {
   pi.registerCommand("ptc", {
-    description: "Control PTC Python kernels: /ptc <interrupt|kill> [session_id]",
+    description: "Control Python kernels: /ptc <interrupt|kill> <kernel-name>",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
-      const [actionRaw, requestedId] = (args ?? "").trim().split(/\s+/);
-      const action = (actionRaw ?? "").toLowerCase();
-
-      if (!["background", "bg", "foreground", "fg", "interrupt", "stop", "kill"].includes(action)) {
-        ctx.ui.notify(
-          "usage: /ptc <interrupt|kill> [session_id]  (background|bg|foreground|fg are WIP/deferred)",
-          "error"
-        );
+      const match = (args ?? "").trim().match(/^(\S+)(?:\s+([\s\S]*))?$/);
+      const action = (match?.[1] ?? "").toLowerCase();
+      if (["background", "bg", "foreground", "fg"].includes(action)) {
+        ctx.ui.notify("Background execution is deferred; cells run synchronously.", "error");
         return;
       }
-
-      if (action === "background" || action === "bg" || action === "foreground" || action === "fg") {
-        ctx.ui.notify("/ptc background|foreground is WIP (deferred) — runs are synchronous for now", "error");
+      if (!["interrupt", "stop", "kill"].includes(action) || !match?.[2]?.trim()) {
+        ctx.ui.notify("usage: /ptc <interrupt|kill> <kernel-name>", "error");
         return;
       }
-      const target = resolveTargetSession(sessionManager, sessionState, requestedId);
-      if ("error" in target) {
-        ctx.ui.notify(target.error, "error");
+      let target: KernelRef;
+      try { target = directory.resolveKernel(match[2].trim()); }
+      catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         return;
       }
-
-      if (action === "interrupt" || action === "stop") {
-        // Ctrl-C semantics: the running chunk stops where it is, the session (and
-        // anything it spawned) stays alive for the next chunk to reuse.
+      if (action !== "kill") {
         const interrupted = sessionManager.interruptRunning(target.id);
-        ctx.ui.notify(
-          interrupted
-            ? `Interrupted the running chunk in session ${target.id} (session left alive)`
-            : `Nothing running in session ${target.id}`,
-          interrupted ? "info" : "error"
-        );
+        ctx.ui.notify(interrupted ? `Interrupted kernel "${target.name}"; state retained.`
+          : `Nothing running in kernel "${target.name}".`, interrupted ? "info" : "error");
         return;
       }
-
-      // kill
       try {
         await sessionManager.dispose(target.id);
-        ctx.ui.notify(`Disposed python session ${target.id}`, "info");
+        directory.forget(target.id);
+        ctx.ui.notify(`Closed kernel "${target.name}".`, "info");
       } catch (error) {
-        ctx.ui.notify(`Failed to dispose session ${target.id}: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(`Failed to close kernel "${target.name}": ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });
@@ -1691,6 +1765,7 @@ async function handleSessionStart(
   toolRegistry: ToolRegistry,
   settings: PtcSettings,
   sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
   sandboxManager: SandboxManager,
   _event: unknown,
   ctx: ExtensionContext
@@ -1702,22 +1777,22 @@ async function handleSessionStart(
   }
 
   const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
-  pi.registerTool(provisionKernelTool(sessionManager, sessionState));
-  pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState, toolDescription));
-  pi.registerTool(listKernelsTool(sessionManager));
-  pi.registerTool(readCellOutputTool(sessionManager));
-  pi.registerTool(promoteToSkillNotebookTool(sessionManager));
-  pi.registerTool(inspectKernelTool(sessionManager, toolDescription));
-  pi.registerTool(provisionDependencyTool(sessionManager, sandboxManager));
-  pi.registerTool(scratchRunTool(sessionManager, settings, sessionState));
-  pi.registerTool(writeCellTool(sessionManager));
-  pi.registerTool(deleteCellTool(sessionManager));
-  pi.registerTool(readCellsTool(sessionManager));
-  pi.registerTool(readCellTool(sessionManager));
-  pi.registerTool(createRenderedCellReviewTool(sessionManager));
-  pi.registerTool(runCellTool(sessionManager, settings, sessionState));
-  pi.registerTool(
-    runBatchTool(sessionManager, sessionState, {
+  const register = (tool: PtcToolDefinition) => pi.registerTool(withKernelRendering(tool, directory));
+  register(provisionKernelTool(sessionManager, directory, sessionState));
+  register(execCellTool(pi, sessionManager, directory, settings, sessionState, toolDescription));
+  register(readCellOutputTool(sessionManager, directory));
+  register(promoteToSkillNotebookTool(sessionManager, directory));
+  register(inspectKernelTool(sessionManager, directory, toolDescription));
+  register(provisionDependencyTool(sessionManager, sandboxManager, directory));
+  register(scratchRunTool(sessionManager, directory, settings, sessionState));
+  register(writeCellTool(sessionManager, directory));
+  register(deleteCellTool(sessionManager, directory));
+  register(readCellsTool(sessionManager, directory));
+  register(readCellTool(sessionManager, directory));
+  register(createRenderedCellReviewTool(sessionManager, directory));
+  register(runCellTool(sessionManager, directory, settings, sessionState));
+  register(
+    runBatchTool(sessionManager, directory, sessionState, {
       name: "run_to",
       label: "run to cell",
       description:
@@ -1725,8 +1800,8 @@ async function handleSessionStart(
       withN: true,
     })
   );
-  pi.registerTool(
-    runBatchTool(sessionManager, sessionState, {
+  register(
+    runBatchTool(sessionManager, directory, sessionState, {
       name: "run_all",
       label: "run all",
       description:
@@ -1734,7 +1809,7 @@ async function handleSessionStart(
       withN: false,
     })
   );
-  pi.registerTool(resetKernelTool(sessionManager));
+  register(resetKernelTool(sessionManager, directory));
 }
 
 /**
@@ -1894,6 +1969,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     },
   });
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;
+  const kernelDirectory = new KernelDirectory(sessionManager);
   subagentRuntime = createSubagentRuntime(sessionManager);
   (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = subagentRuntime;
 
@@ -1934,7 +2010,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     });
   }
 
-  registerPtcCommand(pi, sessionManager, sessionState);
+  registerPtcCommand(pi, sessionManager, kernelDirectory);
   registerWorkflowCommand(pi);
 
   const onToolSetChanged = () => {
@@ -1945,8 +2021,8 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
       return;
     }
     const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
-    pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState, toolDescription));
-    pi.registerTool(inspectKernelTool(sessionManager, toolDescription));
+    pi.registerTool(withKernelRendering(execCellTool(pi, sessionManager, kernelDirectory, settings, sessionState, toolDescription), kernelDirectory));
+    pi.registerTool(withKernelRendering(inspectKernelTool(sessionManager, kernelDirectory, toolDescription), kernelDirectory));
   };
 
   const customToolManager = new CustomToolManager(extensionRoot, pi, toolRegistry, onToolSetChanged);
@@ -1959,6 +2035,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     toolRegistry,
     settings,
     sessionManager,
+    kernelDirectory,
     sandboxManager
   );
   const onBeforeAgentStart = handleBeforeAgentStart.bind(undefined, pi, toolRegistry, settings, sessionState);

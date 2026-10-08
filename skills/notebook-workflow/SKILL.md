@@ -13,7 +13,10 @@ metadata:
 
 ## Input Contract
 
-- A pi-pycells kernel from `provision_kernel`, bound to a real `.ipynb`.
+- A pi-pycells kernel from `provision_kernel({ name, notebook, ... })`, bound to
+  a real `.ipynb`. `name` is a nonempty, unique human-readable kernel name
+  (trimmed; control/terminal escape characters rejected); every other tool
+  targets it with `kernel: "name"`. There is no implicit most-recent kernel.
 - A durable work item (analysis, benchmark, reusable workflow) or scratch
   exploration the user may later want to keep.
 - An explicit notebook path inside the project for work worth keeping. An
@@ -39,7 +42,7 @@ namespace actually holds. Never assume the kernel matches the notebook.
 
 | Operation | Use it when | Notebook effect | Kernel effect |
 | --- | --- | --- | --- |
-| `provision_kernel` | You need a kernel (once per task). | Creates/opens the `.ipynb`. | Fresh namespace. |
+| `provision_kernel` | You need a kernel (once per task). Give it a unique `name`. | Creates/opens the `.ipynb`. | Fresh namespace. |
 | `scratch_run(code)` | Explore: try an import, check a shape, iterate on a value. | **Nothing is appended.** | Mutates the namespace. |
 | `write_cell(at, source, type=...)` | Author content: add or replace a cell (`type="markdown"` for prose). | Inserts/replaces at position `at`; a replaced cell's outputs are cleared as stale; saved immediately. | None. |
 | `run_cell(n)` | Execute the cell you just wrote or edited, at its position. **The main execution path** — write one cell, run one cell. | Updates that cell's outputs. | Mutates the namespace. |
@@ -49,8 +52,11 @@ namespace actually holds. Never assume the kernel matches the notebook.
 | `exec_cell(code)` | You have proven code and want it **both executed and appended** as a new cell. | Appends a new code cell with outputs. | Mutates the namespace. |
 | `delete_cell(n)` | Remove a cell. | Deletes it. | None. |
 | `read_cells` / `read_cell` | Curate: read cell sources and current outputs. | None. | None. |
-| `inspect_kernel` | See what the namespace actually holds (names, types, funcs). | None. | None. |
+| `inspect_kernel` | See what the named kernel's namespace actually holds (names, types, funcs). | None. | None. |
 
+Every operation in this table other than `provision_kernel` takes a required
+`kernel: "name"` argument resolved against live kernels by human-readable name;
+unknown or omitted names are errors, and `list_kernels` no longer exists.
 `write_cell` both inserts a new cell and replaces the one at `at` — it is the
 only in-place source editor, and it never executes anything.
 
@@ -71,6 +77,16 @@ only in-place source editor, and it never executes anything.
   outputs. Before handover, always do this.
 - *Never* narrate a scratch session into the notebook cell by cell; that is
   what `scratch_run` is for.
+
+# Review before substantial execution
+
+`request_cell_review({ kernel, n })` previews a **saved code cell** of the named
+kernel for the user without executing it; it accepts only the required `kernel`
+and cell position `n` — no detached code snippets or external files. Reviewed
+workflows must therefore be saved first: `write_cell` the cell, request review
+of it, then `run_cell` it on approval. Approval covers the intended operation;
+ordinary repairs within approved scope need no repeat review, while new targets,
+permissions, destructive effects, or materially greater cost return to review.
 
 # Cell granularity
 
@@ -185,4 +201,5 @@ skill).
   leaving the cell wrong is hidden state.
 - When delivering, report the notebook path and one line on what it does.
   Promote only genuinely reusable workflows with
-  `promote_to_skill_notebook({ name })` — not one-off scratch.
+  `promote_to_skill_notebook({ kernel, name })` — it promotes the named kernel's
+  bound notebook, not an unrelated external file — not one-off scratch.

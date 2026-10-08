@@ -1,63 +1,58 @@
 import { Type } from "@sinclair/typebox";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { AgentToolResult, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { PythonSessionManager } from "../python-session-manager";
 import type { PtcToolDefinition } from "../types";
 import { withActivityLabel } from "../utils";
 import { highlightCellCode } from "../execution/code-highlight";
+import { KernelDirectory } from "./kernel-directory";
 
 type ReviewDecision = { action: "approve" | "reject"; note?: string };
-type Reviewer = (ctx: ExtensionContext, sessionId: string, code: string) => Promise<ReviewDecision>;
+type Reviewer = (ctx: ExtensionContext, kernelName: string, code: string) => Promise<ReviewDecision>;
 
-/** Review is a user decision, never execution or an exact-code permission token. */
-export function createCellReviewTool(manager: PythonSessionManager, review: Reviewer): PtcToolDefinition {
+/** Review a SAVED notebook cell (write_cell first): a user decision, never execution or an exact-code permission token. */
+export function createCellReviewTool(manager: PythonSessionManager, review: Reviewer, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "request_cell_review",
     label: "review cell",
     description:
-      "Ask the user to review a cell without executing it. Supply exactly one of code, file, or notebook position n. Review substantial workflows and destructive operations before execution; minor repairs within the approved scope do not need another review. Never prompt when the user explicitly requested autonomous execution without prompts.",
+      "Ask the user to review a saved notebook cell without executing it. Supply the kernel name and the 1-based position n of a saved code cell (persist it first with write_cell; detached code and file inputs are not accepted). Review substantial workflows and destructive operations before execution; minor repairs within the approved scope do not need another review. Never prompt when the user explicitly requested autonomous execution without prompts.",
     parameters: Type.Object({
-      session_id: Type.Optional(Type.String({ description: "Kernel id; n defaults to the most recently used kernel." })),
-      n: Type.Optional(Type.Integer({ minimum: 1, description: "1-based position of the notebook code cell to review." })),
-      code: Type.Optional(Type.String({ description: "Complete Python cell body to review, without running it." })),
-      file: Type.Optional(Type.String({ description: "Python file whose complete contents are shown for review." })),
+      kernel: Type.String({ description: "Kernel to review the saved cell in (name from provision_kernel)." }),
+      n: Type.Integer({ minimum: 1, description: "1-based position of the saved code cell to review." }),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const { session_id: requestedId, n, code, file } = params as {
-        session_id?: string; n?: number; code?: string; file?: string;
-      };
-      if ([n, code, file].filter((value) => value !== undefined).length !== 1) {
-        return { content: [{ type: "text", text: "request_cell_review requires exactly one of code, file, or n." }],
-          details: { approved: false }, isError: true };
+      const { kernel, n } = params as { kernel: string; n: number };
+      if (typeof params === "object" && params !== null && ("code" in params || "file" in params)) {
+        return { content: [{ type: "text", text: "Detached code and file reviews are not supported. Save a code cell with write_cell, then specify kernel and n." }],
+          details: { approved: false, rejected: true, kernel, n }, isError: true };
       }
-      let sessionId = requestedId;
-      let source = code ?? "";
+      if (!Number.isInteger(n) || n < 1) {
+        return { content: [{ type: "text", text: "request_cell_review requires the 1-based position n of a saved code cell." }],
+          details: { approved: false, rejected: true, kernel }, isError: true };
+      }
       try {
-        if (n !== undefined) {
-          sessionId ??= manager.list()[0]?.id;
-          if (!sessionId || !manager.get(sessionId)) {
-            throw new Error(sessionId ? `Unknown kernel ${sessionId}.` : "No live kernels. Provision one first.");
-          }
-          const preview = await manager.readCell(sessionId, n);
-          const cell = preview.cells[0];
-          if (!cell || cell.cellType !== "code") throw new Error("Only code cells can be reviewed.");
-          source = cell.source;
-        } else if (file !== undefined) {
-          source = await fs.readFile(path.resolve(ctx.cwd, file), "utf8");
+        let ref;
+        try {
+          ref = directory.resolveKernel(kernel);
+        } catch (resolutionError) {
+          throw new Error(resolutionError instanceof Error ? resolutionError.message : String(resolutionError));
         }
-        const decision = await review(ctx, sessionId ?? "unbound", source);
+        const preview = await manager.readCell(ref.id, n);
+        const cell = preview.cells[0];
+        if (!cell) throw new Error(`Cell ${n} does not exist in kernel "${ref.name}".`);
+        if (cell.cellType !== "code") throw new Error("Only code cells can be reviewed.");
+        const decision = await review(ctx, ref.name, cell.source);
         const approved = decision.action === "approve";
         return {
           content: [{ type: "text", text: approved
             ? "Cell approved for the intended operation. Nothing was executed. Execute separately; small fixes within this scope do not require another review."
             : `Cell rejected. Nothing was executed.${decision.note ? ` User feedback: ${decision.note}` : ""}` }],
-          details: { approved, rejected: !approved, note: decision.note, sessionId, n },
+          details: { approved, rejected: !approved, note: decision.note, kernel: ref.name, kernelName: ref.name, notebookPath: ref.notebookPath, n },
         };
       } catch (error) {
         return { content: [{ type: "text", text: `Cell review failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { approved: false, rejected: true, sessionId, n }, isError: true };
+          details: { approved: false, rejected: true, kernel, n }, isError: true };
       }
     },
   });
@@ -66,10 +61,11 @@ export function createCellReviewTool(manager: PythonSessionManager, review: Revi
 /** Keep review instructions model-facing; render only the user's decision on success. */
 export function createRenderedCellReviewTool(
   sessionManager: PythonSessionManager,
+  directory?: KernelDirectory,
   review: Reviewer = requestCellApproval
 ): PtcToolDefinition {
   return {
-    ...createCellReviewTool(sessionManager, review),
+    ...createCellReviewTool(sessionManager, review, directory ?? new KernelDirectory(sessionManager)),
     renderResult(
       result: AgentToolResult<unknown>,
       { isPartial }: ToolRenderResultOptions,
@@ -87,8 +83,14 @@ export function createRenderedCellReviewTool(
         // Expansion must not reveal the separate model-facing execution instructions.
         return new Text(theme.fg("success", "Approved"), 0, 0);
       }
-      const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
-      return new Text(text, 0, 0);
+      if (result.isError || context?.isError) {
+        const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+        return new Text(theme.fg("error", (text.split("\n", 1)[0] || "Review failed").slice(0, 160)), 0, 0);
+      }
+      const outcome = result.details as { rejected?: boolean; note?: string } | undefined;
+      return new Text(theme.fg("muted", outcome?.rejected
+        ? `Rejected${outcome.note ? ` · ${outcome.note}` : ""}`
+        : "Review incomplete"), 0, 0);
     },
   };
 }
@@ -106,7 +108,7 @@ const CELL_APPROVAL_OPTIONS = [
  */
 async function requestCellApproval(
   ctx: ExtensionContext,
-  sessionId: string,
+  kernelName: string,
   code: string
 ): Promise<ReviewDecision> {
   if (!ctx.hasUI) {
@@ -177,7 +179,7 @@ async function requestCellApproval(
         const visible = rows.slice(rowOffset, rowOffset + viewportRows);
 
         const lines: string[] = [];
-        lines.push(theme.fg("accent", "┌─ cell review ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
+        lines.push(theme.fg("accent", "┌─ cell review ─ kernel " + kernelName + " " + "─".repeat(Math.max(0, renderWidth - 22 - kernelName.length))));
         const rangeLabel = visible.length
           ? `lines ${visible[0].line + 1}–${visible[visible.length - 1].line + 1} of ${previewLines.length}`
           : "0 lines";

@@ -262,14 +262,17 @@ test("run_all: compact Run: box with per-cell status rows", () => {
   assert.ok(failRow.includes("\u0001error\u0002"), JSON.stringify(failRow));
 });
 
-test("reset_kernel: compact muted restatement of the restart", () => {
+test("reset_kernel: compact identity header plus muted restart status", () => {
   const lines = renderLines(
     "reset_kernel",
-    textResult("Restarted kernel s1: fresh namespace.", { id: "s1" }),
+    textResult("restarted", { id: "s1", kernelName: "analysis", notebookPath: "/tmp/analysis.ipynb" }),
   );
-  assert.equal(lines.length, 1);
-  assert.ok(lines[0].includes("\u0001muted\u0002"));
-  assert.ok(lines[0].includes("Restarted kernel s1"));
+  const text = lines.map((line) => line.replace(/\u0001\w+\u0002/g, "")).join("\n");
+  assert.match(text, /reset_kernel · kernel "analysis"/);
+  assert.match(text, /analysis\.ipynb/);
+  assert.match(text, /Kernel restarted: fresh namespace/);
+  // Internal ids never reach the user-facing frame.
+  assert.ok(!text.includes("s1"));
 });
 
 // ---------------------------------------------------------------------------

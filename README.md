@@ -4,6 +4,11 @@ A persistent Python notebook runtime for [Pi](https://github.com/earendil-works/
 
 Cells run on embedded IPython: imports, variables, and definitions survive across cells and conversation turns, with top-level `await`, Jupyter-style expression output, magics, and rich display output.
 
+**Terminology:** a **kernel** is the Python interpreter, a **notebook** is the
+`.ipynb` file a kernel records, and a **session** is the Pi conversation itself.
+Kernels are addressed by human-readable names you choose at provisioning; the
+session is never a kernel argument.
+
 > **No sandbox.** Kernels run with your user permissions and full file, network, and subprocess access. Only execute code you trust. An approval prompt is not a security boundary.
 
 ## Install
@@ -46,43 +51,62 @@ markdown explaining the findings, and cells that run top-to-bottom.
 Pi provisions a kernel once, explores with scratch cells, then writes and runs notebook cells individually. A typical tool sequence is:
 
 ```text
-provision_kernel({ notebook: "analysis.ipynb" })
-# Use the session_id returned by provision_kernel in subsequent calls.
+provision_kernel({ name: "analysis", notebook: "analysis.ipynb" })
+# Every other tool takes kernel: "analysis" to target this kernel by name.
 
-write_cell({ session_id, at: 1, type: "markdown", source: "# Event analysis" })
-write_cell({ session_id, at: 2, source: "from pathlib import Path\nimport json\nrows = json.loads(Path('data/events.json').read_text())\nlen(rows)" })
-run_cell({ session_id, n: 2 })
+write_cell({ kernel: "analysis", at: 1, type: "markdown", source: "# Event analysis" })
+write_cell({ kernel: "analysis", at: 2, source: "from pathlib import Path\nimport json\nrows = json.loads(Path('data/events.json').read_text())\nlen(rows)" })
+run_cell({ kernel: "analysis", n: 2 })
 ```
 
 Use ordinary Python libraries inside cells. For example, `pathlib` handles files, pandas handles tabular data, and matplotlib produces plots. Use Pi's normal tools separately for host-side work.
+
+### Naming and targeting kernels
+
+- `provision_kernel` requires a **nonempty, unique `name`** (trimmed; control and
+  terminal escape characters are rejected). Names must be unique among live
+  kernels, and provisioning fails on a duplicate.
+- Every other public tool requires **`kernel: "name"`** and resolves it by the
+  human-readable live-kernel name. There is no implicit most-recent kernel:
+  omitting `kernel`, or naming a kernel that is not live, is an error.
+- There is no global discovery tool; `list_kernels` has been removed. You know
+  the names you provisioned, and each result names its kernel.
+- Internal kernel UUIDs may exist for protocol bookkeeping, but they are never
+  shown in the terminal UI; tool calls and results are labeled with the kernel's
+  name and notebook instead.
 
 ### Choosing an operation
 
 | Tool | Purpose |
 |---|---|
-| `provision_kernel` | Start a persistent kernel bound to a notebook. Accepts an optional source workflow and Python version. |
-| `scratch_run` | Explore in the live namespace without recording a notebook cell. |
+| `provision_kernel` | Start a persistent kernel bound to a notebook. Requires a unique `name`; accepts an optional source workflow and Python version. |
+| `scratch_run` | Explore in the named kernel's live namespace without recording a notebook cell. |
 | `write_cell` | Add or replace a code or markdown cell without executing it. Replacing a cell clears its stored outputs. |
 | `run_cell` | Execute an existing code cell and refresh its outputs. The usual loop is **write one cell, run one cell**. |
-| `exec_cell` | Execute proven code and append it as a new cell; also accepts a Python file. |
-| `request_cell_review` | Preview code, a file, or a saved cell for user review without executing it. |
+| `exec_cell` | Execute proven code and append it as a new cell inside the named kernel; also accepts a Python file. |
+| `request_cell_review` | Preview a saved code cell of the named kernel for user review without executing it. Takes only `kernel` and the cell position `n`. |
 | `read_cells` / `read_cell` / `delete_cell` | Inspect and curate the notebook document. |
 | `reset_kernel` | Restart the interpreter with an empty namespace, leaving the notebook intact. |
 | `run_to` / `run_all` | Execute through a chosen position or the whole notebook, stopping at the first error. |
-| `list_kernels` / `inspect_kernel` | Discover live kernels and inspect their namespaces. |
+| `inspect_kernel` | Inspect a named kernel's namespace. |
 | `read_cell_output` | Page through a cell's full persisted output. |
-| `provision_dependency` | Install a Python distribution into a kernel's environment. |
+| `provision_dependency` | Install a Python distribution into a named kernel's environment. There is no global-environment fallback. |
 
 **Notebook positions and execution counts are different.** Editing a cell does not update the live namespace or rerun dependent cells. Before handing over a notebook, reset the kernel and run all cells to check it from a clean state.
 
-Every recorded execution updates the standard `.ipynb` on disk, including outputs and errors. Open it in Jupyter or an editor at any time. Omit `notebook` for throwaway work: the destination is reported under `/tmp/pi-pycells/notebooks/`. Use an explicit project path for an artifact worth keeping.
+Every recorded execution updates the standard `.ipynb` on disk, including outputs and errors. Open it in Jupyter or an editor at any time. Omit `notebook` for throwaway work: the destination is reported alongside the kernel's name. Use an explicit project path for an artifact worth keeping.
 
 ### Output and rendering
 
+- Every tool call and result is labeled compactly with the **kernel's name and
+  its notebook**, so multi-kernel conversations stay readable at a glance.
+- Model-only instructional prose and opaque internal identifiers are not
+  rendered; the terminal shows kernel/notebook identity, cell positions, and
+  results.
 - Syntax-highlighted **In** boxes and numbered **Out** boxes render cells in the terminal.
 - Live output streams below the executing cell; long output shows a preview while the full result stays in the notebook.
 - Rich display output, including images, is captured in the notebook.
-- `request_cell_review` asks the user to review an operation; execution is a separate call. **Esc** interrupts a running cell without disposing the kernel.
+- `request_cell_review` asks the user to review a **saved cell** of the named kernel; execution is a separate call. Reviewed workflows use `write_cell` → review the saved cell → `run_cell`. **Esc** interrupts a running cell without disposing the kernel.
 
 More: [kernels and document operations](docs/kernels.md).
 
@@ -90,9 +114,9 @@ More: [kernels and document operations](docs/kernels.md).
 
 > **Experimental:** the library and promotion interface may change.
 
-Promote a finished notebook with `promote_to_skill_notebook({ name: "event-analysis" })`. Promotion copies code, markdown, outputs, and metadata into the library; it does not modify the source notebook. Existing entries are only replaced with explicit overwrite permission.
+Promote a finished notebook with `promote_to_skill_notebook({ kernel: "analysis", name: "event-analysis" })`. Promotion promotes the named kernel's **bound notebook** — it does not accept an unrelated external notebook path. It copies code, markdown, outputs, and metadata into the library; it does not modify the source notebook. Existing entries are only replaced with explicit overwrite permission.
 
-Start future work with `provision_kernel({ source: "event-analysis", notebook: "next-analysis.ipynb" })`. The source is copied and its code cells run before new work begins. Notebooks retain their recorded Python version, with an explicit `version` override available when provisioning.
+Start future work with `provision_kernel({ name: "next-analysis", source: "event-analysis", notebook: "next-analysis.ipynb" })`. The source is copied and its code cells run before new work begins. Notebooks retain their recorded Python version, with an explicit `version` override available when provisioning.
 
 The default library is `~/.pi/agent/pycells-library/`. Pi honors `PI_CODING_AGENT_DIR`, so the agent-directory path follows your configuration.
 

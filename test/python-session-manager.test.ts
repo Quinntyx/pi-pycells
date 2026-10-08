@@ -3,8 +3,15 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { PythonSessionManager, UnknownSessionError } = require("../dist/python-session-manager.js");
+const { PythonSessionManager, PythonSessionError, UnknownSessionError, UnknownKernelError } = require("../dist/python-session-manager.js");
 const { loadSettingsFromEnv, parseSectionedOutput } = require("../dist/utils.js");
+
+// Fresh, unique kernel name per provision call (names must be unique among
+// live kernels, so tests that provision several kernels each need their own).
+let kernelNameCounter = 0;
+function nextKernelName() {
+  return `kernel-${++kernelNameCounter}`;
+}
 
 function parseSection(text: string, name: string): string {
   const sections = parseSectionedOutput(text);
@@ -65,7 +72,7 @@ function makeManager(hooks = {}, settingsOverrides = {}) {
 test("persistent session: definition persists across chunks and returns work", { skip: !RUN_REAL }, async () => {
   const manager = makeManager();
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
     const first = await manager.execForeground(id, "def double(x):\n    return x * 2\nreturn 'defined'", {});
     assert.match(first.output, /^return \(Out\[1\]\):/);
@@ -80,7 +87,7 @@ test("persistent session: definition persists across chunks and returns work", {
 test("persistent session: top-level await chunk works and later chunks see its locals", { skip: !RUN_REAL }, async () => {
   const manager = makeManager();
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
     const awaited = await manager.execForeground(
       id,
@@ -99,7 +106,7 @@ test("persistent session: top-level await chunk works and later chunks see its l
 test("persistent session: exec errors do not kill the session", { skip: !RUN_REAL }, async () => {
   const manager = makeManager();
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
     await assert.rejects(
       manager.execForeground(id, "x = undefined_name\nreturn 1", {}),
@@ -131,7 +138,7 @@ test("persistent session: subagent_state frames flow to the runtime hooks", { sk
     onSubagentSnapshot: (sessionId, _execId, snapshot) => snapshots.push({ sessionId, snapshot }),
   });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     await manager.execForeground(
       id,
       "import builtins\nemit = getattr(builtins, 'PTC_STATE_EMIT', None)\nassert emit is not None, 'bridge missing'\nemit({'agents': [{'id': 'a1', 'name': 'probe', 'status': 'running'}], 'totals': {'running': 1}})\nreturn 'emitted'",
@@ -149,7 +156,7 @@ test("persistent session: subagent_state frames flow to the runtime hooks", { sk
 test("persistent session: the final result carries the last subagent snapshot", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
-		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 		const result = await manager.execForeground(
 			id,
 			"import builtins\nemit = getattr(builtins, 'PTC_STATE_EMIT', None)\nassert emit is not None, 'bridge missing'\nemit({'agents': [{'id': 'a1', 'name': 'probe', 'status': 'settled'}], 'totals': {'settled': 1}})\nreturn 'done'",
@@ -167,7 +174,7 @@ test("persistent session: script export writes a durable, runnable file", { skip
   const manager = makeManager();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-script-"));
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     await manager.execForeground(id, "base_value = 21\nreturn 'ok'", {});
     await manager.execForeground(id, "doubled = base_value * 2\nreturn doubled", {});
 
@@ -197,7 +204,7 @@ test("persistent session: script export wraps async sessions", { skip: !RUN_REAL
   const manager = makeManager();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-script-"));
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     await manager.execForeground(id, "await asyncio.sleep(0)\nmark = 'async-ok'\nreturn mark", {});
 
     const result = await manager.toScript(id, { cwd: tempDir });
@@ -214,7 +221,7 @@ test("persistent session: script export wraps async sessions", { skip: !RUN_REAL
 
 test("persistent session: disposal reaps the interpreter", { skip: !RUN_REAL }, async () => {
   const manager = makeManager();
-  const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
   const summaries = manager.list();
   assert.equal(summaries.length, 1);
   assert.equal(summaries[0].id, id);
@@ -227,7 +234,7 @@ test("persistent session: execForeground forwards partial updates to the caller'
   const manager = makeManager();
   const updates: Array<{ userCode?: string[]; subagentSnapshot?: unknown }> = [];
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
     // Several executed lines guarantee progress frames; the bridge call
     // guarantees a subagent_state frame — both must reach onUpdate.
@@ -261,7 +268,7 @@ test("persistent session: subagent activity re-arms the idle timeout", { skip: !
   const manager = makeManager({}, { executionTimeoutMs: 1_200 });
   const updates = [];
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     const result = await manager.execForeground(
       id,
       [
@@ -289,7 +296,7 @@ test("persistent session: subagent activity re-arms the idle timeout", { skip: !
 test("persistent session: idle timeout interrupts the chunk and keeps the session", { skip: !RUN_REAL }, async () => {
   const manager = makeManager({}, { executionTimeoutMs: 1_200 });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     // Bind state before hanging, to prove the namespace survives the interrupt.
     await manager.execForeground(id, "kept = 'survived'\nreturn kept", { cwd: process.cwd() });
 
@@ -315,7 +322,7 @@ test("persistent session: parallel exec_cell calls are serialized and both retur
   // racing them used to orphan one promise (the transcript wedged forever).
   const manager = makeManager({}, { executionTimeoutMs: 20_000 });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
     const first = manager.execForeground(id, "import time\ntime.sleep(0.4)\nreturn 'first'", { cwd: process.cwd() });
     const queuedNotices: string[] = [];
@@ -346,7 +353,7 @@ test("persistent session: parallel exec_cell calls are serialized and both retur
 test("persistent session: aborting interrupts the chunk but keeps the session usable", { skip: !RUN_REAL }, async () => {
   const manager = makeManager({}, { executionTimeoutMs: 60_000 });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     await manager.execForeground(id, "before = 41\nreturn before", { cwd: process.cwd() });
 
     const controller = new AbortController();
@@ -377,7 +384,7 @@ test("persistent session: an aborted subagent wait leaves handles usable", { ski
   // namespace for a later chunk to await.
   const manager = makeManager({}, { executionTimeoutMs: 30_000 });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     const controller = new AbortController();
     const pending = manager.execForeground(
       id,
@@ -400,7 +407,7 @@ test("persistent session: an unserializable result is an error, not a session de
   // interpreter with "session terminated during execution".
   const manager = makeManager({}, { executionTimeoutMs: 20_000 });
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     await manager.execForeground(id, "kept = 'still-here'\nreturn kept", { cwd: process.cwd() });
 
     const result = await manager.execForeground(id, "import time\nreturn {'mod': time, 'nested': {'m': time}}", {
@@ -423,7 +430,7 @@ test("persistent session: the line arrow catches up when a chunk blocks", { skip
   const manager = makeManager({}, { executionTimeoutMs: 30_000 });
   const lines: Array<number | undefined> = [];
   try {
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     const chunk = [
       "import asyncio",
       "a = 1",
@@ -526,6 +533,8 @@ function makeFakeManager({
         cells: frame.cells.length,
         wrapped_async: false,
       }));
+    } else if (frame.type === "doc") {
+      setImmediate(() => proc.emitFrame({ type: "doc_done", id: frame.id, op: frame.op, total: 1, cells: [] }));
     }
   };
   const spawnProcess = (code, cwd, env) => {
@@ -582,7 +591,7 @@ async function nextTurn() {
 // Unit-level protocol/manager regressions run without opting into a real subprocess.
 test("session manager: a crashed interpreter is evicted and no longer consumes capacity", async () => {
   const { manager, processes } = makeFakeManager();
-  const first = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  const first = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
   assert.equal(manager.list().length, 1);
 
   processes[0].crash(7);
@@ -590,7 +599,7 @@ test("session manager: a crashed interpreter is evicted and no longer consumes c
   assert.equal(manager.get(first.id), false);
   assert.equal(manager.list().length, 0);
 
-  const second = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  const second = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
   assert.notEqual(second.id, first.id);
   await manager.disposeAll();
 });
@@ -598,8 +607,8 @@ test("session manager: a crashed interpreter is evicted and no longer consumes c
 test("session manager: configured session limit is parsed but no longer enforced", async () => {
   const { manager } = makeFakeManager({ settingsOverrides: { maxPythonSessions: 1 } });
   try {
-    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
-    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     assert.equal(manager.list().length, 2);
   } finally {
     await manager.disposeAll();
@@ -650,7 +659,7 @@ test("session manager: document ops and scoped runs frame the interpreter correc
   };
   const { manager, processes } = makeFakeManager({ onFrame });
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 
     // scratch_run executes without appending a cell.
     await manager.scratchRun(id, "y = 2", { cwd: tempDir });
@@ -721,7 +730,7 @@ test("readCellOutput reads durable notebook cells by execution number with offse
   }));
   const { manager } = makeFakeManager();
   try {
-    await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+    await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
     const slice = await manager.readCellOutput(2, { offset: 2, limit: 2 });
     assert.equal(slice.cellIdx, 2);
     assert.equal(slice.notebookPath, notebookPath);
@@ -757,6 +766,7 @@ test("session manager: bare source names resolve from the configured library dir
   const { manager } = makeFakeManager();
   try {
     const result = await manager.provision({
+      name: nextKernelName(),
       cwd: tempDir,
       ctx: fakeCtx(),
       notebookPath,
@@ -795,7 +805,7 @@ test("promoteToSkillNotebook copies the complete notebook, sanitizes names, and 
   fs.writeFileSync(notebookPath, JSON.stringify(notebook, null, 2));
   const { manager } = makeFakeManager({ settingsOverrides: { libraryDir } });
   try {
-    await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+    await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
     const promoted = await manager.promoteToSkillNotebook({ name: "../My Fancy_SKILL.ipynb", cwd: tempDir });
     assert.equal(promoted.name, "my-fancy-skill");
     assert.equal(promoted.path, path.join(libraryDir, "my-fancy-skill.ipynb"));
@@ -821,7 +831,7 @@ test("promoteToSkillNotebook copies the complete notebook, sanitizes names, and 
 test("session manager: startup failure terminates an interpreter that never became ready", async () => {
   const { manager, terminations } = makeFakeManager({ startup: "exit" });
   await assert.rejects(
-    manager.provision({ cwd: process.cwd(), ctx: fakeCtx() }),
+    manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() }),
     /exited|failed/i
   );
   assert.ok(terminations.includes("SIGTERM"));
@@ -840,7 +850,7 @@ test("session protocol: a failed exec send does not wedge the next foreground ex
       setImmediate(() => proc.emitFrame({ type: "exec_done", id: frame.id, output: "recovered", total_output_chars: 9 }));
     },
   });
-  const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
   await assert.rejects(manager.execForeground(id, "return 1", {}), /synthetic stdin failure/);
   assert.equal(manager.list()[0].running, false);
 
@@ -853,7 +863,7 @@ test("session protocol: a failed exec send does not wedge the next foreground ex
 test("session protocol: process exit rejects pending inspect and export calls", async () => {
   {
     const { manager, processes } = makeFakeManager({ onFrame() {} });
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     const inspecting = manager.inspectKernel(id, { timeoutMs: 10_000 });
     processes[0].crash(2);
     await assert.rejects(inspecting, /exited before finishing|failed/i);
@@ -870,7 +880,7 @@ test("session protocol: process exit rejects pending inspect and export calls", 
         }
       },
     });
-    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     await manager.execForeground(id, "value = 1", {});
     const exporting = manager.toScript(id, { cwd: process.cwd(), name: "held-export" });
     await nextTurn();
@@ -893,7 +903,7 @@ test("session manager: spawn env passes subagent agent-dir selection through unt
     },
   });
   try {
-    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
     assert.equal(spawnedEnv.PI_CODING_SUBAGENT_DIR, "/tmp/subagent-dir");
   } finally {
     await manager.disposeAll();
@@ -922,7 +932,7 @@ test("session manager: script dedup stays cwd-relative and preserves extensions"
   fs.writeFileSync(path.join(exportDir, "script-2.py"), "existing");
   const { manager } = makeFakeManager();
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     await manager.execForeground(id, "value = 1", {});
 
     const textResult = await manager.toScript(id, { cwd: tempDir, path: "exports/report.txt" });
@@ -955,6 +965,7 @@ test("kernel: sourced notebook is copied, executes in order, preserves markdown,
   const manager = makeManager();
   try {
     const provisioned = await manager.provision({
+      name: nextKernelName(),
       cwd: tempDir,
       ctx: fakeCtx(),
       notebookPath,
@@ -993,6 +1004,7 @@ test("kernel: .py source is one recorded virtual prefix cell", { skip: !RUN_REAL
   const manager = makeManager();
   try {
     const provisioned = await manager.provision({
+      name: nextKernelName(),
       cwd: tempDir,
       ctx: fakeCtx(),
       notebookPath,
@@ -1032,7 +1044,7 @@ test("kernel: sourcing errors mark the failed prefix cell and leave the kernel u
   }));
   const manager = makeManager();
   try {
-    const provisioned = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath, source: sourcePath });
+    const provisioned = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath, source: sourcePath });
     assert.equal(provisioned.sourceError.cellIdx, 2);
     assert.match(provisioned.sourceError.message, /source boom/);
     const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
@@ -1051,7 +1063,7 @@ test("kernel: sourcing errors mark the failed prefix cell and leave the kernel u
 test("kernel: trailing expression echoes, digest footer, magics run, notebook", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
-		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
 		// Auto-echo: trailing expression is displayed without print/return.
 		const echoed = await manager.execForeground(id, "21 * 2", {});
@@ -1090,7 +1102,7 @@ test("kernel: Jupyter parity (shared namespace, Out/_, magics, display)", { skip
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-jupyter-"));
 	const notebookPath = path.join(tempDir, "rich.ipynb");
 	try {
-		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 
 		// One persistent namespace, and `_` carries the previous Out[] value.
 		await manager.execForeground(id, "seed = 21", {});
@@ -1129,7 +1141,7 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-"));
 	const notebookPath = path.join(tempDir, "scratch.ipynb");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
 		await manager.execForeground(id, "a = 1\nprint('hello from cell')\na + 1", { notebookPath });
 		await assert.rejects(
 			manager.execForeground(id, "raise ValueError('boom')", { notebookPath }),
@@ -1172,7 +1184,7 @@ test("kernel: output above the retired 100k cap remains complete in host result 
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-full-output-"));
 	const notebookPath = path.join(tempDir, "full.ipynb");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		const result = await manager.execForeground(id, "print('x' * 150000, end='')", { notebookPath });
 		assert.ok(result.output.length > 150_000, "host result must retain output beyond the old 100k cap");
 		const sections = parseSectionedOutput(result.output);
@@ -1206,7 +1218,7 @@ test("kernel: rebinding an existing notebook preserves cells and continues numbe
 		nbformat_minor: 5,
 	}));
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		const result = await manager.execForeground(id, "'new output'", { notebookPath });
 		assert.equal(result.details.cellIdx, 5);
 		// Jupyter parity: a string literal's Out[] uses IPython's repr (quotes).
@@ -1230,7 +1242,7 @@ test("kernel: file mode executes a file inside the kernel with real-path traceba
 	const cellFile = path.join(tempDir, "cell.py");
 	fs.writeFileSync(cellFile, "value = 'from-file'\n1 / 0\n");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
 		await assert.rejects(
 			manager.execForeground(id, "ignored", { file: cellFile }),
 			(error: unknown) => {
@@ -1249,7 +1261,7 @@ test("kernel: file mode executes a file inside the kernel with real-path traceba
 test("kernel: inspect returns the user-created namespace", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
-		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: process.cwd(), ctx: fakeCtx() });
 		await manager.execForeground(id, "import json as j\ndef thing():\n    return 1", {});
 		const inspected = await manager.inspectKernel(id);
 		assert.ok(inspected.defs.includes("thing"));
@@ -1278,7 +1290,7 @@ test("kernel: scratch_run mutates the namespace but records no cell", { skip: !R
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-scratch-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		const result = await manager.scratchRun(id, "seed = 41\nreturn seed + 1", { cwd: tempDir });
 		assert.match(result.output, /^return \(Out\[1\]\):\n  42/);
 		// The artifact is not even created: scratch runs record nothing at all.
@@ -1299,7 +1311,7 @@ test("kernel: write_cell creates markdown/code cells; read and delete round-trip
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-writecell-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		assert.equal((await manager.writeCell(id, { at: 1, source: "# Title", cellType: "markdown" })).total, 1);
 		assert.equal((await manager.writeCell(id, { at: 2, source: "value = 7", cellType: "code" })).total, 2);
 
@@ -1334,7 +1346,7 @@ test("kernel: run_cell executes the on-disk cell and replaces its stored output"
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-runcell-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		await manager.writeCell(id, { at: 1, source: "counter = 1\ncounter", cellType: "code" });
 		const first = await manager.runCell(id, 1, { cwd: tempDir });
 		assert.match(first.output, /Out\[1\]/);
@@ -1359,7 +1371,7 @@ test("kernel: run_all executes cells in order and stops at the first error", { s
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-runall-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		await manager.writeCell(id, { at: 1, source: "a = 1", cellType: "code" });
 		await manager.writeCell(id, { at: 2, source: "b = a + 1", cellType: "code" });
 		await manager.writeCell(id, { at: 3, source: "raise ValueError('boom')", cellType: "code" });
@@ -1390,7 +1402,7 @@ test("kernel: external notebook edits survive a scoped run", { skip: !RUN_REAL }
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-external-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		await manager.writeCell(id, { at: 1, source: "a = 1", cellType: "code" });
 
 		// Simulate a Jupyter/editor write: append a markdown cell behind the kernel's back.
@@ -1413,7 +1425,7 @@ test("kernel: reset_kernel clears the namespace, restarts numbering, keeps the n
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-reset-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		await manager.writeCell(id, { at: 1, source: "x = 123", cellType: "code" });
 		await manager.runCell(id, 1, { cwd: tempDir });
 		await manager.execForeground(id, "return x", {});
@@ -1441,7 +1453,7 @@ test("kernel: produced notebook validates against nbformat", { skip: !RUN_REAL |
 	const { execFileSync } = require("node:child_process");
 	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-nbformat-");
 	try {
-		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		await manager.writeCell(id, { at: 1, source: "# Heading", cellType: "markdown" });
 		await manager.writeCell(id, { at: 2, source: "import math\nmath.pi", cellType: "code" });
 		await manager.runCell(id, 2, { cwd: tempDir });
@@ -1476,7 +1488,7 @@ test("session manager: stdout frames stream the emulated screen to onUpdate", as
   };
   const { manager } = makeFakeManager({ onFrame });
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     const updates: Array<{ details?: { liveOutput?: string[]; liveOutputHidden?: number } }> = [];
     const result = await manager.execForeground(id, "for _ in range(3): pass", {
       cwd: tempDir,
@@ -1522,7 +1534,7 @@ test("session manager: live screen resets between cells", async () => {
   };
   const { manager } = makeFakeManager({ onFrame });
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     const secondCellUpdates: Array<{ details?: { liveOutput?: string[] } }> = [];
     await manager.execForeground(id, "first", { cwd: tempDir, onUpdate: () => {} });
     const result2 = await manager.execForeground(id, "second", {
@@ -1561,7 +1573,7 @@ test("session manager: snapshot survives ordinary frames and resets for the next
   };
   const { manager } = makeFakeManager({ onFrame });
   try {
-    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx() });
     const updates: any[] = [];
     const first = await manager.execForeground(id, "first", {
       cwd: tempDir, onUpdate: (update: any) => updates.push(update),
@@ -1579,5 +1591,258 @@ test("session manager: snapshot survives ordinary frames and resets for the next
   } finally {
     await manager.disposeAll();
     require("node:child_process").execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Kernel-name contract: provision({ name, ... }), resolveKernel(name),
+// uniqueness/sanitization, named result state and persistence.
+// These run against the fake interpreter harness (no real Python needed).
+// ---------------------------------------------------------------------------
+
+test("kernel names: provision requires a nonempty kernel name", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    await assert.rejects(
+      manager.provision({ cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /requires a kernel name/i.test(error.message)
+    );
+    await assert.rejects(
+      manager.provision({ name: "", cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /nonempty/i.test(error.message)
+    );
+    await assert.rejects(
+      manager.provision({ name: "   ", cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /nonempty/i.test(error.message)
+    );
+    await assert.rejects(
+      manager.provision({ name: 42, cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /must be a string/i.test(error.message)
+    );
+    assert.equal(manager.list().length, 0);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel names: control and terminal escape characters are rejected", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    for (const bad of ["\u001b[31mred", "a\u0000b", "tab\tname", "nl\nname", "del\u007f", "c1\u009f"]) {
+      await assert.rejects(
+        manager.provision({ name: bad, cwd: process.cwd(), ctx: fakeCtx() }),
+        (error) =>
+          error instanceof PythonSessionError && /control or terminal escape/i.test(error.message),
+        `expected rejection for ${JSON.stringify(bad)}`
+      );
+    }
+    assert.equal(manager.list().length, 0);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel names: names are trimmed, returned, and carry the bound notebook", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({
+      name: "  Research  ",
+      cwd: process.cwd(),
+      ctx: fakeCtx(),
+    });
+    assert.equal(provisioned.name, "Research");
+    assert.equal(typeof provisioned.id, "string");
+    assert.ok(provisioned.id.length > 0, "internal id is preserved");
+    assert.equal(provisioned.notebookPath, undefined);
+    assert.equal(manager.list()[0].name, "Research");
+
+    const withNotebook = await manager.provision({
+      name: "notes",
+      cwd: process.cwd(),
+      ctx: fakeCtx(),
+      notebookPath: "working.ipynb",
+    });
+    assert.ok(withNotebook.notebookPath?.endsWith("working.ipynb"));
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel names: duplicates are rejected while the kernel is live and freed on dispose", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const first = await manager.provision({ name: "dup", cwd: process.cwd(), ctx: fakeCtx() });
+    assert.equal(first.name, "dup");
+
+    await assert.rejects(
+      manager.provision({ name: "dup", cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /already in use/.test(error.message)
+    );
+    // Trimming does not bypass the uniqueness check.
+    await assert.rejects(
+      manager.provision({ name: "  dup  ", cwd: process.cwd(), ctx: fakeCtx() }),
+      (error) => error instanceof PythonSessionError && /already in use/.test(error.message)
+    );
+    assert.equal(manager.list().length, 1);
+
+    await manager.dispose(first.id);
+    const reused = await manager.provision({ name: "dup", cwd: process.cwd(), ctx: fakeCtx() });
+    assert.equal(reused.name, "dup");
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("resolveKernel: returns the live kernel's name, id, and notebook, or throws", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({
+      name: "analysis",
+      cwd: process.cwd(),
+      ctx: fakeCtx(),
+      notebookPath: "work.ipynb",
+    });
+    provisioned.id; // internal id stays available for protocol bookkeeping
+
+    const handle = manager.resolveKernel("analysis");
+    assert.equal(handle.name, "analysis");
+    assert.equal(handle.id, provisioned.id);
+    assert.ok(handle.notebookPath?.endsWith("work.ipynb"));
+    assert.equal(typeof handle.createdAt, "number");
+    assert.equal(typeof handle.running, "boolean");
+
+    // Lookup trims, same as provision.
+    assert.equal(manager.resolveKernel("  analysis ").id, provisioned.id);
+
+    assert.throws(
+      () => manager.resolveKernel("nope"),
+      (error) =>
+        error instanceof UnknownKernelError &&
+        error.requestedName === "nope" &&
+        error.message.includes("Unknown kernel: nope") &&
+        error.message.includes("analysis")
+    );
+    assert.throws(
+      () => manager.resolveKernel(""),
+      (error) => error instanceof PythonSessionError && /nonempty/i.test(error.message)
+    );
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("resolveKernel: names of dead kernels no longer resolve", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({ name: "gone", cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.dispose(provisioned.id);
+    assert.throws(
+      () => manager.resolveKernel("gone"),
+      (error) =>
+        error instanceof UnknownKernelError && error.message.includes("Live kernels: (none)")
+    );
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel names: the name persists across reset_kernel", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({ name: "stable", cwd: process.cwd(), ctx: fakeCtx() });
+    const summary = await manager.resetKernel(provisioned.id, { cwd: process.cwd(), ctx: fakeCtx() });
+    assert.equal(summary.name, "stable");
+    assert.equal(manager.resolveKernel("stable").id, provisioned.id);
+    assert.equal(manager.list().length, 1);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel names: name uniqueness is enforced even for parallel provisions", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const results = await Promise.allSettled([
+      manager.provision({ name: "race", cwd: process.cwd(), ctx: fakeCtx() }),
+      manager.provision({ name: "race", cwd: process.cwd(), ctx: fakeCtx() }),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(fulfilled.length, 1, "exactly one provision may claim a name");
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason.message, /already in use/);
+    assert.equal(manager.list().length, 1);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("kernel operations require a live kernel: unknown ids throw UnknownSessionError", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({ name: "known", cwd: process.cwd(), ctx: fakeCtx() });
+    const live = provisioned.id;
+    const operations = [
+      () => manager.execForeground("ghost", "return 1", {}),
+      () => manager.scratchRun("ghost", "return 1", {}),
+      () => manager.writeCell("ghost", { at: 1, source: "1", cellType: "code" }),
+      () => manager.deleteCell("ghost", 1),
+      () => manager.readCells("ghost", {}),
+      () => manager.readCell("ghost", 1),
+      () => manager.runCell("ghost", 1, {}),
+      () => manager.runTo("ghost", 1, {}),
+      () => manager.runAll("ghost", {}),
+      () => manager.inspectKernel("ghost"),
+      () => manager.toScript("ghost", { cwd: process.cwd() }),
+      () => manager.resetKernel("ghost", { cwd: process.cwd(), ctx: fakeCtx() }),
+    ];
+    for (const operation of operations) {
+      await assert.rejects(operation, (error) => {
+        assert.ok(error instanceof UnknownSessionError, `expected UnknownSessionError, got ${error}`);
+        assert.ok(error.message.includes("ghost"), "error names the requested kernel id");
+        assert.ok(error.message.includes(live), "error lists the live kernel id");
+        return true;
+      });
+    }
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("named kernels: resolve-by-name drives real manager operations", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    await manager.provision({
+      name: "driver",
+      cwd: process.cwd(),
+      ctx: fakeCtx(),
+      notebookPath: "driver.ipynb",
+    });
+    const handle = manager.resolveKernel("driver");
+    const result = await manager.execForeground(handle.id, "value = 1\nreturn value", {});
+    assert.ok(result.output.length > 0);
+
+    const written = await manager.writeCell(handle.id, { at: 1, source: "2 + 3", cellType: "code" });
+    assert.ok(written);
+    const read = await manager.readCell(handle.id, 1);
+    assert.ok(read);
+
+    // Every op accepts only the explicit kernel: the id from resolveKernel.
+    assert.equal(manager.resolveKernel("driver").chunks >= 0, true);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("named kernels: provision result and listing never leak ids as the identity", async () => {
+  const { manager } = makeFakeManager();
+  try {
+    const provisioned = await manager.provision({ name: "presentation", cwd: process.cwd(), ctx: fakeCtx() });
+    assert.notEqual(provisioned.name, provisioned.id, "the public name is the human-readable one");
+    const listed = manager.list()[0];
+    assert.equal(listed.name, "presentation");
+    assert.equal(listed.id, provisioned.id); // internal id retained, but not the identity
+  } finally {
+    await manager.disposeAll();
   }
 });
