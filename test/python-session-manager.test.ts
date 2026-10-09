@@ -61,12 +61,8 @@ function makeManager(hooks = {}, settingsOverrides = {}) {
     },
     async cleanup() {},
   };
-  const toolRegistry = {
-    createCallableToolRuntime() {
-      return { tools: [], runTool: async () => ({ content: [] }) };
-    },
-  };
-  return new PythonSessionManager(sandboxManager, toolRegistry, settings, path.resolve(__dirname, ".."), hooks);
+
+  return new PythonSessionManager(sandboxManager, settings, path.resolve(__dirname, ".."), hooks);
 }
 
 test("persistent session: definition persists across chunks and returns work", { skip: !RUN_REAL }, async () => {
@@ -564,11 +560,7 @@ function makeFakeManager({
     },
     async cleanup() {},
   };
-  const toolRegistry = {
-    createCallableToolRuntime() {
-      return { tools: [], runTool: async () => ({ content: [] }) };
-    },
-  };
+
   const settings = {
     ...loadSettingsFromEnv(),
     executionTimeoutMs: 5_000,
@@ -577,7 +569,6 @@ function makeFakeManager({
   };
   const manager = new PythonSessionManager(
     sandboxManager,
-    toolRegistry,
     settings,
     path.resolve(__dirname, "..")
   );

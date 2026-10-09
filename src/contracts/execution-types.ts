@@ -28,12 +28,6 @@ export interface KernelDigest {
   changed?: Array<[string, string]>;
 }
 
-export interface RpcErrorPayload {
-  type: string;
-  message: string;
-  stack?: string;
-}
-
 export interface PtcImageArtifact {
   mimeType: string;
   data: string;
@@ -42,8 +36,6 @@ export interface PtcImageArtifact {
 }
 
 export type RpcMessage =
-  | { type: "tool_call"; id: string; tool: string; params: Record<string, unknown> }
-  | { type: "tool_result"; id: string; value?: unknown; error?: RpcErrorPayload }
   | { type: "execution_progress"; line: number; total_lines: number }
   | { type: "stdout"; text: string }
   | { type: "complete"; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
@@ -218,23 +210,8 @@ export interface PythonSessionManagerHooks {
   onInterrupted?: (sessionId: string, text: string) => void;
 }
 
-/** One bridged Pi tool call made from inside a cell (tool subtree rendering). */
-export interface NestedToolCallRecord {
-  name: string;
-  /** Short identifying summary of the primary parameter (path, pattern, command). */
-  target?: string;
-  ok: boolean;
-  ms: number;
-}
-
 interface ExecutionMetrics {
-  nestedToolCalls: number;
-  nestedToolNames: string[];
-  nestedResultChars: number;
-  nestedResultCount: number;
-  nestedErrors: number;
   durationMs: number;
-  estimatedAvoidedTokens: number;
 }
 
 export interface ExecutionOptions {
@@ -250,7 +227,6 @@ export interface ExecutionDetails extends ExecutionMetrics {
   currentLine?: number;
   totalLines?: number;
   userCode?: string[];
-  activeTool?: string;
   imagesCount?: number;
   telemetry?: PtcExecutionTelemetry;
   recovery?: PtcRecoveryDetails;
@@ -272,7 +248,6 @@ export interface ExecutionDetails extends ExecutionMetrics {
   /** Head lines hidden from `liveOutput` by the tail cap. */
   liveOutputHidden?: number;
   /** Bridged Pi tool calls made from inside this cell (tool subtree rendering). */
-  nestedCallRecords?: NestedToolCallRecord[];
 }
 
 export interface CodeExecutionResult {

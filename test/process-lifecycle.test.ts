@@ -19,18 +19,8 @@ function settings(overrides = {}) {
     executionTimeoutMs: 10_000,
     outputPreviewChars: 12_000,
     maxSpoolChars: 10_000_000,
-    maxParallelToolCalls: 4,
     maxPythonSessions: 4,
-    autoRoute: false,
     ...overrides,
-  };
-}
-
-function toolRegistry() {
-  return {
-    createCallableToolRuntime() {
-      return { tools: [], runTool: async () => ({ content: [] }) };
-    },
   };
 }
 
@@ -58,7 +48,6 @@ async function makeManager(overrides = {}) {
   };
   const manager = new PythonSessionManager(
     sandbox,
-    toolRegistry(),
     config,
     path.resolve(__dirname, ".."),
   );
@@ -137,4 +126,34 @@ test("Python's emergency spool valve caps output once before it reaches the host
   } finally {
     await dispose(manager, sandbox);
   }
+});
+
+
+test("fresh kernels expose ordinary Python and subagents but no host-tool bridge", async () => {
+  const { manager, sandbox } = await makeManager();
+  try {
+    const { id } = await manager.provision({ name: "bridge-free", cwd: process.cwd(), ctx: fakeCtx() });
+    const result = await manager.execForeground(id, [
+      "assert not any(n in globals() for n in ('ptc', 'read', 'bash', 'edit', 'write', 'find', 'glob', 'grep', 'ls'))",
+      "assert not hasattr(_rpc, 'call')",
+      "import asyncio, pathlib, subprocess",
+      "assert await asyncio.sleep(0, result=7) == 7",
+      "assert pathlib.Path('.').is_dir()",
+      "assert subprocess.check_output(['true']) == b''",
+      "assert np.arange(3).tolist() == [0, 1, 2]",
+      "import pi_subagents",
+      "assert callable(pi_subagents.AgentPool)",
+      "print('bridge-free kernel works')",
+    ].join("\n"), { ctx: fakeCtx() });
+    assert.match(result.output, /bridge-free kernel works/);
+    assert.doesNotMatch(result.output, /^tools:/m);
+  } finally { await dispose(manager, sandbox); }
+});
+
+test("retired host-tool frames fail fast without dispatching any host operation", async () => {
+  const { manager, sandbox } = await makeManager();
+  try {
+    const { id } = await manager.provision({ name: "reject-bridge", cwd: process.cwd(), ctx: fakeCtx() });
+    await assert.rejects(manager.execForeground(id, "_ptc_protocol_write({'type': 'tool_call', 'id': 'x', 'tool': 'bash', 'params': {'command': 'false'}})", { ctx: fakeCtx() }), /Unsupported notebook transport frame: tool_call/);
+  } finally { await dispose(manager, sandbox); }
 });

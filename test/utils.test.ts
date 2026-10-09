@@ -7,7 +7,6 @@ const {
   parseSectionedOutput,
   pythonErrorHelpHint,
   sectionize,
-  shouldAutoRoutePromptToCodeExecution,
   sliceCellOutput,
   validateUserCode,
 } = require("../dist/utils.js");
@@ -78,43 +77,16 @@ test("validateUserCode rejects asyncio.run", () => {
   assert.throws(() => validateUserCode("import asyncio\nasyncio.run(main())"), /Top-level await is already available/);
 });
 
-test("validateUserCode rejects direct _rpc_call usage", () => {
-  assert.throws(() => validateUserCode("result = await _rpc_call('read', {'path': 'x'})"), /Use the generated helper functions/);
-});
 
-test("shouldAutoRoutePromptToCodeExecution triggers on current PTC tool names", () => {
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Use exec_cell to analyze the logs"), true);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Run the provision_kernel tool now"), true);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Call inspect_kernel to check state"), true);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Use code_execution for this task"), true);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("invoke list_kernels please"), true);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("run provision_dependency for numpy"), true);
-});
+
+
 
 // The pre-rename tool name must no longer be a routing trigger (C1).
-test("shouldAutoRoutePromptToCodeExecution ignores the stale python_exec trigger", () => {
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Use python_exec to read the file"), false);
-});
 
-test("shouldAutoRoutePromptToCodeExecution detects multi-file aggregation prompts", () => {
-  assert.equal(
-    shouldAutoRoutePromptToCodeExecution(
-      "Analyze the first 8 test/**/*.test.ts files and return compact JSON only"
-    ),
-    true
-  );
-  assert.equal(
-    shouldAutoRoutePromptToCodeExecution(
-      "Count imports across src/**/*.ts and show the top 10 packages"
-    ),
-    true
-  );
-});
 
-test("shouldAutoRoutePromptToCodeExecution ignores simple or mutating prompts", () => {
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Read src/index.ts"), false);
-  assert.equal(shouldAutoRoutePromptToCodeExecution("Fix the failing tests in src/index.ts"), false);
-});
+
+
+
 
 test("loadSettingsFromEnv parses preview/spool settings and accepts the old output env as an alias", () => {
   const previousPreview = process.env.PTC_OUTPUT_PREVIEW_CHARS;
@@ -205,4 +177,21 @@ test("parseSectionedOutput round-trips sections and rejects legacy blobs", () =>
   assert.deepEqual(parsed?.map((s) => s.name), ["output"]);
   assert.equal(parsed?.[0].body, "kernel:\n  not a real section");
   assert.equal(parseSectionedOutput("plain legacy text\nno markers"), null);
+});
+
+
+test("retired bridge environment flags do not re-enable host-tool exposure", () => {
+  const old = { ...process.env };
+  try {
+    process.env.PTC_CALLABLE_TOOLS = "read,bash";
+    process.env.PTC_BLOCKED_TOOLS = "";
+    process.env.PTC_AUTO_ROUTE = "true";
+    process.env.PTC_MAX_PARALLEL_TOOL_CALLS = "99";
+    const settings = loadSettingsFromEnv();
+    for (const field of ["callableTools", "blockedTools", "autoRoute", "maxParallelToolCalls"]) assert.equal(field in settings, false);
+  } finally {
+    for (const key of ["PTC_CALLABLE_TOOLS", "PTC_BLOCKED_TOOLS", "PTC_AUTO_ROUTE", "PTC_MAX_PARALLEL_TOOL_CALLS"]) {
+      if (old[key] === undefined) delete process.env[key]; else process.env[key] = old[key];
+    }
+  }
 });

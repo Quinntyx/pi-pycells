@@ -4,16 +4,12 @@ import type { RecoveryFailureClass } from "./recovery-state";
 export type RecoveryKind = RecoveryFailureClass;
 
 const KNOWN_ASYNC_HELPERS = [
-  "read",
-  "glob",
-  "find",
-  "grep",
-  "ls",
-  "ptc.read_many",
-  "ptc.read_tree",
-  "ptc.find_files",
-  "ptc.find_files_abs",
-  "ptc.read_text",
+  "asyncio.sleep",
+  "asyncio.create_subprocess_exec",
+  "asyncio.create_subprocess_shell",
+  "asyncio.wait_for",
+  "asyncio.wait",
+  "asyncio.to_thread",
 ] as const;
 
 const helperPattern = KNOWN_ASYNC_HELPERS.map((name) => escapeRegExp(name)).join("|");
@@ -142,8 +138,8 @@ export function classifyCodeExecutionFailure(
 export function buildCodeExecutionRecoveryPrompt(kind: RecoveryKind): string {
   switch (kind) {
     case "missing-await":
-      return "PTC recovery: You called an async helper without await. Helpers like read, glob, find, grep, and ls are async wrappers. Await each helper call before using its result.";
+      return "Python recovery: You called an async helper without await. Use await for coroutine-returning Python library calls, such as asyncio.sleep and asyncio.to_thread. Await each helper call before using its result.";
     case "async-wrapper-iterated":
-      return "PTC recovery: You used an async helper result before awaiting it. Helpers like read, glob, find, grep, and ls are async wrappers. Await the helper call before iterating, sorting, slicing, indexing, or unpacking the result.";
+      return "Python recovery: You used an async helper result before awaiting it. Use await for coroutine-returning Python library calls, such as asyncio.sleep and asyncio.to_thread. Await the helper call before iterating, sorting, slicing, indexing, or unpacking the result.";
   }
 }

@@ -8,13 +8,13 @@ const {
 test("classifyCodeExecutionFailure detects direct missing-await helper failures", () => {
   const code = [
     'path = "package.json"',
-    "content = read(path)",
+    "content = asyncio.sleep(path)",
     "return content",
   ].join("\n");
   const traceback = [
     "Traceback (most recent call last):",
     '  File "<stdin>", line 2, in user_main',
-    '    content = read(path)',
+    '    content = asyncio.sleep(path)',
     "TypeError: object of type 'coroutine' has no len()",
   ].join("\n");
 
@@ -22,11 +22,11 @@ test("classifyCodeExecutionFailure detects direct missing-await helper failures"
 });
 
 test("classifyCodeExecutionFailure detects async-wrapper iteration misuse deterministically", () => {
-  const code = 'files = sorted(glob("src/**/*.ts"))';
+  const code = 'files = sorted(asyncio.to_thread("src/**/*.ts"))';
   const traceback = [
     "Traceback (most recent call last):",
     '  File "<stdin>", line 1, in user_main',
-    '    files = sorted(glob("src/**/*.ts"))',
+    '    files = sorted(asyncio.to_thread("src/**/*.ts"))',
     "TypeError: 'coroutine' object is not iterable",
   ].join("\n");
 
@@ -80,7 +80,7 @@ test("classifyCodeExecutionFailure ignores bare await mentions in diagnostics", 
   const code = [
     "async def helper():",
     "    return 1",
-    "content = read(path)",
+    "content = asyncio.sleep(path)",
   ].join("\n");
   const traceback = [
     "Traceback (most recent call last):",
@@ -96,15 +96,15 @@ test("classifyCodeExecutionFailure ignores bare await mentions in diagnostics", 
 });
 
 test("classifyCodeExecutionFailure keeps evidence containing # inside string literals", () => {
-  // The # in the f-string is not a comment: the read(path) call is real evidence.
+  // The # in the f-string is not a comment: the asyncio.sleep(path) call is real evidence.
   const code = [
-    'chunk = f"#section-{read(path)}"',
+    'chunk = f"#section-{asyncio.sleep(path)}"',
     "return chunk",
   ].join("\n");
   const traceback = [
     "Traceback (most recent call last):",
     '  File "<stdin>", line 1, in user_main',
-    '    chunk = f"#section-{read(path)}"',
+    '    chunk = f"#section-{asyncio.sleep(path)}"',
     "TypeError: object of type 'coroutine' has no len()",
   ].join("\n");
 
@@ -115,11 +115,11 @@ test("classifyCodeExecutionFailure keeps evidence containing # inside string lit
 });
 
 test("classifyCodeExecutionFailure recognizes common iterated helper forms", () => {
-  const joinCode = 'joined = "\\n".join(read(path))';
+  const joinCode = 'joined = "\\n".join(asyncio.sleep(path))';
   const joinTraceback = [
     "Traceback (most recent call last):",
     '  File "<stdin>", line 1, in user_main',
-    '    joined = "\\n".join(read(path))',
+    '    joined = "\\n".join(asyncio.sleep(path))',
     "TypeError: 'coroutine' object is not iterable",
   ].join("\n");
   assert.equal(
@@ -127,11 +127,11 @@ test("classifyCodeExecutionFailure recognizes common iterated helper forms", () 
     "async-wrapper-iterated"
   );
 
-  const minCode = "shortest = min(read(p) for p in paths)";
+  const minCode = "shortest = min(asyncio.sleep(p) for p in paths)";
   const minTraceback = [
     "Traceback (most recent call last):",
     '  File "<stdin>", line 1, in user_main',
-    "    shortest = min(read(p) for p in paths)",
+    "    shortest = min(asyncio.sleep(p) for p in paths)",
     "TypeError: 'coroutine' object is not iterable",
   ].join("\n");
   assert.equal(
@@ -143,10 +143,16 @@ test("classifyCodeExecutionFailure recognizes common iterated helper forms", () 
 test("buildCodeExecutionRecoveryPrompt returns stable minimal text for each supported failure class", () => {
   assert.equal(
     buildCodeExecutionRecoveryPrompt("missing-await"),
-    "PTC recovery: You called an async helper without await. Helpers like read, glob, find, grep, and ls are async wrappers. Await each helper call before using its result."
+    "Python recovery: You called an async helper without await. Use await for coroutine-returning Python library calls, such as asyncio.sleep and asyncio.to_thread. Await each helper call before using its result."
   );
   assert.equal(
     buildCodeExecutionRecoveryPrompt("async-wrapper-iterated"),
-    "PTC recovery: You used an async helper result before awaiting it. Helpers like read, glob, find, grep, and ls are async wrappers. Await the helper call before iterating, sorting, slicing, indexing, or unpacking the result."
+    "Python recovery: You used an async helper result before awaiting it. Use await for coroutine-returning Python library calls, such as asyncio.sleep and asyncio.to_thread. Await the helper call before iterating, sorting, slicing, indexing, or unpacking the result."
   );
+});
+
+
+test("recovery never recommends deleted host-tool helpers", () => {
+  assert.equal(classifyCodeExecutionFailure("coroutine was never awaited", undefined, "x = read(path)"), null);
+  assert.doesNotMatch(buildCodeExecutionRecoveryPrompt("missing-await"), /ptc\.|read, glob|host tool/);
 });

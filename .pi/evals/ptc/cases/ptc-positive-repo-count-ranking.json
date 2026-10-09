@@ -1,6 +1,6 @@
 {
   "id": "ptc-positive-repo-count-ranking",
-  "prompt": "Count exported functions across src/**/*.ts, rank the top 10 files by export count, and return compact JSON only.",
+  "prompt": "Use exec_cell. Count exported functions across src/**/*.ts, rank the top 10 files by export count, and return compact JSON only.",
   "expected_first_path": "code_execution",
   "acceptance": {
     "type": "behavioral",

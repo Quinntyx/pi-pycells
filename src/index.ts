@@ -19,7 +19,6 @@ import {
   buildPtcExecutionTelemetry,
   buildPtcRecoveryDetails,
   createPtcRecoveryState,
-  noteAutomaticRouting,
   noteCodeExecutionAttempt,
   noteCodeExecutionFailure,
   noteCodeExecutionSuccess,
@@ -27,11 +26,9 @@ import {
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
 import { ensurePtcVenv, inheritedSubagentsRuntime, isNestedSubagent, resolvePiSubagentsSource, startSubagentsEnv, subagentDepthPolicy } from "./subagents-env";
-import { describePythonHelpers } from "./tools/python-tool-contract";
 import { createRenderedCellReviewTool } from "./tools/cell-review";
 import { KernelDirectory, KernelNameError, normalizeKernelName, type KernelRef } from "./tools/kernel-directory";
-import { ToolRegistry } from "./tool-registry";
-import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
+import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager } from "./types";
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
 import {
   collapseOutputPreview,
@@ -41,7 +38,6 @@ import {
   isMutationPrompt,
   loadSettingsFromEnv,
   logWarning,
-  shouldAutoRoutePromptToCodeExecution,
   withActivityLabel,
 } from "./utils";
 import { relevantAgents } from "./execution/subagent-panel";
@@ -60,17 +56,6 @@ import type {
   SessionSummary,
 } from "./contracts/execution-types";
 
-// Running tally of cumulative PTC token savings, shared in-process on globalThis
-// so other extensions (e.g. the prompt status bar) can surface it without a cross-package import.
-const ptcGlobal = globalThis as Record<string, unknown>;
-const existingTokenTally = ptcGlobal.__ptcTokensSaved;
-const ptcTokensSaved =
-  typeof existingTokenTally === "object" &&
-  existingTokenTally !== null &&
-  typeof (existingTokenTally as { tokensSaved?: unknown }).tokensSaved === "number"
-    ? (existingTokenTally as { tokensSaved: number })
-    : { tokensSaved: 0 };
-ptcGlobal.__ptcTokensSaved = ptcTokensSaved;
 
 //
 // Minimal structural view of the render context the pi TUI passes as the fourth
@@ -179,47 +164,9 @@ function buildRecoveryContextMessage(content: string) {
 // Tool descriptions
 // ============================================================================
 
-/**
- * Build the model-facing helper contract embedded in exec_cell/inspect_kernel
- * descriptions: the callable host tools and the Python helpers generated for
- * them, plus the always-available ptc.* utilities.
- */
-function buildToolDescription(callableTools: ToolInfo[]): string {
-  const callableHelperLines = describePythonHelpers(callableTools);
-  const callable = callableTools.map((tool) => tool.ptc?.pythonName || tool.name).join(", ") || "(none)";
-  const helperList = callableHelperLines.length > 0
-    ? `- ${callableHelperLines.join("\n- ")}`
-    : "- No host-tool helpers are currently enabled.";
 
-  return `Host tools callable from Python in this kernel: ${callable}
 
-Available Python helpers:
-${helperList}
-- ptc.gather_limit(coros, limit=...) -> list
-- ptc.read_many(paths, max_concurrency=None) -> list[str]
-- ptc.read_tree(pattern, path='.', ...) -> list[dict]
-- ptc.find_files / ptc.find_files_abs / ptc.read_text / ptc.json_dump
-- np / pd / plt lazy imports (matplotlib figures are captured automatically)
 
-Python runs as a local subprocess. Nested host-tool policy still applies.`;
-}
-
-/**
- * Build the tool description for the current cwd, falling back to an empty
- * callable list (with a warning) if registry lookup fails.
- */
-function currentToolDescription(
-  toolRegistry: ToolRegistry,
-  settings: PtcSettings,
-  sessionState: PtcSessionState
-): string {
-  try {
-    return buildToolDescription(toolRegistry.getCallableTools(sessionState.currentCwd, settings));
-  } catch (error) {
-    logWarning(`Unable to build the dynamic PTC tool description: ${error instanceof Error ? error.message : String(error)}`);
-    return buildToolDescription([]);
-  }
-}
 
 const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel bound to a unique human-readable name. Every other kernel tool targets kernels by that name via its required 'kernel' parameter. The kernel is bound to a notebook file (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
@@ -480,7 +427,6 @@ export function provisionDependencyTool(
 interface PtcSessionState {
   currentCwd: string;
   customToolsStarted: boolean;
-  activeToolsBeforeRouting: string[] | null;
   pendingRecoveryPrompt: string | null;
   recoveryAllowed: boolean;
   recoveryState: PtcRecoveryState | null;
@@ -492,74 +438,12 @@ interface PtcSessionState {
 }
 
 /** Order-sensitive list equality (used to avoid redundant setActiveTools calls). */
-function areToolListsEqual(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
 
-/**
- * If the prompt matches the routing heuristic, hide non-routable tools for
- * this request, expose exec_cell/provision_kernel/read_cell_output, and append
- * a routing nudge to the system prompt. Returns the systemPrompt change, or
- * undefined when no routing happened. restoreActiveToolsAfterRouting undoes
- * the tool swap at agent_end.
- */
-function applyAutoRouting(
-  pi: ExtensionAPI,
-  toolRegistry: ToolRegistry,
-  settings: PtcSettings,
-  sessionState: PtcSessionState,
-  prompt: string,
-  currentSystemPrompt: string
-): { systemPrompt?: string } | undefined {
-  if (!settings.autoRoute || !shouldAutoRoutePromptToCodeExecution(prompt)) {
-    return undefined;
-  }
 
-  const allTools = pi.getAllTools();
-  if (!allTools.some((tool) => tool.name === "exec_cell")) {
-    return undefined;
-  }
 
-  noteAutomaticRouting(getRequestRecoveryState(sessionState));
-
-  const activeTools = pi.getActiveTools();
-  const routableToolNames = new Set(toolRegistry.getAutoRoutableToolNames(sessionState.currentCwd, settings));
-  const nextActiveTools = activeTools.filter((name) => !routableToolNames.has(name));
-  if (!nextActiveTools.includes("exec_cell")) {
-    nextActiveTools.push("exec_cell");
-  }
-  if (!nextActiveTools.includes("provision_kernel")) {
-    nextActiveTools.push("provision_kernel");
-  }
-  if (!nextActiveTools.includes("read_cell_output")) {
-    nextActiveTools.push("read_cell_output");
-  }
-
-  if (!areToolListsEqual(activeTools, nextActiveTools)) {
-    sessionState.activeToolsBeforeRouting = activeTools;
-    pi.setActiveTools(nextActiveTools);
-    debugLog("Auto-routed prompt to exec_cell", { prompt, activeTools, nextActiveTools });
-  }
-
-  return {
-    systemPrompt:
-      `${currentSystemPrompt}\n\n` +
-      "This request is a strong fit for exec_cell. Provision a kernel first (provision_kernel), keep large intermediate results inside the kernel namespace, and prefer exec_cell for the work.",
-  };
-}
 
 /** Restore the pre-routing active tool set (no-op when routing never swapped it). */
-function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessionState): void {
-  if (!sessionState.activeToolsBeforeRouting) {
-    return;
-  }
 
-  pi.setActiveTools(sessionState.activeToolsBeforeRouting);
-  debugLog("Restored active tools after exec_cell routing", {
-    restored: sessionState.activeToolsBeforeRouting,
-  });
-  sessionState.activeToolsBeforeRouting = null;
-}
 
 // ============================================================================
 // Explicit cell review (never executes code)
@@ -793,13 +677,7 @@ export function provisionKernelTool(
             sourcedFrom,
             sourceError,
             scriptError: scriptError ? scriptError.message : undefined,
-            nestedToolCalls: 0,
-            nestedToolNames: [],
-            nestedResultChars: 0,
-            nestedResultCount: 0,
-            nestedErrors: sourceError || scriptError ? 1 : 0,
             durationMs: 0,
-            estimatedAvoidedTokens: 0,
           },
         };
       } catch (error) {
@@ -962,9 +840,6 @@ function execCellTool(
           liveUpdates.stop();
         }
         noteCodeExecutionSuccess(recoveryState);
-        if (result.details.estimatedAvoidedTokens > 0) {
-          ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
-        }
         const reportedCellIdx = result.details.cellIdx;
         const compatibilityCellIdx = sessionManager.list().find((entry) => entry.id === sessionId)?.chunks ?? 1;
         const visibleOutput = collapseOutputPreview(
@@ -1117,9 +992,6 @@ function scratchRunTool(
           onUpdate: liveUpdates.onUpdate,
           parentToolCallId: toolCallId,
         });
-        if (result.details.estimatedAvoidedTokens > 0) {
-          ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
-        }
         const completed = completedCellContent(result, target.ref.id, settings);
         return { content: completed.content, details: { ...completed.details, ...kernelIdentity(target.ref) } };
       } finally {
@@ -1387,9 +1259,6 @@ function runCellTool(
           onUpdate: liveUpdates.onUpdate,
           parentToolCallId: toolCallId,
         });
-        if (result.details.estimatedAvoidedTokens > 0) {
-          ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
-        }
         const content = completedCellContent(result, ref.id, settings);
         return { content: content.content, details: { ...content.details, ...kernelIdentity(ref), runCellIndex: n } };
       } catch (error) {
@@ -1690,14 +1559,13 @@ function updateSubagentFooter(
 /** Register complete renderer definitions before Pi reconstructs fork/resume history. */
 function registerKernelTools(
   pi: ExtensionAPI,
-  toolRegistry: ToolRegistry,
   settings: PtcSettings,
   sessionState: PtcSessionState,
   sessionManager: PythonSessionManager,
   directory: KernelDirectory,
   sandboxManager: SandboxManager,
 ): void {
-  const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
+  const toolDescription = "Python runs as a local subprocess. Use normal Python libraries for files, subprocesses, and concurrency. np / pd / plt are lazy imports; matplotlib figures are captured automatically. Host tools are not callable from Python cells.";
   const register = (tool: PtcToolDefinition) => pi.registerTool(withKernelRendering(tool, directory));
   register(provisionKernelTool(sessionManager, directory, sessionState));
   register(execCellTool(pi, sessionManager, directory, settings, sessionState, toolDescription));
@@ -1737,7 +1605,6 @@ async function handleSessionStart(
   customToolManager: CustomToolManager,
   sessionState: PtcSessionState,
   pi: ExtensionAPI,
-  toolRegistry: ToolRegistry,
   settings: PtcSettings,
   sessionManager: PythonSessionManager,
   directory: KernelDirectory,
@@ -1751,17 +1618,15 @@ async function handleSessionStart(
     sessionState.customToolsStarted = true;
   }
 
-  registerKernelTools(pi, toolRegistry, settings, sessionState, sessionManager, directory, sandboxManager);
+  registerKernelTools(pi, settings, sessionState, sessionManager, directory, sandboxManager);
 }
 
 /**
  * before_agent_start: reset per-request recovery state, decide whether
- * automatic recovery is allowed (mutation prompts disallow it), apply prompt
- * routing, and add a depth note to the system prompt for subagent instances.
+ * automatic recovery is allowed (mutation prompts disallow it), add a depth note to the system prompt for subagent instances.
  */
 function handleBeforeAgentStart(
   pi: ExtensionAPI,
-  toolRegistry: ToolRegistry,
   settings: PtcSettings,
   sessionState: PtcSessionState,
   event: { prompt?: string; systemPrompt: string }
@@ -1771,9 +1636,6 @@ function handleBeforeAgentStart(
   sessionState.recoveryState = createPtcRecoveryState();
 
   let result: { systemPrompt?: string } | undefined;
-  if (typeof event.prompt === "string") {
-    result = applyAutoRouting(pi, toolRegistry, settings, sessionState, event.prompt, event.systemPrompt);
-  }
 
   // Depth-aware system prompt for subagent instances.
   const { depth, maxDepth } = subagentDepthPolicy();
@@ -1829,9 +1691,8 @@ function handleToolResult(
   };
 }
 
-/** agent_end: restore routed-away tools and clear per-request recovery state. */
+/** agent_end: clear per-request recovery state. */
 function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
-  restoreActiveToolsAfterRouting(pi, sessionState);
   sessionState.pendingRecoveryPrompt = null;
   sessionState.recoveryAllowed = true;
   sessionState.recoveryState = null;
@@ -1872,12 +1733,10 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
       return undefined; // RPC/non-interactive contexts: collapse to "normal"
     }
   });
-  const toolRegistry = new ToolRegistry(pi);
   const sandboxManager = await createSandbox();
   const sessionState: PtcSessionState = {
     currentCwd: context?.cwd ?? process.cwd(),
     customToolsStarted: false,
-    activeToolsBeforeRouting: null,
     pendingRecoveryPrompt: null,
     recoveryAllowed: true,
     recoveryState: null,
@@ -1898,7 +1757,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   }
 
   let subagentRuntime: SubagentRuntimeApi | undefined;
-  const sessionManager = new PythonSessionManager(sandboxManager, toolRegistry, settings, extensionRoot, {
+  const sessionManager = new PythonSessionManager(sandboxManager, settings, extensionRoot, {
     onSubagentSnapshot: (sessionId, execId, snapshot) => {
       subagentRuntime?.publish(sessionId, snapshot);
       sessionState.lastSubagentSnapshot = snapshot;
@@ -1954,36 +1813,23 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     }
   };
 
-  registerKernelTools(pi, toolRegistry, settings, sessionState, sessionManager, kernelDirectory, sandboxManager);
+  registerKernelTools(pi, settings, sessionState, sessionManager, kernelDirectory, sandboxManager);
   registerPtcCommand(pi, sessionManager, kernelDirectory);
   registerWorkflowCommand(pi);
 
-  const onToolSetChanged = () => {
-    // During initial startup handleSessionStart registers all tools once after
-    // the custom-tool scan. Later hot reloads replace these two definitions so
-    // the model-facing helper list stays in sync with the callable tool set.
-    if (!sessionState.customToolsStarted) {
-      return;
-    }
-    const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
-    pi.registerTool(withKernelRendering(execCellTool(pi, sessionManager, kernelDirectory, settings, sessionState, toolDescription), kernelDirectory));
-    pi.registerTool(withKernelRendering(inspectKernelTool(sessionManager, kernelDirectory, toolDescription), kernelDirectory));
-  };
-
-  const customToolManager = new CustomToolManager(extensionRoot, pi, toolRegistry, onToolSetChanged);
+  const customToolManager = new CustomToolManager(extensionRoot, pi);
 
   const onSessionStart = handleSessionStart.bind(
     undefined,
     customToolManager,
     sessionState,
     pi,
-    toolRegistry,
     settings,
     sessionManager,
     kernelDirectory,
     sandboxManager
   );
-  const onBeforeAgentStart = handleBeforeAgentStart.bind(undefined, pi, toolRegistry, settings, sessionState);
+  const onBeforeAgentStart = handleBeforeAgentStart.bind(undefined, pi, settings, sessionState);
   const onContext = handleContext.bind(undefined, sessionState);
   const onToolResult = handleToolResult.bind(undefined, sessionState);
   const onAgentEnd = handleAgentEnd.bind(undefined, pi, sessionState);

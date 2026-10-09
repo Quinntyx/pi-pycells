@@ -202,7 +202,7 @@ test("power-of-two cohorts reduce without orphan handling and preserve all contr
 test("configuration docs preserve the reference and describe installed SDK sources", () => {
   const config = readFileSync(new URL("../docs/configuration.md", import.meta.url), "utf8");
   for (const heading of ["## What it does", "## How it works", "## Usage", "## Environment variables",
-    "### Execution", "### Tool policy", "### Routing, recovery, sessions", "### Paths and library",
+    "### Execution", "### Recovery and sessions", "### Paths and library",
     "### pi-subagents provisioning", "### Fixed limits (not configurable)"]) {
     assert.ok(config.includes(heading), heading);
   }

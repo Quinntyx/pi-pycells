@@ -372,9 +372,7 @@ function renderExecutingFrame(
       ...opts, mode: inputMode, viewStart: state.viewStartLine, executingLine,
       highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
     }, (options) => renderInCell(code, options), 0, false, mode === "fullscreen");
-    if (details.activeTool) {
-      lines.push(truncateToWidth(theme.fg("muted", `· calling ${details.activeTool}()`), width));
-    }
+
     const liveText = (details.liveOutput ?? []).join("\n");
     const hidden = details.liveOutputHidden ?? 0;
     if (!liveText && !hidden && !panel.length && !details.execId) return lines;

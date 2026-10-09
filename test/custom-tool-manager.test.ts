@@ -19,7 +19,7 @@ async function waitFor(condition, timeoutMs = 3000) {
   }
 }
 
-test("loadCustomToolsFromDir loads ptc metadata from tools directory", async () => {
+test("loadCustomToolsFromDir loads native tools from tools directory", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ptc-tools-"));
   const toolsDir = path.join(root, "tools");
   await fs.mkdir(toolsDir, { recursive: true });
@@ -30,7 +30,6 @@ test("loadCustomToolsFromDir loads ptc metadata from tools directory", async () 
       name: 'echo',
       description: 'Echo input',
       parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-      ptc: { enabled: true, readOnly: true, pythonName: 'echo_tool' },
       async execute() { return { content: [{ type: 'text', text: 'ok' }], details: undefined }; }
     };`
   );
@@ -38,11 +37,7 @@ test("loadCustomToolsFromDir loads ptc metadata from tools directory", async () 
   const loaded = await loadCustomToolsFromDir(toolsDir);
   assert.equal(loaded.length, 1);
   assert.equal(loaded[0].tool.name, "echo");
-  assert.deepEqual(loaded[0].tool.ptc, {
-    enabled: true,
-    readOnly: true,
-    pythonName: "echo_tool",
-  });
+  assert.equal("ptc" in loaded[0].tool, false);
 });
 
 test("loadCustomToolsFromDir fails loudly for invalid custom tools", async () => {
@@ -92,16 +87,9 @@ test("CustomToolManager startup loads valid tools and warns for invalid ones", a
     },
   };
 
-  const toolRegistry = {
-    upsertTool(tool) {
-      upserted.push(tool.name);
-    },
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry, () => {
+
+  const manager = new CustomToolManager(root, pi, () => {
     changed += 1;
   });
 
@@ -114,13 +102,12 @@ test("CustomToolManager startup loads valid tools and warns for invalid ones", a
   }
 
   assert.deepEqual(registered, ["echo"]);
-  assert.deepEqual(upserted, ["echo"]);
   assert.deepEqual(activeTools, ["echo"]);
   assert.equal(changed, 1);
   assert.match(warnings.join("\n"), /Skipping invalid custom tool broken\.js during startup/);
 });
 
-test("CustomToolManager does not auto-activate code_execution-only tools", async () => {
+test("CustomToolManager rejects legacy bridge declarations rather than exposing them natively", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ptc-code-only-"));
   const toolsDir = path.join(root, "tools");
   await fs.mkdir(toolsDir, { recursive: true });
@@ -146,14 +133,9 @@ test("CustomToolManager does not auto-activate code_execution-only tools", async
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   try {
     await manager.start();
   } finally {
@@ -199,16 +181,10 @@ test("CustomToolManager reloads, renames, invalidates, and removes tools end-to-
     },
   };
 
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool(name) {
-      removed.push(name);
-      return true;
-    },
-  };
+
 
   let changed = 0;
-  const manager = new CustomToolManager(root, pi, toolRegistry, () => {
+  const manager = new CustomToolManager(root, pi, () => {
     changed += 1;
   });
 
@@ -253,9 +229,9 @@ test("CustomToolManager reloads, renames, invalidates, and removes tools end-to-
   assert.ok(registered.includes("echo"));
   assert.ok(registered.includes("echo_v2"));
   assert.ok(registered.includes("echo_final"));
-  assert.ok(removed.includes("echo"));
-  assert.ok(removed.includes("echo_v2"));
-  assert.ok(removed.includes("echo_final"));
+  assert.ok(!activeTools.includes("echo"));
+  assert.ok(!activeTools.includes("echo_v2"));
+  assert.ok(!activeTools.includes("echo_final"));
   assert.ok(changed >= 4);
   assert.match(warnings.join("\n"), /Custom tool reload failed for echo\.js/);
 });
@@ -292,16 +268,10 @@ test("CustomToolManager hot-reloads export default (ESM) tools", async () => {
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool(name) {
-      removed.push(name);
-      return true;
-    },
-  };
+
 
   let changed = 0;
-  const manager = new CustomToolManager(root, pi, toolRegistry, () => {
+  const manager = new CustomToolManager(root, pi, () => {
     changed += 1;
   });
 
@@ -322,7 +292,7 @@ test("CustomToolManager hot-reloads export default (ESM) tools", async () => {
       };`
     );
     await waitFor(() => activeTools.includes("esm_echo_v2") && !activeTools.includes("esm_echo"));
-    assert.ok(removed.includes("esm_echo"));
+    assert.ok(!activeTools.includes("esm_echo"));
     assert.ok(changed >= 2);
   } finally {
     manager.close();
@@ -361,14 +331,9 @@ test("CustomToolManager watcher survives fs.watch error events and re-watches", 
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   try {
     await manager.start();
     const originalWatcher = manager.watcher;
@@ -424,14 +389,9 @@ test("CustomToolManager serializes overlapping reconciles for the same file", as
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   try {
     await manager.start();
     manager.watcher.close();
@@ -499,14 +459,9 @@ test("CustomToolManager drops an in-flight reconcile after close", async () => {
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   await manager.start();
   manager.watcher.close();
   manager.watcher = null;
@@ -556,14 +511,9 @@ test("CustomToolManager ignores reconciles that land after close", async () => {
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   await manager.start();
   await waitFor(() => activeTools.includes("echo"));
 
@@ -617,14 +567,9 @@ test("CustomToolManager rejects custom tools colliding with builtin names", asyn
       activeTools.splice(0, activeTools.length, ...next);
     },
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   try {
     await manager.start();
     await new Promise((resolve) => setImmediate(resolve));
@@ -635,7 +580,7 @@ test("CustomToolManager rejects custom tools colliding with builtin names", asyn
 
   assert.deepEqual(registered, []);
   assert.deepEqual(activeTools, []);
-  assert.match(warnings.join("\n"), /collides with a reserved builtin\/PTC tool name/);
+  assert.match(warnings.join("\n"), /collides with a reserved builtin\/kernel tool name/);
 });
 
 test("CustomToolManager warns and rejects cross-file duplicate tool names", async () => {
@@ -671,14 +616,9 @@ test("CustomToolManager warns and rejects cross-file duplicate tool names", asyn
     },
     setActiveTools() {},
   };
-  const toolRegistry = {
-    upsertTool() {},
-    removeTool() {
-      return true;
-    },
-  };
 
-  const manager = new CustomToolManager(root, pi, toolRegistry);
+
+  const manager = new CustomToolManager(root, pi);
   try {
     await manager.start();
     await new Promise((resolve) => setImmediate(resolve));
@@ -690,4 +630,19 @@ test("CustomToolManager warns and rejects cross-file duplicate tool names", asyn
   // The first file wins; the second is treated as a load error.
   assert.deepEqual(registered, ["dupe"]);
   assert.match(warnings.join("\n"), /already provided by a_first\.js; duplicate name rejected/);
+});
+
+
+test("custom tools cannot shadow native notebook operations", async () => {
+  for (const name of ["run_cell", "scratch_run", "read_cell_output", "reset_kernel"]) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "kernel-tool-reserved-"));
+    const toolsDir = path.join(root, "tools");
+    await fs.mkdir(toolsDir, { recursive: true });
+    await writeTool(toolsDir, "shadow.js", `module.exports = { name: '${name}', description: 'shadow', parameters: { type: 'object' }, async execute() { return { content: [] }; } };`);
+    const registered = [];
+    const pi = { registerTool(tool) { registered.push(tool.name); }, getActiveTools() { return []; }, setActiveTools() {} };
+    const manager = new CustomToolManager(root, pi);
+    try { await manager.start(); } finally { manager.close(); }
+    assert.deepEqual(registered, []);
+  }
 });

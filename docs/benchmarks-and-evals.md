@@ -7,7 +7,7 @@
 ## How it works
 
 - **Case loading** (`loadEvalCasesFromDisk` in `src/benchmark-runner.ts`): reads every `*.json` file in `<evals-path>/cases/` in sorted filename order and validates each one with `parseEvalCase` (`src/eval-cases.ts`). Invalid files (bad shape, unknown acceptance rule keys, unknown `expected_first_path` or acceptance `type`) fail the run at load time. If you pass `--cases`, only matching case ids run, and unknown ids are an error listing the available ids.
-- **Default executor** (`createDeterministicBenchmarkExecutor`): no LLM is called. Classification is done by replaying the extension's real routing heuristic, `shouldAutoRoutePromptToCodeExecution(prompt)` (`src/utils.ts`), over the case prompt:
+The deterministic executor simulates explicit kernel-tool requests only. Production never auto-routes prompts or hides direct tools.
   - If the heuristic routes the prompt, `observed_first_path` is `"code_execution"`; otherwise `"direct"`.
   - `recovery_attempted` is true only when the case was routed to code execution *and* the case's rules expect `recovery_attempted=true`.
   - `failure_class` is copied from the case's `failure_class=` rule when recovery fired, else `null`.
@@ -103,7 +103,7 @@ CLI flags (all parsed by `parseCliArgs`; unknown flags are an error):
 ## Configuration
 
 - `PTC_EVALS_PATH` — overrides the default eval root (`.pi/evals/ptc`). Relative paths are resolved against the current working directory.
-- Routing behavior that the deterministic executor replays depends on the same heuristic as the live extension (`shouldAutoRoutePromptToCodeExecution`); the extension's own routing toggle (`PTC_AUTO_ROUTE`, default `true`) governs live sessions but the benchmark executor always applies the heuristic for classification.
+The deterministic executor simulates explicit kernel-tool requests only. Production never auto-routes prompts or hides direct tools.
 
 ## Standalone setup notes
 

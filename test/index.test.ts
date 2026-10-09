@@ -30,9 +30,8 @@ function makeFakeSessionManager(sandbox) {
   return class FakePythonSessionManager {
     static lastInstance = null;
 
-    constructor(sandboxManager, toolRegistry, settings, extensionRoot, hooks) {
+    constructor(sandboxManager, settings, extensionRoot, hooks) {
       this.sandboxManager = sandboxManager;
-      this.toolRegistry = toolRegistry;
       this.settings = settings;
       this.extensionRoot = extensionRoot;
       this.hooks = hooks ?? {};
@@ -150,17 +149,7 @@ function restoreInjectedModules(sandbox, overrides = {}) {
       close() {}
     },
   });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: class FakeToolRegistry {
-      getCallableTools() {
-        return [{ name: "read", source: "builtin", isReadOnly: true }];
-      }
 
-      getAutoRoutableToolNames() {
-        return ["read", "grep"];
-      }
-    },
-  });
   const FakeSessionManager = makeFakeSessionManager(sandbox);
   for (const [method, implementation] of Object.entries(overrides)) {
     FakeSessionManager.prototype[method] = implementation;
@@ -172,7 +161,6 @@ function restoreInjectedModules(sandbox, overrides = {}) {
   return () => {
     restoreSandbox();
     restoreManager();
-    restoreRegistry();
     restoreSessions();
   };
 }
@@ -205,10 +193,9 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
   let managerInstance = null;
 
   class FakeCustomToolManager {
-    constructor(extensionRoot, pi, toolRegistry, onToolSetChanged) {
+    constructor(extensionRoot, pi, onToolSetChanged) {
       this.extensionRoot = extensionRoot;
       this.pi = pi;
-      this.toolRegistry = toolRegistry;
       this.onToolSetChanged = onToolSetChanged;
       this.started = 0;
       this.closed = 0;
@@ -217,7 +204,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
 
     async start() {
       this.started += 1;
-      this.onToolSetChanged();
+      this.onToolSetChanged?.();
     }
 
     close() {
@@ -237,9 +224,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
       return ["read", "grep"];
     }
   };
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
+
   const FakeSessionManager = makeFakeSessionManager(sandbox);
   const restoreSessions = setModuleExports("../dist/python-session-manager.js", {
     ...require("../dist/python-session-manager.js"),
@@ -312,13 +297,12 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
   } finally {
     restoreSandbox();
     restoreManager();
-    restoreRegistry();
     restoreSessions();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
 
-test("ptc extension auto-routes repo-wide analysis prompts toward exec_cell", async () => {
+test("notebook extension leaves native tools active and exposes no host-tool helpers", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() {
@@ -345,17 +329,17 @@ test("ptc extension auto-routes repo-wide analysis prompts toward exec_cell", as
 
     const execCell = registered.find((tool) => tool.name === "exec_cell");
     const inspectKernel = registered.find((tool) => tool.name === "inspect_kernel");
-    assert.match(execCell.description, /Host tools callable from Python in this kernel: read/);
-    assert.match(inspectKernel.description, /Available Python helpers:/);
+    assert.match(execCell.description, /Host tools are not callable from Python cells/);
+    assert.doesNotMatch(execCell.description, /ptc\.|Available Python helpers|read\(path/);
+    assert.match(inspectKernel.description, /Host tools are not callable from Python cells/);
 
     const routeResult = eventHandlers.get("before_agent_start")({
       prompt: "Analyze the first 8 test/**/*.test.ts files and return compact JSON only",
       systemPrompt: "base prompt",
     });
 
-    assert.deepEqual(activeTools, ["exec_cell", "provision_kernel", "read_cell_output"]);
-    assert.match(routeResult.systemPrompt, /strong fit for exec_cell/);
-    assert.match(routeResult.systemPrompt, /provision_kernel/);
+    assert.deepEqual(activeTools, ["read", "grep"]);
+    assert.equal(routeResult, undefined);
 
     eventHandlers.get("agent_end")();
     assert.deepEqual(activeTools, ["read", "grep"]);
@@ -420,7 +404,7 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = asyncio.sleep(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -518,7 +502,7 @@ test("ptc extension appends one targeted recovery message on the next turn after
 
   const { PtcPythonError } = require("../dist/execution/execution-errors.js");
   const recoveryPrompt =
-    "PTC recovery: You called an async helper without await. Helpers like read, glob, find, grep, and ls are async wrappers. Await each helper call before using its result.";
+    "Python recovery: You called an async helper without await. Use await for coroutine-returning Python library calls, such as asyncio.sleep and asyncio.to_thread. Await each helper call before using its result.";
 
   const sandbox = {
     async cleanup() {},
@@ -557,7 +541,7 @@ test("ptc extension appends one targeted recovery message on the next turn after
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = asyncio.sleep(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -638,7 +622,7 @@ test("ptc extension does not append a second automatic recovery message after re
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { kernel: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { kernel: "s1", code: "paths = sorted(asyncio.to_thread('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -653,7 +637,7 @@ test("ptc extension does not append a second automatic recovery message after re
     await assert.rejects(
       pythonExecTool.execute(
         "call-2",
-        { kernel: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { kernel: "s1", code: "paths = sorted(asyncio.to_thread('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -723,7 +707,7 @@ test("ptc extension includes recovery telemetry in successful exec_cell details 
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { kernel: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { kernel: "s1", code: "path = 'README.md'\ncontent = asyncio.sleep(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -736,7 +720,7 @@ test("ptc extension includes recovery telemetry in successful exec_cell details 
 
     const result = await pythonExecTool.execute(
       "call-2",
-      { kernel: "s1", code: "path = 'README.md'\ncontent = await read(path)\nreturn len(content)" },
+      { kernel: "s1", code: "path = 'README.md'\ncontent = await asyncio.sleep(path)\nreturn len(content)" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -812,7 +796,7 @@ test("ptc extension includes first-path telemetry in non-recovered exec_cell det
       failureClass: null,
     });
     assert.deepEqual(result.details.telemetry, {
-      autoRouted: true,
+      autoRouted: false,
       firstToolPath: "code_execution",
       routedToCodeExecution: true,
       codeExecutionAttempts: 1,
@@ -868,7 +852,7 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     await assert.rejects(
       pythonExecTool.execute(
         "call-1",
-        { kernel: "s1", code: "paths = await glob('src/**/*.missing.ts')\nreturn paths[0]" },
+        { kernel: "s1", code: "paths = await asyncio.to_thread('src/**/*.missing.ts')\nreturn paths[0]" },
         undefined,
         undefined,
         { cwd: process.cwd() }

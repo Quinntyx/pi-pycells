@@ -451,24 +451,6 @@ def _ptc_format_digest(digest: dict) -> str:
     return " · ".join(parts)
 
 
-def _ptc_tools_summary() -> str | None:
-    """One-line summary of the Pi tools this cell called, for the model-facing
-    `tools:` section (e.g. `read ×12 · grep ×3 · 15 calls`). Defensive: the
-    ledger lives in the RPC module and must never break cell reporting."""
-    try:
-        ledger = globals().get("cell_tool_calls")
-        if not ledger:
-            return None
-        counts: dict[str, int] = {}
-        for name in ledger:
-            counts[name] = counts.get(name, 0) + 1
-        bits = [f"{name} ×{n}" if n > 1 else name for name, n in counts.items()]
-        bits.append(f"{len(ledger)} call" + ("s" if len(ledger) != 1 else ""))
-        return " · ".join(bits)
-    except Exception:
-        return None
-
-
 def _ptc_subagents_summary() -> str | None:
     """One line per open subagent pool with submitted work, for the model-facing
     `subagents:` section. Defensive: the pool registry is an optional runtime
@@ -1023,8 +1005,6 @@ async def _ptc_exec_chunk(frame: dict) -> None:
     global _ptc_notebook_path, _ptc_baseline
     exec_id = frame.get("id") or "unknown"
     code = frame.get("code") or ""
-    # Fresh per-cell tool-call ledger (see rpc.cell_tool_calls).
-    globals().get("cell_tool_calls", []).clear()
     source_path = frame.get("source_path") or None
     notebook_path = frame.get("notebook") or None
     # Sourcing uses source_cell_index (position-based execution counts);
@@ -1133,7 +1113,7 @@ async def _ptc_exec_chunk(frame: dict) -> None:
         digest = _ptc_kernel_digest(before_fingerprint)
         kernel_text = _ptc_format_digest(digest)
         subagents_text = _ptc_subagents_summary()
-        tools_text = _ptc_tools_summary()
+        tools_text = None
         record_parts = []
         if result_text:
             record_parts.append(result_text)

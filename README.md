@@ -11,6 +11,10 @@ session is never a kernel argument.
 
 > **No sandbox.** Kernels run with your user permissions and full file, network, and subprocess access. Only execute code you trust. An approval prompt is not a security boundary.
 
+Python cells use normal Python libraries for files, processes, and concurrency.
+There is no Python-to-host-tool bridge or automatic native-tool rerouting.
+See [Python execution boundary](docs/python-runtime.md).
+
 ## Install
 
 First, make sure Pi can answer a normal prompt and that [`uv`](https://docs.astral.sh/uv/) is on your PATH.

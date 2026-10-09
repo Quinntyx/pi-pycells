@@ -24,7 +24,7 @@ test("run-benchmarks CLI exits non-zero when comparison has regressions", () => 
     path.join(evalsPath, "cases", "case.json"),
     JSON.stringify({
       id: "cli-regression-case",
-      prompt: "Count files across the repo and return compact JSON only.",
+      prompt: "Use exec_cell to compute the result.",
       expected_first_path: "direct",
       acceptance: {
         type: "behavioral",

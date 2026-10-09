@@ -16,7 +16,7 @@ The notebook is also a first-class editable document. The model can create and e
 ### Cell semantics (embedded IPython)
 
 - **One shared namespace, real IPython.** Cells run on one embedded IPython `InteractiveShell` whose user namespace *is* the session's globals, so there is a single persistent namespace with native top-level `await`, `In[n]`/`Out[n]` history, and real magics (`src/python-runtime/session.py`, `_ptc_run_shell_cell`). There is no per-cell `def`/function wrapper, no locals merge, and no trailing-expression rewrite.
-- **Magics and shell escapes work.** `%time`, `%pip`, `%%capture`, `!ls`, and friends are executed by IPython rather than rejected. (Client-side validation still rejects a cell that calls `asyncio.run(...)` — top-level `await` already works — or `_rpc_call(...)` directly; use the generated helpers instead. See `src/utils.ts`, `validateUserCode`.)
+- **Magics and shell escapes work.** `%time`, `%pip`, `%%capture`, `!ls`, and friends are executed by IPython rather than rejected. (Client-side validation still rejects a cell that calls `asyncio.run(...)` — top-level `await` already works — See `src/utils.ts`, `validateUserCode`.)
 - **Echo.** A trailing bare expression is echoed by IPython's displayhook and travels as the frame's `echo` field; its `Out[n]` matches the notebook's `execution_count`. The notebook records it as an `execute_result` output.
 - **Top-level `return`.** Kept for compatibility via a small AST transformer: `return <value>` becomes a private `_PtcReturn` signal that stops the cell early without copying the namespace. Its value is reported in the `return (Out[n])` section and cached in `metadata.ptc_full_output`, but it is *not* written as an `execute_result` output (only auto-echoed bare expressions are).
 - **Rich output.** Output is captured with IPython's `capture_output` (`display=True`): `print` lines stream to the host while rich `display(...)` mime bundles — including `image/png` — are collected and written to the notebook as nbformat `display_data` outputs.
@@ -41,7 +41,7 @@ The notebook is also a first-class editable document. The model can create and e
 ### Concurrency, timeouts, and interrupts
 
 - **Serialization.** Cells run one at a time per kernel via a promise queue (jsonl frames are processed sequentially by the interpreter). A second parallel `exec_cell` streams a "Queued: another exec_cell cell is still running in this kernel" update instead of racing. Document ops, scoped runs, and `reset_kernel` are serialized through the same queue (`src/python-session-manager.ts`, `enqueue`/`execForeground`). Stale frames from superseded execs are dropped by exec-id comparison.
-- **Idle timeout, not runtime timeout.** The default idle window is 270 s (`PTC_EXECUTION_TIMEOUT_MS`) and is re-armed by *every* interpreter frame — progress, stdout, nested tool calls, subagent updates — so it measures silence, not total runtime. Expiry sends SIGINT into the interpreter rather than killing the session.
+- **Idle timeout, not runtime timeout.** The default idle window is 270 s (`PTC_EXECUTION_TIMEOUT_MS`) and is re-armed by *every* interpreter frame — progress, stdout, subagent updates — so it measures silence, not total runtime. Expiry sends SIGINT into the interpreter rather than killing the session.
 - **Interrupts are Ctrl-C semantics.** Esc-abort and idle timeout both SIGINT the interpreter; the running cell raises `KeyboardInterrupt`/`CancelledError`, the kernel stays interactive with its namespace intact, and the report includes a `Stopped at:` line plus the Python traceback. If the interpreter cannot be interrupted (stuck in a native call), a 5 s grace period (`INTERRUPT_GRACE_MS`) ends in SIGKILL. Esc makes pi reject the tool call with its own `AbortError` first — the interrupt report then reaches the model via a queued message, while idle timeouts reject normally with the stack in the tool error (`src/python-session-manager.ts`).
 - **Output sections.** The host composes the model-visible result into structural sections — `output:` (printed text), `return (Out[n]):` (the return value and/or echoed value), `kernel:` (namespace digest), `subagents:` (pool progress), and `tools:` (nested-tool summary) — with cell-produced lines indented two spaces under column-0 markers, so provenance is positional and a cell that prints `kernel:` cannot impersonate a section (`src/python-session-manager.ts`, `buildFinalOutput`; `src/utils.ts`, `sectionize`).
 - **Lifecycle.** Kernels live until the conversation ends, `/ptc kill`, or `session_shutdown` (which disposes all sessions and their children). `PTC_MAX_PYTHON_SESSIONS` is parsed but enforcement is disabled — provision never rejects.
@@ -100,13 +100,12 @@ All settings are environment-based (`loadSettingsFromEnv`, `src/utils.ts`); ther
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` (270 s) | Idle window per cell/op; re-armed on every interpreter frame. Expiry SIGINTs the chunk (kernel survives). |
 | `PTC_OUTPUT_PREVIEW_CHARS` (alias `PTC_MAX_OUTPUT_CHARS`) | `12000` | Model-facing head/tail preview size before the model should page via `read_cell_output`. |
 | `PTC_MAX_SPOOL_CHARS` | `10000000` | Emergency per-cell capture ceiling in the interpreter; output below this is always persisted in full to the notebook. |
-| `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default parallelism of the in-kernel `ptc.gather_limit` helper for nested tool calls. |
 | `PTC_MAX_PYTHON_SESSIONS` | `4` | Parsed but **not enforced** — provisioning never rejects; vestigial. |
 | `PTC_CODE_THEME` | `github-dark` | Shiki theme override for cell boxes and standalone cell review. |
 | `PTC_PYTHON_EXECUTABLE` | venv at `~/.cache/pi-pycells/python-env`, else `python3` | Interpreter used for kernels and for `provision_dependency` installs (`src/sandbox-manager.ts`). |
 | `PTC_DEBUG` | `false` | Debug logging to stdout. |
 
-Two timeouts are not configurable: nested host-tool calls from a cell time out after 300 s (`src/python-runtime/rpc.py`), and `inspect_kernel` waits at most 15 s for the namespace digest (`src/index.ts`). `provision_dependency` runs `uv pip install --python <kernel python> <package>` with a 180 s timeout and reports installed/updated vs. already satisfied; already-running kernels keep their loaded versions until restarted.
+`inspect_kernel` waits at most 15 s for the namespace digest (`src/index.ts`). `provision_dependency` runs `uv pip install --python <kernel python> <package>` with a 180 s timeout and reports installed/updated vs. already satisfied; already-running kernels keep their loaded versions until restarted.
 
 ## Testing note
 
@@ -129,4 +128,4 @@ The real interpreter round-trip tests are opted in with `PTC_TEST_REAL_RUNTIME=t
 - **Notebook paths.** Omitted destinations create scratch notebooks under
   `/tmp/pi-pycells/notebooks/`. Give a project path for durable artifacts.
 - **Child processes.** Capture subprocess output and prevent them from reading
-  the kernel's RPC input. See [tool-bridge.md](tool-bridge.md).
+  the kernel's RPC input. See [python-runtime.md](python-runtime.md).

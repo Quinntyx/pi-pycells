@@ -11,7 +11,6 @@ import {
   PtcPythonError,
   PtcTimeoutError,
 } from "./execution/execution-errors";
-import { normalizeToolResult } from "./tool-adapters";
 import { sectionize } from "./utils";
 import { existsSync } from "fs";
 import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
@@ -35,8 +34,6 @@ import type {
 } from "./contracts/execution-types";
 import type { PtcSettings } from "./contracts/settings";
 import type { ToolUpdateCallback } from "./contracts/tool-types";
-import type { ToolRegistry } from "./tool-registry";
-import { generateToolWrappers } from "./tools/tool-wrapper";
 import {
   appendPythonErrorHelp,
   debugLog,
@@ -131,7 +128,6 @@ export interface KernelHandle {
   running: boolean;
 }
 
-type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
 // ---------------------------------------------------------------------------
 // Persistent protocol: per-exec request/response against a long-lived interpreter.
@@ -185,7 +181,6 @@ class PersistentSessionProtocol {
   private stderrCharsSeen = 0;
   private currentLine?: number;
   private totalLines?: number;
-  private activeTool?: string;
   private chunkLines: string[] = [];
   private execId = "";
   private execStartedAt = Date.now();
@@ -204,14 +199,8 @@ class PersistentSessionProtocol {
   private execTimeout?: NodeJS.Timeout;
   private updateHandler?: ToolUpdateCallback;
   private execTimeoutMs?: number;
-  private nestedToolCalls = 0;
-  private nestedToolNames: string[] = [];
   // Per-call records for the model/user-facing tool subtree (name, one-line
   // target summary, outcome). Reset at the start of each exec.
-  private nestedCallRecords: Array<{ name: string; target?: string; ok: boolean; ms: number }> = [];
-  private nestedResultChars = 0;
-  private nestedResultCount = 0;
-  private nestedErrors = 0;
   private readonly reader: readline.Interface;
   private readyResolve?: () => void;
   private readyReject?: (error: Error) => void;
@@ -236,7 +225,6 @@ class PersistentSessionProtocol {
 
   constructor(
     private proc: ChildProcess,
-    private runTool: RunTool,
     private options: PersistentProtocolOptions
   ) {
     if (!proc.stdout) {
@@ -341,18 +329,10 @@ class PersistentSessionProtocol {
   private buildDetails(overrides?: Partial<ExecutionDetails>): ExecutionDetails {
     return {
       execId: this.execId,
-      nestedToolCalls: this.nestedToolCalls,
-      nestedToolNames: [...this.nestedToolNames],
-      nestedCallRecords: [...this.nestedCallRecords],
-      nestedResultChars: this.nestedResultChars,
-      nestedResultCount: this.nestedResultCount,
-      nestedErrors: this.nestedErrors,
       durationMs: Date.now() - this.execStartedAt,
-      estimatedAvoidedTokens: estimateTokensFromChars(this.nestedResultChars),
       currentLine: this.currentLine,
       totalLines: this.totalLines,
       userCode: this.chunkLines,
-      activeTool: this.activeTool,
       subagentSnapshot: this.lastSubagentSnapshot,
       ...overrides,
     };
@@ -400,51 +380,6 @@ class PersistentSessionProtocol {
       case "session_ready":
         this.resolveReady();
         return;
-
-      case "tool_call": {
-        const tool = msg.tool as string;
-        const callId = msg.id as string;
-        this.nestedToolCalls += 1;
-        this.nestedToolNames.push(tool);
-        this.activeTool = tool;
-        const callStartedAt = Date.now();
-        this.emitUpdate();
-        try {
-          const result = await this.runTool(tool, msg.params, callId);
-          const normalized = normalizeToolResult(
-            tool,
-            result as { content?: Array<Record<string, unknown>>; details?: unknown }
-          );
-          this.nestedResultChars += normalized.estimatedChars;
-          this.nestedResultCount += 1;
-          this.nestedCallRecords.push({
-            name: tool,
-            target: summarizeToolTarget(msg.params),
-            ok: true,
-            ms: Date.now() - callStartedAt,
-          });
-          this.send({ type: "tool_result", id: callId, value: normalized.value });
-        } catch (error) {
-          this.nestedErrors += 1;
-          this.nestedCallRecords.push({
-            name: tool,
-            target: summarizeToolTarget(msg.params),
-            ok: false,
-            ms: Date.now() - callStartedAt,
-          });
-          this.send({
-            type: "tool_result",
-            id: callId,
-            error: {
-              type: error instanceof Error ? error.name : "Error",
-              message: error instanceof Error ? error.message : String(error),
-            },
-          });
-        } finally {
-          this.activeTool = undefined;
-        }
-        return;
-      }
 
       case "execution_progress":
         this.currentLine = msg.line as number;
@@ -589,6 +524,8 @@ class PersistentSessionProtocol {
       }
 
       default:
+        this.failAllPending(new PtcProtocolError(`Unsupported notebook transport frame: ${msg.type}`));
+        this.options.sendSignal("SIGTERM");
         return;
     }
   }
@@ -746,9 +683,7 @@ class PersistentSessionProtocol {
   }
 
   private describeProgress(): string {
-    if (this.activeTool) {
-      return `Calling ${this.activeTool}()`;
-    }
+
     if (this.currentLine !== undefined && this.totalLines) {
       return `Executing line ${this.currentLine}/${this.totalLines}`;
     }
@@ -838,9 +773,7 @@ class PersistentSessionProtocol {
     this.liveLastEmitAt = 0;
     this.currentLine = undefined;
     this.totalLines = undefined;
-    this.activeTool = undefined;
     this.lastSubagentSnapshot = undefined;
-    this.nestedCallRecords = [];
 
     const sourcePath = this.cellFile;
     const sourceCellIndex = this.sourceCellIndex;
@@ -1133,23 +1066,7 @@ function extractNotebookCellOutput(cell: Record<string, unknown>): string {
  * One-line identifying summary of a bridged tool call's primary parameter
  * (path, pattern, command, ...) for the tool subtree renderer.
  */
-function summarizeToolTarget(params: unknown): string | undefined {
-  try {
-    if (!params || typeof params !== "object") return undefined;
-    const record = params as Record<string, unknown>;
-    const preferred = ["path", "file_path", "pattern", "command", "notebook", "name", "query"];
-    for (const key of preferred) {
-      const value = record[key];
-      if (typeof value === "string" && value.trim()) return truncateTarget(value.trim());
-    }
-    for (const value of Object.values(record)) {
-      if (typeof value === "string" && value.trim()) return truncateTarget(value.trim());
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
-}
+
 
 function truncateTarget(value: string): string {
   return value.length > 48 ? `${value.slice(0, 47)}...` : value;
@@ -1268,7 +1185,6 @@ export class PythonSessionManager {
 
   constructor(
     private sandboxManager: SandboxManager,
-    private toolRegistry: ToolRegistry,
     private settings: PtcSettings,
     private extensionRoot: string,
     private hooks: PythonSessionManagerHooks = {}
@@ -1544,17 +1460,10 @@ export class PythonSessionManager {
     pythonExecutable?: string;
   }): { proc: ChildProcess; protocol: PersistentSessionProtocol } {
     const { sessionId, cwd } = params;
-    const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
-      ctx: params.ctx,
-      signal: params.signal,
-      parentToolCallId: params.parentToolCallId,
-    });
     const { rpcCode, runtimeCode, sessionCode } = loadPythonRuntimeSources(this.extensionRoot);
     const prelude = buildSessionPrelude({
       sessionId,
-      toolWrappers: generateToolWrappers(callableToolRuntime.tools),
       runtime: { rpcCode, runtimeCode, sessionCode },
-      maxParallelToolCalls: this.settings.maxParallelToolCalls,
       // session-prelude's legacy field name feeds the runtime's sole emergency
       // capture valve; it is no longer a model-facing output limit.
       maxOutputChars: this.settings.maxSpoolChars,
@@ -1564,7 +1473,7 @@ export class PythonSessionManager {
     });
 
     const proc = this.spawnSession(prelude, cwd, params.pythonExecutable);
-    const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
+    const protocol = new PersistentSessionProtocol(proc, {
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
       sendSignal: (signal) => {
         this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);

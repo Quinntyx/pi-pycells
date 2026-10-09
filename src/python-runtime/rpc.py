@@ -4,12 +4,10 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
-"""JSONL RPC client for the PTC Python runtime.
+"""JSONL control transport for the persistent notebook runtime.
 
-Tool calls are written to stdout as {"type": "tool_call", ...} frames and
-answered by the host on stdin. The same stdin carries host-initiated
-exec/export_script/inspect frames for persistent-session mode, dispatched to a
-registered exec handler. Malformed frames are skipped and logged; the client
+Host-initiated exec/export_script/inspect frames are dispatched to a registered
+execution handler. There is no Python-to-host-tool request channel. Malformed frames are skipped and logged; the client
 disconnects only on EOF or 100 consecutive malformed frames.
 """
 
@@ -32,18 +30,6 @@ if sys.version_info < (3, 10):
 # stream that produces this many consecutive bad frames is genuinely broken
 # (e.g. a binary blob piped into the protocol) and must not be spun on forever.
 _MAX_CONSECUTIVE_MALFORMED_FRAMES = 100
-
-
-class ToolCallError(Exception):
-    """Raised when a tool call returns an error payload: the message includes the
-    host-provided stack trace when present, and .payload keeps the original dict."""
-
-    def __init__(self, payload: Dict[str, Any]):
-        self.payload = payload
-        message = str(payload.get("message") or "Tool call failed")
-        stack = payload.get("stack")
-        formatted = f"{message}\n{stack}" if isinstance(stack, str) and stack else message
-        super().__init__(formatted)
 
 
 class RpcProtocolError(Exception):
@@ -86,15 +72,11 @@ async def _connect_stdin_reader(reader: asyncio.StreamReader, stdin: Any = None)
 
 
 class RpcClient:
-    """Request/response client over stdin/stdout JSONL frames, plus dispatch of
+    """Notebook control client over stdin/stdout JSONL frames, dispatching
     host-initiated exec-family frames in persistent-session mode."""
 
-    def __init__(self, default_call_timeout: float = 300.0):
-        self.call_id = 0
-        # Per-call timeout for tool calls (seconds). Host alignment is handled
-        # elsewhere; 300s remains the default so behavior is unchanged.
-        self.default_call_timeout = default_call_timeout
-        self.pending_calls: Dict[str, asyncio.Future[Any]] = {}
+    def __init__(self):
+        self.error: Exception | None = None
         self.reader_task: Optional[asyncio.Task[Any]] = None
         # Persistent-session mode: the host sends {"type":"exec",...} frames on
         # the same stdin pipe; a registered handler receives them.
@@ -112,12 +94,8 @@ class RpcClient:
         """Start the background stdin reader task."""
         self.reader_task = asyncio.create_task(self._stdin_reader())
 
-    def _fail_pending_calls(self, error: Exception) -> None:
-        """Fail and clear every in-flight call with `error`."""
-        for future in self.pending_calls.values():
-            if not future.done():
-                future.set_exception(error)
-        self.pending_calls.clear()
+    def _record_failure(self, error: Exception) -> None:
+        self.error = error
 
     async def _stdin_reader(self) -> None:
         """Read stdin until EOF: route responses to pending calls, hand exec-family
@@ -131,7 +109,7 @@ class RpcClient:
             while True:
                 line = await reader.readline()
                 if not line:
-                    self._fail_pending_calls(RpcProtocolError("RPC host closed stdin while tool calls were pending"))
+                    self._record_failure(RpcProtocolError("Notebook host closed stdin"))
                     break
 
                 try:
@@ -149,7 +127,7 @@ class RpcClient:
                         file=sys.stderr,
                     )
                     if malformed_streak >= _MAX_CONSECUTIVE_MALFORMED_FRAMES:
-                        self._fail_pending_calls(
+                        self._record_failure(
                             RpcProtocolError(
                                 f"RPC stream produced {malformed_streak} consecutive malformed frames; giving up"
                             )
@@ -166,7 +144,7 @@ class RpcClient:
                         file=sys.stderr,
                     )
                     if malformed_streak >= _MAX_CONSECUTIVE_MALFORMED_FRAMES:
-                        self._fail_pending_calls(
+                        self._record_failure(
                             RpcProtocolError(
                                 f"RPC stream produced {malformed_streak} consecutive undecodable frames; giving up"
                             )
@@ -176,67 +154,21 @@ class RpcClient:
         except asyncio.CancelledError:
             pass
         except Exception as error:
-            self._fail_pending_calls(error if isinstance(error, Exception) else RpcProtocolError(str(error)))
+            self._record_failure(error if isinstance(error, Exception) else RpcProtocolError(str(error)))
             print(f"stdin reader error: {error}", file=sys.stderr)
         finally:
             self.disconnected.set()
 
     def _handle_response(self, response: Dict[str, Any]) -> None:
-        """Dispatch one decoded frame: exec-family frames go to the handler;
-        anything else resolves the pending call with the matching id (an `error`
-        dict becomes ToolCallError)."""
-        if response.get("type") in ("exec", "export_script", "inspect", "doc"):
-            handler = self.exec_handler
-            if handler is not None:
-                handler(response)
-            return
-        call_id = response.get("id")
-        if call_id and call_id in self.pending_calls:
-            future = self.pending_calls[call_id]
-            if not future.done():
-                error = response.get("error")
-                if isinstance(error, dict):
-                    future.set_exception(ToolCallError(error))
-                elif error:
-                    future.set_exception(Exception(str(error)))
-                else:
-                    future.set_result(response.get("value"))
-            del self.pending_calls[call_id]
-
-    async def call(self, tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
-        """Invoke a host tool and await its result value. Raises ToolCallError (or
-        a plain Exception) for error replies, and Exception on timeout (per-call
-        `timeout` in seconds, default 300)."""
-        self.call_id += 1
-        call_id = f"call_{self.call_id}"
-        request = {
-            "type": "tool_call",
-            "id": call_id,
-            "tool": tool,
-            "params": params,
-        }
-
-        # Register before writing so a fast host response can never be dropped.
-        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self.pending_calls[call_id] = future
-        try:
-            protocol_write = globals().get("_ptc_protocol_write")
-            if callable(protocol_write):
-                protocol_write(request)
-            else:
-                print(json.dumps(request), flush=True)
-
-            try:
-                effective_timeout = self.default_call_timeout if timeout is None else timeout
-                return await asyncio.wait_for(future, timeout=effective_timeout)
-            except asyncio.TimeoutError as error:
-                raise Exception(f"Tool call '{tool}' timed out") from error
-        finally:
-            self.pending_calls.pop(call_id, None)
+        """Only dispatch notebook control frames; no host-tool invocation channel."""
+        if response.get("type") not in ("exec", "export_script", "inspect", "doc"):
+            raise RpcProtocolError(f"Unsupported notebook control frame: {response.get('type')}")
+        if self.exec_handler is not None:
+            self.exec_handler(response)
 
     async def cleanup(self) -> None:
-        """Fail pending calls and cancel the reader task. Idempotent."""
-        self._fail_pending_calls(RpcProtocolError("RPC client shut down"))
+        """Cancel the notebook control reader. Idempotent."""
+        self._record_failure(RpcProtocolError("RPC client shut down"))
         if self.reader_task:
             self.reader_task.cancel()
             try:
@@ -251,11 +183,3 @@ _rpc = RpcClient()
 # Per-cell tool-call ledger. session.py clears this at the start of each exec
 # and summarizes it into the cell's model-facing `tools:` section, so the model
 # can see which Pi tools a cell used and how often.
-cell_tool_calls: list[str] = []
-
-
-async def _rpc_call(tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
-    """Call a host tool, first recording it in the per-cell tool-call ledger
-    (cell_tool_calls) that feeds the model-facing `tools:` section."""
-    cell_tool_calls.append(tool)
-    return await _rpc.call(tool, params, timeout=timeout)

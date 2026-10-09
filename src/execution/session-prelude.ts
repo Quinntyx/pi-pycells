@@ -2,9 +2,7 @@ import type { PythonRuntimeSources } from "./runtime-assets";
 
 export interface SessionPreludeOptions {
   sessionId: string;
-  toolWrappers: string;
   runtime: PythonRuntimeSources;
-  maxParallelToolCalls: number;
   maxOutputChars: number;
   hostWorkspaceRoot: string;
   runtimeWorkspaceRoot: string;
@@ -12,16 +10,14 @@ export interface SessionPreludeOptions {
 }
 
 /**
- * Builds the persistent interpreter program: rpc bridge + tool wrappers +
+ * Builds the persistent interpreter program: notebook transport +
  * runtime helpers + (conditional) pi_subagents autoimport + the session exec
  * loop. One interpreter serves many `exec_cell` cells.
  */
 export function buildSessionPrelude(options: SessionPreludeOptions): string {
   const {
     sessionId,
-    toolWrappers,
     runtime,
-    maxParallelToolCalls,
     maxOutputChars,
     hostWorkspaceRoot,
     runtimeWorkspaceRoot,
@@ -44,9 +40,6 @@ except Exception as _ptc_auto_error:
   return `
 ${runtime.rpcCode}
 
-${toolWrappers}
-
-PTC_MAX_PARALLEL_TOOL_CALLS = ${maxParallelToolCalls}
 PTC_MAX_OUTPUT_CHARS = ${maxOutputChars}
 PTC_HOST_WORKSPACE_ROOT = ${JSON.stringify(hostWorkspaceRoot)}
 PTC_RUNTIME_WORKSPACE_ROOT = ${JSON.stringify(runtimeWorkspaceRoot)}

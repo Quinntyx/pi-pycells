@@ -22,16 +22,7 @@ No. There is no pi-profiles *package* dependency anywhere in pi-pycells, and ker
 
 ### Does it work without tmux?
 
-Kernels and cells: yes, fully. The extension loads and `provision_kernel`/`exec_cell` work with `TMUX` unset — including nested tool calls and `ptc.*` helpers.
-
-Subagent orchestration: no, and it degrades gracefully. Per the `envcheck.py` contract in pi-subagents, `import pi_subagents` emits a one-time stderr warning (`ENV_OK = False`) and every API call raises `NotImplementedError`:
-
-```
-result: ✗ demo-1 (demo) · NotImplementedError: pi_subagents: not running inside a tmux session —
-subagent spawning is unavailable here. Run this script inside tmux to spawn subagents.
-```
-
-This surfaces as a failed per-agent pool result, not a cell crash — the cell completes normally, and the subagent footer/panels simply never activate.
+Kernels and cells work without tmux. Subagents still require their SDK transport setup.
 
 ### Does activity tracking require pi-tool-tree?
 
@@ -55,7 +46,7 @@ No. Python cells run as a local subprocess and can spawn arbitrary child process
 
 ### Why does calling `bash(...)` in a cell raise `NameError: name 'bash' is not defined`?
 
-`bash` and mutating tools (`edit`/`write`) are bridged with no opt-in. Filtering them was dropped as futile — cells can run `os.system`/`subprocess` and edit files natively (yolo mode). Use `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` if you want to reshape the callable set.
+Host tools are no longer bridged into Python. Use `subprocess` in a cell, or call the native `bash` tool from the parent agent.
 
 ### `provision_kernel` fails with a "PTC Python environment not found" error — what's wrong?
 
@@ -105,25 +96,11 @@ Not extension-related. With a fresh `PI_CODING_AGENT_DIR` and no model auth, pi 
 
 ### Which environment variables does it read?
 
-All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
-
-**Required:** none — all variables are optional. (The former mandatory `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` gate was removed; kernels run unsandboxed.)
-
-**Tools/policy:** `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`.
-
-**Routing/recovery/sessions:** `PTC_AUTO_ROUTE` (true), `PTC_AUTO_RECOVER` (false), `PTC_AUTO_RECOVER_MAX_ATTEMPTS` (1, parsed 0–4), `PTC_MAX_PYTHON_SESSIONS` (4, clamped 1–32; enforcement currently disabled), `PTC_DEBUG` (false — `[PTC]` debug lines), `PTC_SUBAGENT_FOOTER` (true).
-
-**Output/limits:** `PTC_OUTPUT_PREVIEW_CHARS` (12 000), `PTC_MAX_OUTPUT_CHARS` (legacy alias), `PTC_MAX_SPOOL_CHARS` (10 000 000), `PTC_EXECUTION_TIMEOUT_MS` (270 000), `PTC_MAX_PARALLEL_TOOL_CALLS` (8).
-
-**Paths:** `PTC_LIBRARY_DIR` (default `$PI_CODING_AGENT_DIR/pycells-library`), `PTC_PYTHON_EXECUTABLE`, `PTC_EVALS_PATH` (`.pi/evals/ptc`), `PTC_SCRIPTS_DIR` (**parsed but never used** — no effect; script export hardcodes `./.pi/scripts`).
-
-**Subagents:** `PTC_SUBAGENTS_REPO_URL`, `PTC_SUBAGENTS_SOURCE`, `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` (24).
-
-**Non-`PTC_` vars:** `PI_CODING_AGENT_DIR` (moves `pycells-library` and pi's own config), `PI_SUBAGENT_DEPTH` (set by pi on spawned subagents — skips provisioning and the `pi_subagents` autoimport; spawned agents can't spawn agents), and `PI_CODING_SUBAGENT_DIR` (read by pi-subagents itself — separate agent dir for spawned subagents).
+See [configuration.md](configuration.md) for supported notebook, recovery, output and subagent settings. Former bridge allowlists, concurrency and auto-routing flags are removed.
 
 ### What happens if I set a nonsense value for a `PTC_*` variable?
 
-Nothing — silently. Garbage values are swallowed by lenient parsing (`src/utils.ts:10-58`): booleans are true only for `1/true/yes/on`; `parseInt` semantics mean `12abc` → 12 (so `PTC_EXECUTION_TIMEOUT_MS=270_000` becomes 270); `0` fails the `> 0` check and falls back to the default (8 for parallel calls); `999` sessions clamps to 32. Nothing is ever reported. A run with `PTC_AUTO_ROUTE=banana PTC_MAX_PARALLEL_TOOL_CALLS=0 PTC_MAX_PYTHON_SESSIONS=999 PTC_MAX_OUTPUT_CHARS=-5 PTC_MAX_SPOOL_CHARS=oink PTC_EXECUTION_TIMEOUT_MS=hotdog` loaded, ran a kernel, and produced normal output.
+Supported numeric and boolean settings use documented fallback/clamping rules. Retired bridge settings are ignored and cannot re-enable host-tool calls.
 
 ### Why does my cell keep getting interrupted with `KeyboardInterrupt`?
 
@@ -145,11 +122,11 @@ No. A second pi session on the same notebook got `NameError: name 'persistent_va
 
 ### My kernel hangs when I use `subprocess` in a cell — why?
 
-Children spawned from a cell inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout can corrupt the protocol and hang the kernel. Always pass `stdin=subprocess.DEVNULL, capture_output=True` (see `docs/tool-bridge.md`).
+Children spawned from a cell inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout can corrupt the protocol and hang the kernel. Always pass `stdin=subprocess.DEVNULL, capture_output=True` (see [Python execution boundary](python-runtime.md)).
 
 ### Which host tools can my Python code call, and how do I get more?
 
-By default the read-only builtins are bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see `docs/tool-bridge.md`). Nothing is gated. (Historical note: tools excluded via `PTC_BLOCKED_TOOLS`/`PTC_CALLABLE_TOOLS` show up as bare `NameError`s — see above.)
+None. The bridge has been removed. Use standard Python libraries or invoke native Pi tools outside the cell.
 
 ### Where does the notebook library live?
 

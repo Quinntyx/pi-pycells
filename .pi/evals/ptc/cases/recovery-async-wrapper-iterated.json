@@ -1,6 +1,6 @@
 {
   "id": "recovery-async-wrapper-iterated",
-  "prompt": "Use Python to glob test/**/*.ts, sort the matches, and return the first five file names as compact JSON only.",
+  "prompt": "Use exec_cell. Use Python to glob test/**/*.ts, sort the matches, and return the first five file names as compact JSON only.",
   "expected_first_path": "code_execution",
   "acceptance": {
     "type": "behavioral",

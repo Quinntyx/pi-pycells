@@ -4,12 +4,12 @@ import os as _ptc_os
 import sys as _ptc_sys
 import time as _ptc_time
 import traceback as _ptc_traceback
-from typing import Any, Callable, Coroutine, Iterable, Sequence
+from typing import Any, Callable
 
 """Cell-execution plumbing for the PTC Python kernel: stdout proxy, progress
-tracing, output serialization, and the `ptc` helpers exposed to user code.
+tracing, output serialization, and normal numerical/plot imports.
 
-The host-built combined script concatenates rpc.py + tool wrappers + this
+The host-built combined script concatenates notebook control transport + this
 module + user_main, then runs ``_runtime_main`` (one-shot) or session.py's
 persistent exec loop (PTC_MODE == "session"). Names defined here are runtime
 plumbing and are excluded from kernel digests.
@@ -202,97 +202,6 @@ def _trace_lines(frame, event, arg):
     _current_line = lineno
     _report_execution_progress(lineno)
     return _trace_lines
-
-
-def _host_abspath(path: str) -> str:
-    """Map a runtime-side path to its host-side absolute path: paths under the
-    runtime workspace root are re-rooted onto the host workspace root, other
-    absolute paths pass through, and relative paths resolve against the host root."""
-    if _ptc_os.path.isabs(path):
-        runtime_root = _ptc_os.path.normpath(_PTC_RUNTIME_WORKSPACE_ROOT)
-        normalized = _ptc_os.path.normpath(path)
-        if normalized == runtime_root or normalized.startswith(f"{runtime_root}{_ptc_os.sep}"):
-            relative_path = _ptc_os.path.relpath(normalized, runtime_root)
-            return _ptc_os.path.normpath(_ptc_os.path.join(_PTC_HOST_WORKSPACE_ROOT, relative_path))
-        return normalized
-
-    return _ptc_os.path.normpath(_ptc_os.path.join(_PTC_HOST_WORKSPACE_ROOT, path))
-
-
-class _PtcHelpers:
-    """Backing object of the `ptc` namespace available in user cells: bounded
-    parallel gather plus glob/read conveniences that call the host tools over RPC."""
-
-    def __init__(self, max_parallel_tool_calls: int):
-        self.max_parallel_tool_calls = max(1, max_parallel_tool_calls)
-
-    async def gather_limit(self, coroutines: Iterable[Coroutine[Any, Any, Any]], limit: int | None = None):
-        """gather() the coroutines under a semaphore (default: max_parallel_tool_calls)."""
-        semaphore = _ptc_asyncio.Semaphore(max(1, limit or self.max_parallel_tool_calls))
-
-        async def _runner(coro: Coroutine[Any, Any, Any]):
-            async with semaphore:
-                return await coro
-
-        return await _ptc_asyncio.gather(*[_runner(coro) for coro in coroutines])
-
-    async def find_files(self, pattern: str, path: str = ".", max_files: int = 1000) -> Sequence[str]:
-        """Glob for files via the host `glob` tool; returns up to `max_files`
-        (default 1000) paths as the tool reports them."""
-        return await glob(pattern=pattern, path=path, limit=max_files)
-
-    async def find_files_abs(self, pattern: str, path: str = ".", max_files: int = 1000) -> Sequence[str]:
-        """Like find_files, but every returned path is made absolute (host-side)."""
-        files = await self.find_files(pattern=pattern, path=path, max_files=max_files)
-        base_path = _host_abspath(path)
-        return [item if _ptc_os.path.isabs(item) else _ptc_os.path.join(base_path, item) for item in files]
-
-    async def read_text(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
-        """Read one file via the host `read` tool, with optional line offset/limit."""
-        return await read(path=path, offset=offset, limit=limit)
-
-    async def read_many(
-        self,
-        paths: Sequence[str],
-        max_concurrency: int | None = None,
-        *,
-        offset: int | None = None,
-        line_limit: int | None = None,
-    ) -> Sequence[str]:
-        """Read many files concurrently, sharing one optional offset/line_limit;
-        `max_concurrency` bounds parallelism (default: max_parallel_tool_calls)."""
-        return await self.gather_limit(
-            [read(path=path, offset=offset, limit=line_limit) for path in paths],
-            limit=max_concurrency,
-        )
-
-    async def read_tree(
-        self,
-        pattern: str,
-        path: str = ".",
-        max_files: int = 1000,
-        concurrency: int | None = None,
-        offset: int | None = None,
-        line_limit: int | None = None,
-    ) -> Sequence[dict[str, Any]]:
-        """Glob + batched read in one call; returns [{"path", "content"}, ...]
-        aligned with the found files."""
-        files = await self.find_files_abs(pattern=pattern, path=path, max_files=max_files)
-        contents = await self.read_many(files, max_concurrency=concurrency, offset=offset, line_limit=line_limit)
-        return [
-            {
-                "path": file_path,
-                "content": content,
-            }
-            for file_path, content in zip(files, contents)
-        ]
-
-    def json_dump(self, value: Any) -> str:
-        """JSON-serialize with indent=2, sorted keys, and non-ASCII preserved."""
-        return _ptc_json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
-
-
-ptc = _PtcHelpers(globals().get("PTC_MAX_PARALLEL_TOOL_CALLS", 8))
 
 
 class _LazyModuleProxy:

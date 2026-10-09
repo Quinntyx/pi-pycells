@@ -29,13 +29,11 @@ The shared venv is the same one the pi_subagents provisioner creates (`uv venv -
 - `cleanup()` sends `SIGTERM` to all tracked children, waits up to 1 s (`PROCESS_TERMINATION_GRACE_MS`), then `SIGKILL`s survivors and waits again (`src/sandbox-manager.ts:84-102`).
 - The `SandboxManager` contract is evolving; `python-session-manager.ts` keeps a compatibility shim for older manager implementations whose `spawn` takes a single options object (detected via `fn.length`). Subagent agent-dir selection is purely env-driven (`PI_CODING_SUBAGENT_DIR` / `PI_CODING_AGENT_DIR`, inherited by kernels).
 
-### What's blocked by default (tool policy)
+### Host-tool boundary
 
-Independently of the subprocess gate, the tool registry (`src/tool-registry.ts:236-250`) gates which pi tools are callable:
-
-- All bridged tools — builtins, `bash`, mutating tools like `edit`/`write` — are callable by default; custom tools must opt in via `ptc: { enabled: true, ... }`. Only `PTC_CALLABLE_TOOLS`/`PTC_BLOCKED_TOOLS` reshape the set.
-
-So a fresh install out of the box gives Python read-only access to your repo through the pi tool helpers — no shell, no file writes from the model. The subprocess itself, however, runs unsandboxed on your host.
+Python executes on the local host, not in a security sandbox. Cells use Python
+libraries directly; Pi host tools have no Python RPC bridge. File and process
+access through `pathlib`, `open`, and `subprocess` remain possible.
 
 ## Usage
 
@@ -50,7 +48,8 @@ Then a typical cell (executed via the `exec_cell` tool) reads files through the 
 
 ```python
 # inside exec_cell — Python runs as a host subprocess in the workspace cwd
-files = ptc.read_many(glob("src/**/*.ts"))
+from pathlib import Path
+files = [p.read_text() for p in Path("src").rglob("*.ts")]
 
 lines = sum(f.count("\n") for f in files)
 print(f"{len(files)} files, {lines} lines")

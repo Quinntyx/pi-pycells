@@ -4,20 +4,19 @@ import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import type { LoadedTool, PtcToolDefinition } from "./contracts/tool-types";
-import { getExplicitCallers, PTC_TOOL_NAMES } from "./contracts/tool-types";
-import { BUILTIN_TOOL_NAMES } from "./tools/python-tool-contract";
-import type { ToolRegistry } from "./tool-registry";
+import { KERNEL_TOOL_NAMES } from "./contracts/tool-types";
+const BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "bash", "edit", "write", "find", "grep", "ls", "glob"]);
 import { debugLog, logWarning, withActivityLabel } from "./utils";
 
 /**
  * Names a custom tool may never claim: colliding with a builtin would make the
  * custom tool inherit the builtin's classification and fabricated result types
- * (review item L6), while colliding with a registered PTC tool would shadow
+ * (review item L6), while colliding with a registered kernel tool would shadow
  * the extension's own machinery.
  */
 const RESERVED_CUSTOM_TOOL_NAMES: ReadonlySet<string> = new Set([
   ...BUILTIN_TOOL_NAMES,
-  ...PTC_TOOL_NAMES,
+  ...KERNEL_TOOL_NAMES,
 ]);
 
 /** Monotonically increasing counter used to cache-bust custom tool imports. */
@@ -37,7 +36,6 @@ function buildRegisteredTool(definition: PtcToolDefinition): PtcToolDefinition {
     description: definition.description || definition.name,
     parameters: definition.parameters,
     execute: definition.execute,
-    ptc: definition.ptc,
   };
 }
 
@@ -52,6 +50,7 @@ function isCustomToolDefinition(value: unknown): value is PtcToolDefinition {
   }
 
   const candidate = value as Partial<PtcToolDefinition>;
+  if ("ptc" in candidate) return false; // Legacy Python bridge metadata is unsupported.
   return (
     typeof candidate.name === "string" &&
     typeof candidate.execute === "function" &&
@@ -152,7 +151,6 @@ export class CustomToolManager {
   constructor(
     extensionRoot: string,
     private pi: ExtensionAPI,
-    private toolRegistry: ToolRegistry,
     private onToolSetChanged?: () => void
   ) {
     this.toolsDir = path.join(extensionRoot, "tools");
@@ -263,14 +261,6 @@ export class CustomToolManager {
   }
 
   private setToolActive(toolName: string, tool: PtcToolDefinition): void {
-    // An explicit `ptc.callers` array is authoritative — including an empty
-    // array, which allows no callers at all (review items L3/C4; see
-    // getExplicitCallers in contracts/tool-types).
-    const resolved = getExplicitCallers(tool.ptc);
-    if (resolved.explicit && !resolved.callers.has("direct")) {
-      return;
-    }
-
     const activeTools = this.pi.getActiveTools();
     if (!activeTools.includes(toolName)) {
       this.pi.setActiveTools([...activeTools, toolName]);
@@ -278,7 +268,6 @@ export class CustomToolManager {
   }
 
   private deactivateTool(toolName: string): void {
-    this.toolRegistry.removeTool(toolName);
     const activeTools = this.pi.getActiveTools();
     this.pi.setActiveTools(activeTools.filter((name) => name !== toolName));
   }
@@ -293,7 +282,7 @@ export class CustomToolManager {
 
     if (RESERVED_CUSTOM_TOOL_NAMES.has(tool.name)) {
       throw new Error(
-        `Custom tool file ${filename} declares '${tool.name}', which collides with a reserved builtin/PTC tool name; rejected`
+        `Custom tool file ${filename} declares '${tool.name}', which collides with a reserved builtin/kernel tool name; rejected`
       );
     }
 
@@ -311,7 +300,6 @@ export class CustomToolManager {
       debugLog(`Removed renamed custom tool ${previousToolName} from ${filename}`);
     }
 
-    this.toolRegistry.upsertTool(tool);
     this.pi.registerTool(withActivityLabel(tool));
     this.setToolActive(tool.name, tool);
     this.fileToTool.set(filename, tool.name);

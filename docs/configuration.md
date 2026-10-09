@@ -9,7 +9,7 @@ and where it takes effect.
 ## What it does
 
 One startup read turns your environment into the extension's entire configuration: execution
-timeouts, output-preview sizing, which pi tools Python may call, auto-routing and recovery
+timeouts, output-preview sizing, and optional bounded error recovery
 behavior, kernel and library paths, and the optional pi-subagents integration. Kernels are
 spawned with a copy of the extension's environment (`src/python-session-manager.ts` spawns
 with `env: { ...process.env }`), so the same `PTC_*` variables are also visible inside
@@ -28,15 +28,11 @@ starting a new pi session (or reloading the extension), not just setting it mid-
   - **Clamped integers** (`parseClampedIntEnv`): values outside the documented range are
     clamped, not rejected.
   - **Lists** (`parseListEnv`): comma-separated, trimmed; empty values are treated as unset.
-- The resulting `PtcSettings` object is passed to the tool registry, session manager, sandbox
+- The resulting `PtcSettings` object is passed to the session manager, sandbox
   manager, and panel code. No part of the extension reads a config file or pi settings store;
   environment variables are the only configuration surface.
-- Two settings are additionally injected into each kernel as Python globals at spawn time:
-  `PTC_MAX_PARALLEL_TOOL_CALLS` (from `settings.maxParallelToolCalls`,
-  `src/execution/session-prelude.ts:49`) and the spool ceiling (`settings.maxSpoolChars` →
-  `maxOutputChars`, `src/python-session-manager.ts:1139-1142`). The Python runtime's own env
-  fallbacks (`src/python-runtime/runtime.py:20-22,232`) match the Node defaults, so both
-  paths agree unless you set the env var only inside the kernel — the host-side value wins.
+- The output spool ceiling is injected into each kernel at spawn time.
+  Python cells cannot call Pi host tools; former bridge configuration is removed.
 
 ## Usage
 
@@ -67,7 +63,6 @@ return json.dumps({k: v for k, v in os.environ.items() if k.startswith("PTC_")},
 
 No tools are policy-gated: kernels run unsandboxed as host subprocesses (yolo mode — sandboxing is
 planned, not implemented), so gating the model's tools would be futile enforcement. Only
-`PTC_CALLABLE_TOOLS`/`PTC_BLOCKED_TOOLS` reshape the callable set.
 
 ## Environment variables
 
@@ -81,26 +76,11 @@ that file.
 | `PTC_EXECUTION_TIMEOUT_MS` | positive int | `270000` (4.5 min) | Hard timeout for a full cell execution (host-side, `src/python-session-manager.ts:1368`). |
 | `PTC_OUTPUT_PREVIEW_CHARS` | positive int | `12000` | Model-visible preview size; output beyond this is collapsed to ~70% head / 30% tail with a `read_cell_output` pointer. `PTC_MAX_OUTPUT_CHARS` is accepted as a legacy alias. |
 | `PTC_MAX_SPOOL_CHARS` | positive int | `10000000` | Emergency per-cell capture ceiling; anything below it is persisted in full to the notebook. Not a preview limit. Also enforced inside the Python runtime. |
-| `PTC_MAX_PARALLEL_TOOL_CALLS` | positive int | `8` | Default concurrency for `ptc.gather_limit()` and the runtime's parallel tool-call cap. |
 
-### Tool policy
-
-Tool filtering happens in `ToolRegistry.getCallableTools` (`src/tool-registry.ts`):
-`PTC_BLOCKED_TOOLS` is checked first (denylist always wins), then `PTC_CALLABLE_TOOLS`
-(when set, only listed tools pass). Nothing else is gated — the Python process is
-unsandboxed (yolo mode), so filtering the model's tools (`bash` included) is futile
-enforcement.
+### Recovery and sessions
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_CALLABLE_TOOLS` | comma list | *(unset — all eligible tools)* | Explicit allowlist override. |
-| `PTC_BLOCKED_TOOLS` | comma list | *(unset)* | Explicit denylist; wins over the allowlist. |
-
-### Routing, recovery, sessions
-
-| Variable | Type | Default | Effect |
-|---|---|---|---|
-| `PTC_AUTO_ROUTE` | bool | `true` | Route qualifying prompts (repo-wide analysis, fan-out, "don't flood chat") to `exec_cell` automatically. |
 | `PTC_AUTO_RECOVER` | bool | `false` | Enable one bounded async-only recovery hint after a qualifying failed first `exec_cell` attempt. |
 | `PTC_AUTO_RECOVER_MAX_ATTEMPTS` | clamped int (0–4) | `1` | Cap on automatic recovery attempts per request. |
 | `PTC_MAX_PYTHON_SESSIONS` | clamped int (1–32) | `4` | Parsed for compatibility but enforcement is currently disabled (`src/python-session-manager.ts:1123`). |

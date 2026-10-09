@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseEvalCase, type EvalCase } from "./eval-cases";
 import type { RecoveryFailureClass } from "./recovery-state";
-import { estimateTokensFromChars, shouldAutoRoutePromptToCodeExecution } from "./utils";
+import { estimateTokensFromChars } from "./utils";
 
 /**
  * Exhaustive map over the RecoveryFailureClass union: adding a member to the
@@ -255,15 +255,15 @@ export function loadEvalCasesFromDisk(evalsPath: string, caseIds?: string[]): Ev
 }
 
 /**
- * Offline executor for CI: routes via the same heuristic as production
- * auto-routing but never invokes a model. Recovery/failure-class/output_json
+ * Offline executor for CI: simulates explicit kernel-tool requests only;
+ * production never hides or reroutes native tools. It never invokes a model. Recovery/failure-class/output_json
  * expectations are read from the case's acceptance rules; token counts are
  * ceil(chars/4) of a synthesized char count and durations are char counts —
  * estimates, not real timings.
  */
 export function createDeterministicBenchmarkExecutor(): BenchmarkCaseExecutor {
   return (evalCase, context) => {
-    const observed_first_path: BenchmarkObservedFirstPath = shouldAutoRoutePromptToCodeExecution(evalCase.prompt)
+    const observed_first_path: BenchmarkObservedFirstPath = /\b(?:exec_cell|run_cell|run_all|run_to)\b/.test(evalCase.prompt)
       ? "code_execution"
       : "direct";
     const recoveryExpected = parseBoolean(getRuleExpectation(evalCase.acceptance.rules, "recovery_attempted")) === true;

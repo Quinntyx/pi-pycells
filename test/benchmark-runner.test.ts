@@ -300,7 +300,7 @@ test("deterministic benchmark executor derives recovery hints from eval rules", 
   const observation = await executor(
     {
       id: "recovery-async-wrapper-iterated",
-      prompt: "Count imports across src/**/*.ts and return compact JSON only.",
+      prompt: "Use exec_cell to count imports across src/**/*.ts and return compact JSON only.",
       expected_first_path: "code_execution",
       acceptance: {
         type: "behavioral",

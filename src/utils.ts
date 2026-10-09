@@ -10,7 +10,6 @@ export const DEFAULT_CELL_OUTPUT_LINES = 2_000;
 /** Per-page UTF-8 byte cap for cell output; also the overlong-single-line truncation point. */
 export const DEFAULT_CELL_OUTPUT_BYTES = 50 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 270_000;
-const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 8;
 const DEBUG_PREFIX = "[PTC]";
 
 let debugLoggingEnabled = false;
@@ -46,18 +45,7 @@ function parseClampedIntEnv(value: string | undefined, fallback: number, min: nu
   return Math.min(max, Math.max(min, parsed));
 }
 
-function parseListEnv(value: string | undefined): string[] | undefined {
-  if (!value) {
-    return undefined;
-  }
 
-  const items = value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-  return items.length > 0 ? items : undefined;
-}
 
 function emptyToUndefined(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -80,16 +68,9 @@ export function loadSettingsFromEnv(): PtcSettings {
       DEFAULT_OUTPUT_PREVIEW_CHARS
     ),
     maxSpoolChars: parsePositiveIntEnv(process.env.PTC_MAX_SPOOL_CHARS, DEFAULT_MAX_SPOOL_CHARS),
-    maxParallelToolCalls: parsePositiveIntEnv(
-      process.env.PTC_MAX_PARALLEL_TOOL_CALLS,
-      DEFAULT_MAX_PARALLEL_TOOL_CALLS
-    ),
     debugLogging: parseBooleanEnv(process.env.PTC_DEBUG, false),
-    autoRoute: parseBooleanEnv(process.env.PTC_AUTO_ROUTE, true),
     autoRecover: parseBooleanEnv(process.env.PTC_AUTO_RECOVER, false),
     autoRecoverMaxAttempts: parseClampedIntEnv(process.env.PTC_AUTO_RECOVER_MAX_ATTEMPTS, 1, 0, 4),
-    callableTools: parseListEnv(process.env.PTC_CALLABLE_TOOLS),
-    blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
     maxPythonSessions: parseClampedIntEnv(process.env.PTC_MAX_PYTHON_SESSIONS, 4, 1, 32),
     scriptsDir: emptyToUndefined(process.env.PTC_SCRIPTS_DIR),
     subagentFooter: parseBooleanEnv(process.env.PTC_SUBAGENT_FOOTER, true),
@@ -110,47 +91,7 @@ export function isMutationPrompt(prompt: string): boolean {
   );
 }
 
-/**
- * Heuristic router: true when the prompt looks like a fan-out/aggregation job
- * that belongs in a Python kernel (explicit exec-tool mentions always route;
- * mutation prompts never do). Conservative by design — false negatives are
- * fine, false positives hijack the request.
- */
-export function shouldAutoRoutePromptToCodeExecution(prompt: string): boolean {
-  const normalized = prompt.trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
 
-  // Current tool names (post exec_cell → exec_cell rename); "code_execution"
-  // is kept as an alias because prompts often refer to the execution path.
-  if (/\b(?:use|call|run|invoke) (?:the )?(?:exec_cell|provision_kernel|inspect_kernel|list_kernels|provision_dependency|code_execution)\b/.test(
-    normalized
-  )) {
-    return true;
-  }
-
-  if (isMutationPrompt(normalized)) {
-    return false;
-  }
-
-  const hasFanout =
-    /(?:\*\*\/|\*\.[a-z0-9]+\b|\bglob\b|\bcodebase\b|\brepo\b|\brepository\b|\ball files\b|\bevery file\b|\bentire codebase\b|\bentire repo\b|\bacross (?:the )?(?:repo|codebase)\b|\bfirst \d+\b.*\bfiles?\b|\bmany files\b|\bmultiple files\b|\bfor each\b|\bfor every\b|\beach file\b)/.test(
-      normalized
-    );
-
-  const hasProcessing =
-    /\b(count|group|aggregate|rank|sort|top \d+|summari[sz]e|compare|statistics|histogram|frequency|frequencies|distribution|dedup|filter|tabulate)\b/.test(
-      normalized
-    );
-
-  const hasContextPressure =
-    /\b(compact json|json only|summary only|summaries only|keep intermediate|keep intermediates|stay out of chat|out of chat|without flooding|don't flood)\b/.test(
-      normalized
-    );
-
-  return (hasFanout && (hasProcessing || hasContextPressure)) || (hasProcessing && hasContextPressure);
-}
 
 function countNewlines(text: string): number {
   let count = 0;
@@ -169,7 +110,7 @@ function countNewlines(text: string): number {
 
 /**
  * Column-0 section marker names the host composes/parses in exec results.
- * Note the host also emits a `tools:` section (nested-call summary) that is
+ * Historical notebooks can contain a `tools:` section; it is
  * not listed here.
  */
 export const OUTPUT_SECTION_NAMES = ["output", "return", "kernel", "subagents", "tools"] as const;
@@ -381,7 +322,6 @@ export function estimateTokensFromChars(chars: number): number {
 /**
  * Pre-execution guard for model-authored cells. Throws (before the cell runs)
  * on asyncio.run(...) — top-level await already works — and on direct
- * _rpc_call(...) — generated helpers must be used instead.
  */
 export function validateUserCode(userCode: string): void {
   if (/\basyncio\.run\s*\(/.test(userCode)) {
@@ -390,11 +330,7 @@ export function validateUserCode(userCode: string): void {
     );
   }
 
-  if (/\b_rpc_call\s*\(/.test(userCode)) {
-    throw new Error(
-      "Use the generated helper functions such as read(), glob(), find(), grep(), ls(), or ptc.read_many() instead of calling _rpc_call(...) directly."
-    );
-  }
+
 }
 
 function formatLogMessage(message: string, args: unknown[]): string {
