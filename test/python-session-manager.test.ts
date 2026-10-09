@@ -782,52 +782,6 @@ test("session manager: bare source names resolve from the configured library dir
   }
 });
 
-test("promoteToSkillNotebook copies the complete notebook, sanitizes names, and refuses overwrite", async () => {
-  const { execFileSync } = require("node:child_process");
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-promote-"));
-  const libraryDir = path.join(tempDir, "library");
-  const notebookPath = path.join(tempDir, "session.ipynb");
-  const notebook = {
-    cells: [
-      { cell_type: "markdown", metadata: {}, source: ["# Why this works\n"] },
-      {
-        cell_type: "code",
-        execution_count: 1,
-        metadata: { ptc_full_output: "Out[1]: 42" },
-        outputs: [{ output_type: "execute_result", execution_count: 1, data: { "text/plain": ["42"] }, metadata: {} }],
-        source: ["6 * 7\n"],
-      },
-    ],
-    metadata: { custom: "preserved" },
-    nbformat: 4,
-    nbformat_minor: 5,
-  };
-  fs.writeFileSync(notebookPath, JSON.stringify(notebook, null, 2));
-  const { manager } = makeFakeManager({ settingsOverrides: { libraryDir } });
-  try {
-    await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
-    const promoted = await manager.promoteToSkillNotebook({ name: "../My Fancy_SKILL.ipynb", cwd: tempDir });
-    assert.equal(promoted.name, "my-fancy-skill");
-    assert.equal(promoted.path, path.join(libraryDir, "my-fancy-skill.ipynb"));
-    assert.equal(fs.readFileSync(promoted.path, "utf8"), fs.readFileSync(notebookPath, "utf8"));
-    assert.deepEqual(JSON.parse(fs.readFileSync(promoted.path, "utf8")).cells, notebook.cells);
-
-    await assert.rejects(
-      manager.promoteToSkillNotebook({ name: "My Fancy Skill", cwd: tempDir }),
-      /already exists.*overwrite: true/
-    );
-    const overwritten = await manager.promoteToSkillNotebook({
-      name: "My Fancy Skill",
-      cwd: tempDir,
-      overwrite: true,
-    });
-    assert.equal(overwritten.overwritten, true);
-  } finally {
-    await manager.disposeAll();
-    execFileSync("trash", ["--", tempDir]);
-  }
-});
-
 test("session manager: startup failure terminates an interpreter that never became ready", async () => {
   const { manager, terminations } = makeFakeManager({ startup: "exit" });
   await assert.rejects(

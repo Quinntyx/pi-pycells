@@ -38,7 +38,7 @@ test("individual delegation is the default and counts do not imply a workflow", 
     .toLowerCase().replace(/\s+/g, " ");
   for (const term of ["default to lightweight delegation", "does not request a workflow",
       "agent count alone", "user explicitly requests a workflow", "scope is large enough",
-      "do not expand a request for n agents to 3c tasks", "total-launch cap"])
+      "do not expand a request for n agents to 2c tasks", "total-launch cap"])
     assert.ok(select.includes(term), term);
   const contract = section("## Input Contract", skill).toLowerCase();
   assert.ok(!contract.includes("forgejo"));
@@ -73,7 +73,7 @@ test("implementation protocol is progressively loaded only in selected workflow 
   const initial = section("## Stage 3: Author and submit the initial cohort", workflow)
     .toLowerCase().replace(/\s+/g, " ");
   assert.ok(initial.includes("preserve an explicit requested builder count n"));
-  assert.ok(initial.includes("natural smaller cohort or return to lightweight delegation"));
+  assert.ok(initial.includes("smaller power-of-two cohort or return to lightweight delegation"));
 });
 
 test("lightweight completion retains active sessions and closes only its finished pool", () => {
@@ -94,12 +94,12 @@ test("builders explore subsystems in worktrees rather than implementing file all
   assert.ok(prose.includes("do not invent a delivery deadline"));
 });
 
-test("initial 3C Build items use submit_all without a maintained ready-frontier quota", () => {
+test("initial 2C Build items use submit_all without a maintained ready-frontier quota", () => {
   const author = section("## Stage 3: Author and submit the initial cohort");
-  assert.match(author, /3C initial Build items/);
+  assert.match(author, /2C initial Build items/);
   assert.match(author, /build\.submit_all/);
-  assert.match(author, /not 3C simultaneously running/);
-  assert.ok(prose.includes("not maintain a predictive 3c frontier"));
+  assert.match(author, /not 2C simultaneously running/);
+  assert.ok(prose.includes("not maintain a predictive 2c frontier"));
   assert.ok(prose.includes("do not refill") || prose.includes("or refill merely"));
   assert.ok(prose.includes("live admission remains c"));
 });
@@ -128,7 +128,8 @@ test("merge reduction uses same-depth buckets and repair only for actual merge o
   for (const term of ["same depth", "ordinary git merge", "depth d+1", "flat",
       "do not spawn merge agents by default", "textual conflicts", "ci failure after merge",
       "semantic incompatibility", "build repair", "five-cycle", "no intermediate agent pass",
-      "atomically claim", "quiescent", "one orphan carry at a level", "multiple levels"])
+      "atomically claim", "no merge orphans", "equal-depth siblings", "never carry a",
+      "all n original contributors", "depth log2(n)"])
     assert.ok(merge.includes(term), term);
 });
 
@@ -145,7 +146,7 @@ test("final review covers the whole tree with an independent five-cycle gate", (
 test("large worktree counts are allowed and all remote/local recovery nodes survive until completion", () => {
   const retention = section("## Stage 7: Retention, cleanup and handoff")
     .toLowerCase().replace(/\s+/g, " ");
-  for (const term of ["entire workflow", "do not delete", "6c-1", "authorized",
+  for (const term of ["entire workflow", "do not delete", "4c-1", "authorized",
       "not a reason to lower c", "sccache", "only then", "remote branches", "unmerged",
       "blocked requested subsystem", "retain recoverable state"])
     assert.ok(retention.includes(term), term);
@@ -165,41 +166,34 @@ test("retained handle, failure and replay contracts remain explicit", () => {
     assert.ok(prose.includes(term) || (term === "inspect a dormant" && prose.includes("inspecting a dormant")), term);
 });
 
-// Exercise the documented binary reduction, including quiescent odd carries.
+// Only power-of-two cohorts belong to the documented balanced merge protocol.
 function reduceNodes(n: number) {
-  const buckets = new Map<number, Set<number>[]>();
-  buckets.set(0, Array.from({ length: n }, (_, i) => new Set([i])));
-  let merges = 0, crossDepth = 0;
-  const carryLevels = new Set<number>();
-  while ([...buckets.values()].reduce((sum, nodes) => sum + nodes.length, 0) > 1) {
-    const levels = [...buckets.keys()].sort((a, b) => a - b);
-    const same = levels.find((depth) => buckets.get(depth)!.length >= 2);
-    let leftDepth: number, rightDepth: number;
-    if (same !== undefined) leftDepth = rightDepth = same;
-    else {
-      const ready = levels.filter((depth) => buckets.get(depth)!.length);
-      [leftDepth, rightDepth] = ready;
-      assert.ok(!carryLevels.has(rightDepth));
-      carryLevels.add(rightDepth);
-      crossDepth++;
+  assert.ok(Number.isInteger(n) && n > 0 && (n & (n - 1)) === 0, "power of two required");
+  let nodes = Array.from({ length: n }, (_, i) => ({ leaves: new Set([i]), depth: 0 }));
+  let merges = 0;
+  while (nodes.length > 1) {
+    const next: typeof nodes = [];
+    for (let i = 0; i < nodes.length; i += 2) {
+      const left = nodes[i]!, right = nodes[i + 1]!;
+      assert.equal(left.depth, right.depth);
+      for (const leaf of left.leaves) assert.ok(!right.leaves.has(leaf));
+      next.push({ leaves: new Set([...left.leaves, ...right.leaves]), depth: left.depth + 1 });
+      merges++;
     }
-    const left = buckets.get(leftDepth)!.pop()!;
-    const right = buckets.get(rightDepth)!.pop()!;
-    for (const leaf of left) assert.ok(!right.has(leaf));
-    const merged = new Set([...left, ...right]);
-    const depth = Math.max(leftDepth, rightDepth) + 1;
-    if (!buckets.has(depth)) buckets.set(depth, []);
-    buckets.get(depth)!.push(merged);
-    merges++;
+    nodes = next;
   }
-  const root = [...buckets.values()].find((nodes) => nodes.length)![0];
-  assert.deepEqual([...root].sort((a, b) => a - b), Array.from({ length: n }, (_, i) => i));
+  assert.deepEqual([...nodes[0]!.leaves].sort((a, b) => a - b),
+    Array.from({ length: n }, (_, i) => i));
   assert.equal(merges, n - 1);
-  return { merges, crossDepth, worktrees: n + merges };
+  assert.equal(nodes[0]!.depth, Math.log2(n));
+  return { merges, worktrees: n + merges };
 }
 
-test("balanced reduction terminates and preserves every contributor for odd and even cohorts", () => {
-  for (let n = 1; n <= 512; n++) reduceNodes(n);
-  for (const C of [1, 2, 4, 7, 24]) assert.equal(reduceNodes(3 * C).worktrees, 6 * C - 1);
-  assert.equal(reduceNodes(21).crossDepth, 2);
+test("power-of-two cohorts reduce without orphan handling and preserve all contributors", () => {
+  for (let n = 1; n <= 1024; n *= 2) reduceNodes(n);
+  for (const C of [1, 2, 4, 8, 16, 32, 64])
+    assert.equal(reduceNodes(2 * C).worktrees, 4 * C - 1);
+  for (const n of [0, -1, 3, 5, 6, 24, 3.5]) assert.throws(() => reduceNodes(n));
+  assert.ok(prose.includes("positive powers of two"));
+  assert.ok(!/lowest-depth orphan|orphan carry|cross-depth carries/.test(workflow));
 });

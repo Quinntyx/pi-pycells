@@ -190,8 +190,8 @@ len(data)
 
 For pool workflows the guard matters more: re-running a notebook must not spawn
 a second set of tmux agents. Guard pool creation behind an existing result file
-or a session check, and close pools before the cell ends (see the `pi-subagents`
-skill).
+or a session check. Follow the `pi-subagents` skill for pool lifecycle; do not
+close a pool while agents or requested follow-ups still need it.
 
 # Curating and delivering
 
@@ -200,6 +200,5 @@ skill).
 - Fix the notebook, not just the kernel: patching a value with `scratch_run` and
   leaving the cell wrong is hidden state.
 - When delivering, report the notebook path and one line on what it does.
-  Promote only genuinely reusable workflows with
-  `promote_to_skill_notebook({ kernel, name })` — it promotes the named kernel's
-  bound notebook, not an unrelated external file — not one-off scratch.
+  Keep durable notebooks in the project. Library reuse is optional and must not
+  add automatic curation work to a one-off task.

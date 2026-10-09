@@ -627,3 +627,53 @@ test("subagent panel inherits pending, success, and error backgrounds from its o
     assert.equal(calls.at(-1), expected);
   }
 });
+
+
+test("executing cells show the arrow beside source numbers and two following lines", () => {
+  const code = Array.from({ length: 20 }, (_, i) => `source_${i + 1}`);
+  const state = {};
+  const lines = renderNotebookResult("exec_cell", textResult("", {
+    userCode: code, currentLine: 7, cellIdx: 3, execId: "live",
+  }), { isPartial: true }, PLAIN_THEME, { state }).render(100);
+  const text = lines.join("\n");
+  assert.match(text, /→\s+7\s+│\s+source_7/);
+  assert.ok(text.includes("source_9"));
+  assert.equal(state.viewStartLine, 2);
+  assert.equal(lines.filter((line) => /│\s+source_\d+/.test(line)).length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 100));
+});
+
+test("executing preview keeps a short loop stable and removes the marker on completion", () => {
+  const code = Array.from({ length: 20 }, (_, i) => `source_${i + 1}`);
+  const state = {};
+  for (const currentLine of [2, 3, 4, 5, 6, 7, 2, 5, 7, 2]) {
+    const text = renderNotebookResult("scratch_run", textResult("", {
+      userCode: code, currentLine, execId: "loop",
+    }), { isPartial: true }, PLAIN_THEME, { state }).render(100).join("\n");
+    assert.match(text, new RegExp(`→\\s+${currentLine}\\s+│`));
+  }
+  assert.equal(state.viewStartLine, 2);
+  const done = renderNotebookResult("scratch_run", textResult("done", {
+    userCode: code, currentLine: 2,
+  }), {}, PLAIN_THEME, { state }).render(100).join("\n");
+  assert.ok(!done.includes("→"));
+});
+
+
+test("execution marker preserves manual scrolling and stays within narrow box widths", () => {
+  const code = Array.from({ length: 20 }, (_, i) => `source_${i + 1}`);
+  const state = { scrollPositions: { input: 11 } };
+  const result = textResult("", { userCode: code, currentLine: 12, execId: "manual" });
+  const text = renderNotebookResult("exec_cell", result, { isPartial: true },
+    PLAIN_THEME, { state }).render(100).join("\n");
+  assert.ok(text.includes("source_11"));
+  assert.ok(text.includes("source_18"));
+  assert.ok(!text.includes("│ source_7"));
+  assert.equal(state.scrollPositions.input, 11);
+  assert.match(text, /→\s+12\s+│/);
+  for (let width = 20; width <= 70; width++) {
+    const lines = renderNotebookResult("exec_cell", result, { isPartial: true },
+      PLAIN_THEME, { state: {} }).render(width);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `width ${width}`);
+  }
+});

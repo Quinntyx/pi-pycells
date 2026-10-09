@@ -224,7 +224,7 @@ function currentToolDescription(
 const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel bound to a unique human-readable name. Every other kernel tool targets kernels by that name via its required 'kernel' parameter. The kernel is bound to a notebook file (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
 - name (required): unique human-readable kernel name among live kernels. Trimmed, nonempty, no control or terminal escape characters. Use a meaningful name (e.g. "analysis", "etl-pipeline") and reuse the SAME name for every later call that targets this kernel.
-- notebook (optional): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. Omit it for throwaway/scratch work — the notebook is created under /tmp/pi-pycells/notebooks/ and the provision result reports its path. Pass an explicit path when the notebook should be kept with the project or promoted to the library.
+- notebook (optional): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. Omit it for throwaway/scratch work — the notebook is created under /tmp/pi-pycells/notebooks/ and the provision result reports its path. Pass an explicit path when the notebook should be kept with the project.
 - version (optional): Python version for this kernel's venv — 3.14 (default), 3.14.4, or a pre-release like 3.15.0b1. Overrides a version pinned in the source notebook's metadata WITHOUT mutating that metadata (metadata records the original/intended version).
 - source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
 - Prefix numbering includes every sourced notebook cell, including markdown: for 7 source cells, the first new exec_cell is cell 8. A sourcing error is recorded on the failed cell and leaves the kernel usable.
@@ -245,14 +245,6 @@ const EXEC_CELL_DESCRIPTION = `Execute a cell in the explicitly named persistent
 - Review is separate from execution: reviewed workflows persist the cell with write_cell, present it with request_cell_review(kernel, n), then execute with run_cell. Minor repairs within an approved scope do not require another review. Never prompt when the user explicitly requested autonomous execution without prompts.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
-
-const PROMOTE_DESCRIPTION = `Promote a polished notebook into the reusable PTC workflow library.
-
-- name (required): safe library name; it is normalized to a lowercase hyphenated filename.
-- kernel (required): live kernel name. By default promote the notebook bound to this kernel.
-- notebookPath (optional): explicit source .ipynb; the named kernel must still exist.
-- overwrite (optional): false by default. Existing library notebooks are never replaced unless explicitly true.
-- The notebook is copied intact, preserving interleaved markdown, code cells, and outputs. Prefer this over legacy script export after a successful nontrivial workflow.`;
 
 const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into a kernel's environment (uv-backed, fast).
 
@@ -310,70 +302,6 @@ function readCellOutputTool(sessionManager: PythonSessionManager, directory: Ker
   });
 }
 
-/** promote_to_skill_notebook tool: copy the named kernel's bound notebook into the PTC library. */
-function promoteToSkillNotebookTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
-  return withActivityLabel({
-    name: "promote_to_skill_notebook",
-    label: "promote notebook",
-    description: PROMOTE_DESCRIPTION,
-    parameters: Type.Object({
-      kernel: Type.String({ description: "Kernel whose bound notebook is promoted (name from provision_kernel)." }),
-      name: Type.String({ description: "Library notebook name; sanitized to a safe lowercase hyphenated filename." }),
-      overwrite: Type.Optional(
-        Type.Boolean({ description: "Replace an existing library notebook with the same sanitized name. Default false." })
-      ),
-    }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const { kernel, name, overwrite } = params as {
-        kernel: string;
-        name: string;
-        overwrite?: boolean;
-      };
-      let ref: KernelRef;
-      try {
-        ref = directory.resolveKernel(kernel);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `promote_to_skill_notebook failed: ${message}` }],
-          details: { kernel, name, error: "unknown-kernel" },
-          isError: true,
-        };
-      }
-      if (!ref.notebookPath) {
-        return {
-          content: [{ type: "text", text: `Kernel "${ref.name}" has no bound notebook to promote. Provision it with an explicit notebook path.` }],
-          details: { kernel: ref.name, name },
-          isError: true,
-        };
-      }
-      try {
-        const result = await sessionManager.promoteToSkillNotebook({
-          name,
-          notebookPath: ref.notebookPath,
-          overwrite,
-          cwd: ctx.cwd,
-        });
-        return {
-          content: [{
-            type: "text",
-            text: `Promoted kernel "${ref.name}" notebook ${result.notebookPath} to library notebook ${result.name} at ${result.path}.`,
-          }],
-          details: { ...result, kernel: ref.name },
-        };
-      } catch (error) {
-        return {
-          content: [{
-            type: "text",
-            text: `promote_to_skill_notebook failed: ${error instanceof Error ? error.message : String(error)}`,
-          }],
-          details: { kernel: ref.name, name },
-          isError: true,
-        };
-      }
-    },
-  });
-}
 
 /** inspect_kernel tool: structured digest of a kernel's user namespace (imports/defs/classes/vars/cells). */
 function inspectKernelTool(
@@ -777,7 +705,7 @@ export function provisionKernelTool(
       // Default notebook location is /tmp: most kernels are throwaway, and
       // cwd-defaults tracked piles of scratch notebooks into user repos.
       // Pass an explicit path (e.g. in the project dir) when the notebook
-      // should be kept or promoted to the library.
+      // should be kept with the project.
       let notebookPath: string;
       if (notebook && notebook.trim()) {
         const resolved = path.isAbsolute(notebook) ? notebook : path.resolve(ctx.cwd, notebook);
@@ -1599,7 +1527,7 @@ Load the bundled pi-subagents skill (skills/pi-subagents/SKILL.md) and read it f
 5. Set each agent's working directory through Task(cwd=WORKDIR), not instructions in its prompt.
 6. Feed results forward yourself: parse structured results in Python and restate them as prose in the next agent's prompt — never paste raw JSON between agents.
 
-If the request is too small to warrant a workflow (a single agent would do), say so and just do the work directly instead.
+For a small request, choose the smallest useful AgentPool workflow and delegate the task; do not replace the explicitly requested workflow with parent-only work.
 
 User request: `;
 
@@ -1613,7 +1541,8 @@ function registerWorkflowCommand(pi: ExtensionAPI): void {
         ctx.ui.notify("usage: /workflow <request to turn into a subagent workflow>", "error");
         return;
       }
-      await pi.sendUserMessage(WORKFLOW_PROMPT + request, { deliverAs: "followUp" });
+      await pi.sendUserMessage(WORKFLOW_PROMPT + request + "\n\n" +
+          "Use workflows to accomplish this task. Do as little work yourself as possible and delegate to the workflow to keep things token-efficient.", { deliverAs: "followUp" });
     },
   });
 }
@@ -1758,31 +1687,21 @@ function updateSubagentFooter(
 // Event handlers
 // ============================================================================
 
-/** session_start: scan custom tools, then (re)register all PTC tools. */
-async function handleSessionStart(
-  customToolManager: CustomToolManager,
-  sessionState: PtcSessionState,
+/** Register complete renderer definitions before Pi reconstructs fork/resume history. */
+function registerKernelTools(
   pi: ExtensionAPI,
   toolRegistry: ToolRegistry,
   settings: PtcSettings,
+  sessionState: PtcSessionState,
   sessionManager: PythonSessionManager,
   directory: KernelDirectory,
   sandboxManager: SandboxManager,
-  _event: unknown,
-  ctx: ExtensionContext
-): Promise<void> {
-  sessionState.currentCwd = ctx.cwd;
-  if (!sessionState.customToolsStarted) {
-    await customToolManager.start();
-    sessionState.customToolsStarted = true;
-  }
-
+): void {
   const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
   const register = (tool: PtcToolDefinition) => pi.registerTool(withKernelRendering(tool, directory));
   register(provisionKernelTool(sessionManager, directory, sessionState));
   register(execCellTool(pi, sessionManager, directory, settings, sessionState, toolDescription));
   register(readCellOutputTool(sessionManager, directory));
-  register(promoteToSkillNotebookTool(sessionManager, directory));
   register(inspectKernelTool(sessionManager, directory, toolDescription));
   register(provisionDependencyTool(sessionManager, sandboxManager, directory));
   register(scratchRunTool(sessionManager, directory, settings, sessionState));
@@ -1811,6 +1730,28 @@ async function handleSessionStart(
     })
   );
   register(resetKernelTool(sessionManager, directory));
+}
+
+/** session_start: scan custom tools, then (re)register all PTC tools. */
+async function handleSessionStart(
+  customToolManager: CustomToolManager,
+  sessionState: PtcSessionState,
+  pi: ExtensionAPI,
+  toolRegistry: ToolRegistry,
+  settings: PtcSettings,
+  sessionManager: PythonSessionManager,
+  directory: KernelDirectory,
+  sandboxManager: SandboxManager,
+  _event: unknown,
+  ctx: ExtensionContext
+): Promise<void> {
+  sessionState.currentCwd = ctx.cwd;
+  if (!sessionState.customToolsStarted) {
+    await customToolManager.start();
+    sessionState.customToolsStarted = true;
+  }
+
+  registerKernelTools(pi, toolRegistry, settings, sessionState, sessionManager, directory, sandboxManager);
 }
 
 /**
@@ -2013,6 +1954,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     }
   };
 
+  registerKernelTools(pi, toolRegistry, settings, sessionState, sessionManager, kernelDirectory, sandboxManager);
   registerPtcCommand(pi, sessionManager, kernelDirectory);
   registerWorkflowCommand(pi);
 

@@ -354,6 +354,12 @@ function renderExecutingFrame(
   return new NotebookComponent((width, layout, now) => {
     const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const mode = currentViewportMode(expanded);
+    const executingLine = Number.isInteger(details.currentLine) && details.currentLine! > 0
+      ? details.currentLine : undefined;
+    if (executingLine !== undefined) {
+      state.viewStartLine = computeCodeViewStart(executingLine, bodyLineCount(code), state.viewStartLine);
+    }
+    const inputMode = inputViewportMode(expanded, state) === "expanded" ? "expanded" : "fullscreen";
     const identity = renderIdentityHeader(toolName, details, theme);
     const opts = {
       width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const,
@@ -363,9 +369,9 @@ function renderExecutingFrame(
       width, theme, execId: details.execId, expanded, now, background: opts.labelBackground,
     });
     const lines = layout.box("input", bodyLineCount(code), {
-      ...opts, mode: inputViewportMode(expanded, state), viewStart: state.viewStartLine,
+      ...opts, mode: inputMode, viewStart: state.viewStartLine, executingLine,
       highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
-    }, (options) => renderInCell(code, options));
+    }, (options) => renderInCell(code, options), 0, false, mode === "fullscreen");
     if (details.activeTool) {
       lines.push(truncateToWidth(theme.fg("muted", `· calling ${details.activeTool}()`), width));
     }
@@ -390,7 +396,7 @@ function renderExecutingFrame(
     // bracket frame and panel clock in the key, leaving completed rows warm.
     const indicator = animating ? executionIndicator(now) : "";
     const panelTick = details.subagentSnapshot ? Math.floor(now / 120) : "";
-    return `${currentViewportMode(expanded)}:${indicator}:${panelTick}`;
+    return `${currentViewportMode(expanded)}:${indicator}:${panelTick}:${details.currentLine ?? ""}`;
   });
 }
 // ---------------------------------------------------------------------------

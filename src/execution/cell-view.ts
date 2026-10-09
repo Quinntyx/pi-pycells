@@ -47,6 +47,8 @@ export const NORMAL_VIEWPORT_LINES = 7;
 export type ViewportMode = "fullscreen" | "normal" | "expanded";
 
 export interface CellRenderOptions {
+  /** 1-based executing source line; reserves an arrow beside the In-box line numbers. */
+  executingLine?: number;
   /**
    * Cell number N for `In[N]:` / `Out[N]:`.
    * - a number → the execution count (Jupyter's `In[N]:`).
@@ -111,16 +113,17 @@ export interface BodyRow {
   num?: number | null;
 }
 
-export type BodyStyle = "plain" | "muted" | "added" | "removed" | "error" | "warning" | "success";
+export type BodyStyle = "plain" | "muted" | "accent" | "added" | "removed" | "error" | "warning" | "success";
 
 interface StyleAttrs {
-  fg?: "muted" | "toolDiffAdded" | "toolDiffRemoved" | "error" | "warning" | "success";
+  fg?: "muted" | "accent" | "toolDiffAdded" | "toolDiffRemoved" | "error" | "warning" | "success";
   strike?: boolean;
 }
 
 const STYLE_ATTRS: Record<BodyStyle, StyleAttrs> = {
   plain: {},
   muted: { fg: "muted" },
+  accent: { fg: "accent" },
   added: { fg: "toolDiffAdded" },
   removed: { fg: "toolDiffRemoved", strike: true },
   error: { fg: "error" },
@@ -286,6 +289,7 @@ function diffRowsToBodyRows(rows: DiffRow[]): BodyRow[] {
 // ---------------------------------------------------------------------------
 
 interface BoxSpec {
+  executingLine?: number;
   /** Gutter label for this box, e.g. `In[12]:`, `Out[3]:`, `In:`. */
   label: string;
   /**
@@ -351,7 +355,9 @@ function renderBox(spec: BoxSpec): string[] {
   const interior = Math.max(1, width - prefixWidth - 2);
   // Very narrow panes prefer intact fences and content over a number/rail
   // field that would push rows past the terminal width.
-  const numberField = lineNumberWidth > 0 && interior >= lineNumberWidth + 4 ? lineNumberWidth + 1 : 0;
+  const markerWidth = spec.executingLine !== undefined ? 2 : 0;
+  const numberField = lineNumberWidth > 0 && interior >= lineNumberWidth + markerWidth + 4
+    ? lineNumberWidth + markerWidth + 1 : 0;
   // The rail column (+ its separating space) sits between the line-number
   // field and the content, in both In and Out boxes.
   const railWidth = numberField > 0 ? 2 : 0;
@@ -377,7 +383,8 @@ function renderBox(spec: BoxSpec): string[] {
 
   rows.forEach((row, rowIndex) => {
     const numText =
-      numberField > 0 ? String(row.num ?? "").padStart(lineNumberWidth) + " " : "";
+      numberField > 0 ? (markerWidth ? (row.num === spec.executingLine ? "→ " : "  ") : "") +
+        String(row.num ?? "").padStart(lineNumberWidth) + " " : "";
     const content = truncateVisible(row.text, contentWidth);
     let style = row.style ?? "plain";
     if (spec.contentError || spec.wholeCellError) style = "error";
@@ -385,7 +392,7 @@ function renderBox(spec: BoxSpec): string[] {
     // in the same column on every row (visible-width aware: content may be
     // pre-highlighted and carry ANSI escapes).
     const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(content)));
-    const numStyle = style === "plain" ? "muted" : style;
+    const numStyle = spec.executingLine !== undefined && row.num === spec.executingLine ? "accent" : style === "plain" ? "muted" : style;
     // The label rides the first content row; later rows keep a blank gutter.
     const labelGutter = gutterFor(rowIndex === 0, rowIndex - 1);
     // Vertical rail between the line-number field and the content.
@@ -521,6 +528,7 @@ function buildBox(
     ? countLabel.length <= labelWidth ? [countLabel] : [`(${rows.length}`, "lines)"]
     : undefined;
   return renderBox({
+    executingLine: kind === "in" ? opts.executingLine : undefined,
     label,
     labelWidth,
     leftPadding: 1,

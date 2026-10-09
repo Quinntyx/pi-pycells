@@ -6,13 +6,11 @@ The kernels feature gives the model a persistent, Jupyter-like Python interprete
 
 The notebook is also a first-class editable document. The model can create and edit cells without executing them (`write_cell`, `delete_cell`), read the current cells and their stored outputs (`read_cells`, `read_cell`), run specific cells or the whole notebook (`run_cell`, `run_to`, `run_all`), run throwaway code that mutates the namespace but records nothing (`scratch_run`), and restart the interpreter from a clean namespace while leaving the notebook file intact (`reset_kernel`). Markdown cells are first-class alongside code cells.
 
-Supporting tools cover discovery (`list_kernels`, `inspect_kernel`), paging through large persisted outputs (`read_cell_output`), installing packages into the kernel's environment (`provision_dependency`), seeding a kernel from a saved workflow, and promoting a finished notebook back into a reusable library workflow (`promote_to_skill_notebook`).
 
 ## How it works
 
 ### One process per kernel, JSONL protocol
 
-- **Tools registered.** `session_start` registers `provision_kernel`, `exec_cell`, `list_kernels`, `read_cell_output`, `promote_to_skill_notebook`, `inspect_kernel`, `provision_dependency`, and the document/kernel tools `scratch_run`, `write_cell`, `delete_cell`, `read_cells`, `read_cell`, `run_cell`, `run_to`, `run_all`, and `reset_kernel` (`src/index.ts`, `handleSessionStart`).
 - **Transport.** `provision_kernel` spawns a Python subprocess running the persistent session runtime (`src/python-session-manager.ts`, `provision`). Host and interpreter talk a line-delimited JSON protocol over the child's stdin/stdout. The host sends `exec`, `inspect`, `doc`, and `export_script` frames; the interpreter answers with `session_ready`, `exec_done`, `exec_error`, `kernel_inspected`, `doc_done`, `doc_error`, and `script_exported`, plus interleaved `execution_progress`, `stdout`, and `subagent_state` frames. The frame vocabulary is documented at the top of `src/python-runtime/session.py`.
 
 ### Cell semantics (embedded IPython)
@@ -92,7 +90,6 @@ Later cells (or later conversation turns) build on the same namespace — `rows`
 - run **`/ptc interrupt [session_id]`** (or `/ptc stop`) to stop the running chunk from the TUI, or **`/ptc kill [session_id]`** to dispose the kernel entirely;
 - open `analysis.ipynb` in Jupyter at any time — it is a standard nbformat 4 notebook, updated after every executed cell.
 
-Finished workflows can be saved for reuse with `promote_to_skill_notebook({ name: "event-analysis" })`, which copies the complete notebook (markdown, code, outputs, metadata) into the library under a normalized lowercase-hyphenated name; an existing library notebook is only replaced when `overwrite: true` (`src/python-session-manager.ts`, `promoteToSkillNotebook`).
 
 ## Options / Configuration
 
@@ -104,7 +101,6 @@ All settings are environment-based (`loadSettingsFromEnv`, `src/utils.ts`); ther
 | `PTC_OUTPUT_PREVIEW_CHARS` (alias `PTC_MAX_OUTPUT_CHARS`) | `12000` | Model-facing head/tail preview size before the model should page via `read_cell_output`. |
 | `PTC_MAX_SPOOL_CHARS` | `10000000` | Emergency per-cell capture ceiling in the interpreter; output below this is always persisted in full to the notebook. |
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default parallelism of the in-kernel `ptc.gather_limit` helper for nested tool calls. |
-| `PTC_LIBRARY_DIR` | `~/.pi/agent/pycells-library` (or `$PI_CODING_AGENT_DIR/pycells-library`) | Library directory for `source` bare-name resolution and `promote_to_skill_notebook` (`src/python-session-manager.ts`). |
 | `PTC_MAX_PYTHON_SESSIONS` | `4` | Parsed but **not enforced** — provisioning never rejects; vestigial. |
 | `PTC_CODE_THEME` | `github-dark` | Shiki theme override for cell boxes and standalone cell review. |
 | `PTC_PYTHON_EXECUTABLE` | venv at `~/.cache/pi-pycells/python-env`, else `python3` | Interpreter used for kernels and for `provision_dependency` installs (`src/sandbox-manager.ts`). |
@@ -118,13 +114,19 @@ The real interpreter round-trip tests are opted in with `PTC_TEST_REAL_RUNTIME=t
 
 ## Standalone setup notes
 
-Things that are hardcoded or assume the author's machine setup, and how to work around each:
-
-- **The Python venv location.** Kernels prefer `~/.cache/pi-pycells/python-env/bin/python` (created on demand by the pi_subagents provisioner, `uv` if available else `python3 -m venv`). To use your own interpreter instead, set `PTC_PYTHON_EXECUTABLE` — it wins over the venv. Python **3.10+ is required**; older interpreters fail fast with a clear startup error (PEP 604 unions and 3.12 AST features are load-bearing) (`src/python-runtime/rpc.py`).
-- **pi_subagents provisioning clones a public GitHub mirror by default.** The managed clone comes from `https://github.com/Quinntyx/pi-subagents` (`DEFAULT_REPO_URL`, `src/subagents-env.ts`). Without network access, the background sync logs a failure but kernels still work — only `import pi_subagents` (subagent pools) is unavailable. Workarounds: point `PTC_SUBAGENTS_REPO_URL` at your own fork/clone, or set `PTC_SUBAGENTS_SOURCE` to a local checkout, which is installed editable and skips cloning entirely.
-- **The dev-checkout default path is author-specific.** Without `PTC_SUBAGENTS_SOURCE`, the provisioner checks `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`, `src/subagents-env.ts`) — harmless if absent, but it means the author's machine silently prefers a checkout you won't have. Set `PTC_SUBAGENTS_SOURCE` explicitly if you keep one elsewhere. Sync frequency is throttled to once per `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` (default 24).
-- **Subagent agent-dir selection.** Selection is env-driven end to end: kernels inherit `PI_CODING_SUBAGENT_DIR` / `PI_CODING_AGENT_DIR` from the host process, and `pi_subagents` resolves the dir for spawned subagents (default: the orchestrator's own agent dir). No PTC-side forwarding exists.
-- **Library directory.** Bare-name `source` resolution and notebook promotion read from `~/.pi/agent/pycells-library` (honoring `PI_CODING_AGENT_DIR` if set). There is no settings-file field for this: `PtcSettings.libraryDir` exists in the contract but is never populated by the loader, so `PTC_LIBRARY_DIR` is the only way to relocate it.
-- **`uv` must be on PATH for package installs.** `provision_dependency` shells out to the `uv` binary; without it you get an ENOENT error suggesting you install `uv`. There is no pip fallback. Pre-install heavy distributions into the venv yourself as an alternative.
-- **Notebook path defaults to /tmp.** Every kernel is bound to a destination `.ipynb` (`.ipynb` appended if omitted). Omitted, it is created under `/tmp/pi-pycells/notebooks/` — right for throwaway kernels, which are the common case. Pass an explicit path (in the repo) when the notebook is the durable artifact you want to keep or promote.
-- **Child processes can corrupt the protocol.** Processes spawned from a cell inherit the interpreter's RPC pipes; anything that reads stdin or writes un-captured stdout can hang the kernel. Spawn children with `stdin=DEVNULL` and capture their output (a documented property of the JSONL-over-stdio transport, see `docs/tool-bridge.md`).
+- **Managed SDK.** Register `git:git.quinntyx.dev/quinntyx/pi-subagents@dev` with Pi.
+  The runtime uses the installed package; there is no local development checkout
+  requirement. Publish SDK changes to remote `dev` and use `pi update --extensions`.
+- **Python.** The managed SDK prepares the Python environment. An explicit
+  `PTC_PYTHON_EXECUTABLE` overrides interpreter selection; see
+  [subagents.md](subagents.md) for the runtime setup contract.
+- **Agent directories.** `PI_CODING_SUBAGENT_DIR` selects the spawned agent
+  profile; `PI_CODING_AGENT_DIR` identifies the parent profile.
+- **Library directory.** Bare source names use `PTC_LIBRARY_DIR`, or the current
+  agent directory's `pycells-library`. See [notebook-library.md](notebook-library.md).
+- **Dependencies.** `provision_dependency` requires `uv` on PATH and targets the
+  explicitly named live kernel. There is no pip fallback.
+- **Notebook paths.** Omitted destinations create scratch notebooks under
+  `/tmp/pi-pycells/notebooks/`. Give a project path for durable artifacts.
+- **Child processes.** Capture subprocess output and prevent them from reading
+  the kernel's RPC input. See [tool-bridge.md](tool-bridge.md).

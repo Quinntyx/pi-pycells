@@ -126,9 +126,8 @@ More: [kernels and document operations](docs/kernels.md).
 
 ## Reusable notebook library
 
-> **Experimental:** the library and promotion interface may change.
+> **Experimental:** the notebook library format may change.
 
-Promote a finished notebook with `promote_to_skill_notebook({ kernel: "analysis", name: "event-analysis" })`. Promotion promotes the named kernel's **bound notebook** — it does not accept an unrelated external notebook path. It copies code, markdown, outputs, and metadata into the library; it does not modify the source notebook. Existing entries are only replaced with explicit overwrite permission.
 
 Start future work with `provision_kernel({ name: "next-analysis", source: "event-analysis", notebook: "next-analysis.ipynb" })`. The source is copied and its code cells run before new work begins. Notebooks retain their recorded Python version, with an explicit `version` override available when provisioning.
 
@@ -141,9 +140,14 @@ More: [notebook library](docs/notebook-library.md).
 Enable subagents before starting Pi:
 
 ```bash
-export PI_SUBAGENTS_MAX_CONCURRENT=8
+export PI_SUBAGENTS_MAX_CONCURRENT=16
 pi
 ```
+
+Use a **positive power of two** for `PI_SUBAGENTS_MAX_CONCURRENT` (16 recommended).
+The implementation workflow expects power-of-two concurrency and an initial **2C** builder
+cohort (32 builders at C=16), so its balanced merge tree has no orphans. Other values may not
+work with this workflow policy; the lower-level SDK can still admit other positive limits.
 
 The positive value caps concurrency and enables background provisioning of `pi_subagents` into the shared Python environment. Without it, notebook work still functions and no subagent module is downloaded.
 
@@ -195,7 +199,7 @@ More: [subagent setup](docs/subagents.md) and the bundled [pi-subagents skill](s
 
 - [Notebook workflow skill](skills/notebook-workflow/SKILL.md): cell discipline, markdown narrative, and clean-kernel handover.
 - [Kernels](docs/kernels.md): lifecycle, IPython semantics, document operations, and interrupts.
-- [Notebook library](docs/notebook-library.md): promotion, sourcing, and version pinning.
+- [Notebook library](docs/notebook-library.md): sourcing and version pinning.
 - [Subagents](docs/subagents.md): provisioning and orchestration setup.
 - [Configuration](docs/configuration.md): runtime and environment settings.
 

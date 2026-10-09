@@ -62,12 +62,6 @@ export interface SourceExecutionError {
 }
 
 /** Result of copying a session notebook into the reusable PTC library. */
-export interface SkillNotebookPromotionResult {
-  name: string;
-  path: string;
-  notebookPath: string;
-  overwritten: boolean;
-}
 
 /** Thrown when an operation names a session id that is not live; the message lists live ids. */
 export class UnknownSessionError extends PythonSessionError {
@@ -1105,18 +1099,6 @@ function emptyNotebookDocument(): string {
   }, null, 1)}\n`;
 }
 
-function sanitizeSkillNotebookName(name: string): string {
-  const withoutExtension = name.trim().replace(/\.ipynb$/i, "");
-  const sanitized = withoutExtension
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!sanitized) {
-    throw new PythonSessionError("promotion name must contain at least one letter or number");
-  }
-  return sanitized;
-}
 
 function extractNotebookCellOutput(cell: Record<string, unknown>): string {
   const metadata = cell.metadata;
@@ -1275,7 +1257,7 @@ function readNotebookCells(notebookPath: string): NotebookCellSummary[] {
 /**
  * Owns the set of live persistent Python kernels: provisioning (optionally
  * sourcing a notebook/script), serialized foreground exec, notebook-backed
- * cell output reads, script export/promotion, subagent snapshot fan-out, and
+ * cell output reads, script export, subagent snapshot fan-out, and
  * lifecycle (interrupt/kill/dispose).
  */
 export class PythonSessionManager {
@@ -1673,7 +1655,7 @@ export class PythonSessionManager {
 
     // Honor a Python version pinned in the source notebook's metadata
     // (language_info.version): provision a dedicated uv venv for that version
-    // so promoted skill workflows keep running on the interpreter they were
+    // so stored notebook workflows keep running on the interpreter they were
     // recorded with, even after the default bump.
     let pythonExecutable: string | undefined;
     if (options.version && !process.env.PTC_PYTHON_EXECUTABLE) {
@@ -2280,85 +2262,7 @@ export class PythonSessionManager {
     }
   }
 
-  /** Copy a complete notebook artifact into the reusable PTC library. */
-  async promoteToSkillNotebook(options: {
-    name: string;
-    notebookPath?: string;
-    overwrite?: boolean;
-    cwd?: string;
-  }): Promise<SkillNotebookPromotionResult> {
-    const cwd = options.cwd ?? process.cwd();
-    const recentRecord = [...this.recency]
-      .reverse()
-      .map((id) => this.sessions.get(id))
-      .find((record): record is SessionRecord => Boolean(record?.notebookPath && !record.killed));
-    const notebookPath = options.notebookPath
-      ? path.resolve(cwd, options.notebookPath)
-      : recentRecord?.notebookPath;
-    if (!notebookPath) {
-      throw new PythonSessionError(
-        "no session notebook is available; pass notebookPath or provision a notebook-backed kernel first"
-      );
-    }
-    if (path.extname(notebookPath).toLowerCase() !== ".ipynb") {
-      throw new PythonSessionError(`promotion source must be a .ipynb notebook: ${notebookPath}`);
-    }
-
-    const sourceRecord = [...this.sessions.values()].find(
-      (record) => record.notebookPath && path.resolve(record.notebookPath) === path.resolve(notebookPath)
-    );
-    if (sourceRecord) {
-      await sourceRecord.queue;
-    }
-
-    let notebookTextOnDisk: string;
-    try {
-      notebookTextOnDisk = await fs.promises.readFile(notebookPath, "utf8");
-    } catch (error) {
-      throw new PythonSessionError(
-        `could not read notebook ${notebookPath}: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-    parseNotebookDocument(notebookTextOnDisk, notebookPath);
-
-    const name = sanitizeSkillNotebookName(options.name);
-    const libraryDir = this.resolveLibraryDir();
-    const targetPath = path.join(libraryDir, `${name}.ipynb`);
-    const overwritten = fs.existsSync(targetPath);
-    if (overwritten && !options.overwrite) {
-      throw new PythonSessionError(
-        `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
-      );
-    }
-    if (path.resolve(notebookPath) === path.resolve(targetPath)) {
-      if (!options.overwrite) {
-        throw new PythonSessionError(
-          `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
-        );
-      }
-      return { name, path: targetPath, notebookPath, overwritten: true };
-    }
-
-    await fs.promises.mkdir(libraryDir, { recursive: true });
-    try {
-      await fs.promises.copyFile(
-        notebookPath,
-        targetPath,
-        options.overwrite ? 0 : fs.constants.COPYFILE_EXCL
-      );
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
-        throw new PythonSessionError(
-          `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
-        );
-      }
-      throw error;
-    }
-    return { name, path: targetPath, notebookPath, overwritten };
-  }
-
-  /** Legacy script export retained for API callers; notebook promotion is preferred. */
+  /** Legacy script export retained for API callers. */
   async toScript(
     sessionId: string,
     options: { cwd: string; path?: string; name?: string }

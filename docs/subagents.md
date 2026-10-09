@@ -58,7 +58,7 @@ not accepted deliverables or successful replay entries.
 
 ### Completion-driven scheduling and queue headroom
 
-Let **C = `PI_SUBAGENTS_MAX_CONCURRENT`** (currently 8 in the agreed workflow).
+Let **C = `PI_SUBAGENTS_MAX_CONCURRENT`** (16 in the recommended system configuration).
 It limits active turns across pools in the Python process, not the number of
 submitted tasks, queued handles, or retained failed sessions. Pool concurrency
 may be smaller than C. A handle can be marked `starting` while waiting for
@@ -66,14 +66,12 @@ process-wide capacity; counting every `starting` status is not proof that C has
 been exceeded. This is not a cross-kernel coordinator or provider admission
 policy.
 
-- Decompose work into small, bounded units with explicit acceptance checks.
-  Maintain ready headroom around **3C** when useful (about 24 ready units for
-  C=8), so replacements are available without waiting for a whole wave. This
-  is a planning target, not a required minimum or runtime queue limit. A
-  queued roster is not active concurrency; do not pad it with speculative or
-  dependency-blocked tasks just to reach the target. Bound the frontier to useful
-  independent deliverables and drain it when the objective is covered; headroom
-  is not a reason to manufacture tail work.
+- Use an individual `AgentPool` task or a small group for limited work; asking
+  for subagents does not automatically request a full implementation workflow.
+- For a selected implementation workflow, submit **2C** useful initial Build
+  items with `submit_all` (32 builders at C=16), not a continuously maintained
+  ready-frontier quota. Use power-of-two C and builder counts: balanced reduction
+  then has no merge orphans. Lightweight delegation does not require this cohort.
 - Submit independent ready work, then consume `await pool.pop(...)` in
   **completion order**, routing each result and replenishing ready work
   immediately. Do not await submissions in roster order or insert batch
@@ -280,7 +278,7 @@ cross-kernel recovery coordinator is implied.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PI_SUBAGENTS_MAX_CONCURRENT` | *(unset — subagents disabled)* | Set to a positive number to enable subagents; also the global cap across all pools (stage `slots` are priorities, not hard limits). pi-pycells provisions the `pi_subagents` module when this is set. |
+| `PI_SUBAGENTS_MAX_CONCURRENT` | *(unset — subagents disabled)* | Set to a power of two (recommended 16) to enable subagents; other values may not work with workflow reduction; also the global cap across all pools (stage `slots` are priorities, not hard limits). pi-pycells provisions the `pi_subagents` module when this is set. |
 | `PI_SUBAGENTS_CATALOG_TTL` | `120` s | Model-catalog cache lifetime before a live re-check |
 | `PI_CODING_SUBAGENT_DIR` | *(unset — subagents share the orchestrator's agent dir)* | Agent dir spawned subagent instances run under (env `PI_CODING_SUBAGENT_DIR`; `Task.agentDir` can override per task) |
 
@@ -305,7 +303,7 @@ A separate profile does not inherit packages installed in the orchestrator's pro
 PI_CODING_AGENT_DIR=/path/to/subagents pi install git:github.com/Quinntyx/pi-sock
 PI_CODING_AGENT_DIR=/path/to/subagents pi install https://git.quinntyx.dev/quinntyx/pi-activity.git
 export PI_CODING_SUBAGENT_DIR=/path/to/subagents
-export PI_SUBAGENTS_MAX_CONCURRENT=8
+export PI_SUBAGENTS_MAX_CONCURRENT=16
 # Start the orchestrator in tmux using its usual configuration.
 pi
 ```

@@ -76,9 +76,15 @@ There are no sandbox-specific settings beyond these — no container image, netw
 
 Several defaults encode the author's machine layout. None break execution — kernels fall back to `python3` — but subagent support and reproducibility depend on the following:
 
-- **Hardcoded cache root `~/.cache/pi-pycells`** (`src/subagents-env.ts` `defaultCacheRoot()`). The venv `~/.cache/pi-pycells/python-env` is created by the subagents provisioner and preferred over `python3` by every kernel. If you don't want your kernels to silently switch interpreters when that venv appears, set `PTC_PYTHON_EXECUTABLE` explicitly.
-- **`pi_subagents` source**: the managed clone defaults to the public GitHub mirror `https://github.com/Quinntyx/pi-subagents` (`DEFAULT_REPO_URL`, `src/subagents-env.ts`) and clones anonymously. Point `PTC_SUBAGENTS_REPO_URL` at your own fork, or `PTC_SUBAGENTS_SOURCE` at a local checkout to install editable instead of cloning.
-- **Author-specific dev-checkout default**: when `PTC_SUBAGENTS_SOURCE` is unset, the provisioner probes `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`) and installs it editable if it exists. On the author's machine this silently shadows the managed clone; elsewhere it just doesn't exist and the managed clone is used.
+- **Managed Python environment.** Runtime environments are cached and prepared
+  by the managed SDK; `PTC_PYTHON_EXECUTABLE` selects an explicit interpreter.
+- **Managed SDK source.** Register `git:git.quinntyx.dev/quinntyx/pi-subagents@dev`
+  as a Pi package. The installed SDK supplies the runtime source. The fallback
+  repository defaults to `https://git.quinntyx.dev/quinntyx/pi-subagents.git`
+  on branch `dev`; `PTC_SUBAGENTS_REPO_URL` can select a different remote.
+- **No local development default.** The plugin does not probe an author-specific
+  checkout. Installed managed SDK sources are used, with a remote `dev` cache
+  fallback where required. Publish changes to remote `dev` and update with Pi.
 - **Subagent agent-dir selection**: subagents run under the orchestrator's own agent dir by default (`PI_CODING_AGENT_DIR` else `~/.pi/agent`); `PI_CODING_SUBAGENT_DIR` points them at any other directory with a pi config. No pi-profiles dependency either way.
 - **Sync stamp inside the extension clone**: `.ptc-subagents-sync.json` lives in the extension's own directory and is re-synced after every `pi update` (the stamp is wiped by the update). This only matters if you rely on the managed pi-subagents clone; the venv itself is untouched.
 - **No isolation to lean on**: execution is a plain host subprocess — no barrier exists between the Python process and your system, and no model-facing gate exists either. Don't use this extension in untrusted workspaces.

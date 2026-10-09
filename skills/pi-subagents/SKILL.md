@@ -31,13 +31,13 @@ metadata:
    Ask only when missing information prevents a safe assignment; otherwise use known context.
 2. Default to lightweight delegation: one agent or a natural small set of independent tasks.
    Asking to spin up subagents does not request a workflow. Agent count alone is not a reason
-   to select one. Do not impose five review passes, a balanced merge tree or 3C decomposition.
+   to select one. Do not impose five review passes, a balanced merge tree or 2C decomposition.
 3. Select workflow mode only if the user explicitly requests a workflow or the scope is large
    enough that dependent implementation, CI gates and multi-subsystem integration justify it.
    State the reason for that choice. Preserve user overrides and requested counts in either mode.
 4. Resolve live concurrency C within runtime capacity and inherited permission. N is the number
    of assignments; C is the live admission bound, not a required number of tasks. Do not expand
-   a request for N agents to 3C tasks. If N exceeds C, queue the requested N without duplication.
+   a request for N agents to 2C tasks. If N exceeds C, queue the requested N without duplication.
    Honor whether a count limits simultaneous agents, assignments or total launches. Do not
    reinterpret a total-launch cap as concurrency or add unrequested roles behind that cap.
 5. Both modes go to Stage 2. After preparation, lightweight work goes to Stage 3; selected
@@ -69,7 +69,7 @@ metadata:
    No additional build/review/merge stages, CI bootstrap or worktree tree are required.
 2. For several independent agents, use the same pattern with concurrency bounded by C and the
    actual assignments. Use one stage or only the stages needed by those tasks. Submit exactly
-   the requested N with stage.submit or stage.submit_all; never manufacture a 3C cohort.
+   the requested N with stage.submit or stage.submit_all; never manufacture a 2C cohort.
 3. Task carries prompt, name, cwd and agentDir; add schema, model, thinking, metadata or timeout
    only as required by the real task and runtime. Give leaves zero delegation fuel; child
    orchestrators need separately authorized finite inherited delegation fuel.
@@ -90,7 +90,7 @@ metadata:
    [the implementation workflow](references/implementation-workflow.md) before submission.
    Follow its CI, review and integration gates only within that selected mode, then go to Stage 5.
 2. For a requested non-implementation workflow, define AgentPool stages and dependency release
-   according to that work. Do not import build CI, five-cycle review defaults, 3C fan-out or
+   according to that work. Do not import build CI, five-cycle review defaults, 2C fan-out or
    balanced Git merging into research, planning or other work where they serve no purpose.
    Preserve explicit counts, account for outcomes, and proceed to Stage 5 after delivery/handoff.
 

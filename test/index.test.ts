@@ -61,14 +61,6 @@ function makeFakeSessionManager(sandbox) {
       };
     }
 
-    async promoteToSkillNotebook(options) {
-      return {
-        name: options.name,
-        path: `/tmp/library/${options.name}.ipynb`,
-        notebookPath: options.notebookPath ?? "/tmp/test.ipynb",
-        overwritten: false,
-      };
-    }
 
     list() {
       return this.provisionedKernels?.length ? this.provisionedKernels :
@@ -124,7 +116,9 @@ function buildPi({ eventHandlers, registered, activeTools }) {
   const commands = {};
   const pi = {
     registerTool(tool) {
-      registered.push(tool);
+      const existing = registered.findIndex((item) => item.name === tool.name);
+      if (existing < 0) registered.push(tool);
+      else registered[existing] = tool;
     },
     registerCommand(name, definition) {
       commands[name] = definition;
@@ -273,7 +267,6 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
         "delete_cell",
         "exec_cell",
         "inspect_kernel",
-        "promote_to_skill_notebook",
         "provision_dependency",
         "provision_kernel",
         "read_cell",
@@ -308,16 +301,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
 
     const provisionKernel = registered.find((tool) => tool.name === "provision_kernel");
     assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["name", "notebook", "source", "version"]);
-    const promote = registered.find((tool) => tool.name === "promote_to_skill_notebook");
-    assert.deepEqual(Object.keys(promote.parameters.properties), ["kernel", "name", "overwrite"]);
-    const promoted = await promote.execute(
-      "promote",
-      { kernel: "s1", name: "review-workflow" },
-      undefined,
-      undefined,
-      { cwd: process.cwd() }
-    );
-    assert.equal(promoted.details.path, "/tmp/library/review-workflow.ipynb");
+    assert.ok(!registered.some((tool) => tool.name === "promote_to_skill_notebook"));
 
     assert.ok(commands.ptc);
     assert.equal(managerInstance.started, 1);
@@ -1572,7 +1556,6 @@ test("kernels are named, unique, and every operation targets an explicit kernel"
       ["inspect_kernel", { kernel: "ghost" }],
       ["reset_kernel", { kernel: "ghost" }],
       ["provision_dependency", { package: "numpy", kernel: "ghost" }],
-      ["promote_to_skill_notebook", { kernel: "ghost", name: "nb" }],
       ["request_cell_review", { kernel: "ghost", n: 1 }],
     ];
     for (const [name, params] of ops) {
@@ -1627,7 +1610,7 @@ test("every kernel tool renders named notebook identity and never exposes admin 
       assert.match(call, /review\.ipynb/, tool.name);
       assert.ok(!call.includes(created.details.sessionId), tool.name);
     }
-    for (const name of ["inspect_kernel", "provision_dependency", "promote_to_skill_notebook"]) {
+    for (const name of ["inspect_kernel", "provision_dependency"]) {
       const tool = tools.get(name);
       assert.ok(tool, name);
       for (const expanded of [false, true]) {
@@ -1683,4 +1666,54 @@ test("provision_kernel forwards the validated kernel name to the manager", async
   assert.equal(result.isError, undefined);
   assert.equal(receivedName, "analysis");
   assert.match(JSON.stringify(result.details), /analysis/);
+});
+
+
+test("/workflow appends the user's delegation instruction and never falls back to parent-only work", async () => {
+  const restore = restoreInjectedModules({ spawn() {}, cleanup: async () => {} });
+  try {
+    const extension = await loadExtension();
+    const handlers = new Map();
+    const { pi, commands } = buildPi({ eventHandlers: handlers, registered: [], activeTools: [] });
+    const sent = [];
+    pi.sendUserMessage = async (content, options) => { sent.push({ content, options }); };
+    await extension(pi);
+    await commands.workflow.handler("  Build a tiny prototype  ", { ui: { notify() {} } });
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].content.endsWith("User request: Build a tiny prototype\n\n" +
+      "Use workflows to accomplish this task. Do as little work yourself as possible and delegate to the workflow to keep things token-efficient."));
+    assert.deepEqual(sent[0].options, { deliverAs: "followUp" });
+    assert.ok(!sent[0].content.includes("just do the work directly instead"));
+    await commands.workflow.handler(" ", { ui: { notify() {} } });
+    assert.equal(sent.length, 1);
+  } finally { restore(); }
+});
+
+
+test("fork/resume history has every kernel renderer before session_start or async bootstrap", async () => {
+  const restore = restoreInjectedModules({ spawn() {}, cleanup: async () => {} });
+  try {
+    const extension = await loadExtension();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers: new Map(), registered, activeTools: [] });
+    await extension(pi);
+    const theme = { fg: (_color, text) => text };
+    for (const name of ["provision_kernel", "exec_cell", "scratch_run", "write_cell", "run_cell", "read_cell_output"]) {
+      const tool = registered.find((item) => item.name === name);
+      assert.ok(tool, `${name} must exist before history replay`);
+      assert.equal(tool.renderShell, "self");
+      assert.equal(typeof tool.renderCall, "function");
+      assert.equal(typeof tool.renderResult, "function");
+    }
+    const tool = registered.find((item) => item.name === "exec_cell");
+    const context = { state: {} };
+    const call = tool.renderCall({ kernel: "old-kernel", code: "print('fork-history')" }, theme, context);
+    assert.ok(call.render(100).join("\n").includes("fork-history"));
+    const result = tool.renderResult({ content: [{ type: "text", text: "fork-history" }],
+      details: { userCode: ["print('fork-history')"], cellIdx: 1 } }, {}, theme, context);
+    const painted = result.render(100).join("\n");
+    assert.ok(painted.includes("In[1]:"));
+    assert.ok(painted.includes("Out[1]:"));
+    assert.ok(!painted.includes('"kernel":'));
+  } finally { restore(); }
 });

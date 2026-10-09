@@ -4,9 +4,11 @@ Load this reference only after the main Entrypoint selects workflow mode for a s
 implementation or the user explicitly requests this implementation workflow. A request to
 launch subagents, their number, or permission to edit does not select this protocol by itself.
 
-The five-cycle intermediate/final review defaults, initial 3C cohort and balanced merge tree
+The five-cycle intermediate/final review defaults, initial 2C cohort and balanced merge tree
 below are conditional workflow policy, not general AgentPool requirements. Preserve explicit
-user-requested counts and overrides. Live admission remains C across all stages.
+user-requested counts and overrides within this power-of-two workflow. Live admission remains C
+across all stages. C and the initial builder count N must be positive powers of two; C=16 and
+N=2C=32 are the configured default. There are no merge orphans.
 
 Use AgentPool, Task and the main skill's API, failure, continuation and lifecycle contracts.
 Record the integration branch, effect permissions and required CI before proceeding to Stage 1.
@@ -21,6 +23,8 @@ Record the integration branch, effect permissions and required CI before proceed
    remote and test framework, then go to Stage 2.
 2. Resolve C from the user's concurrency request and actual runtime capacity. Record the value
    explicitly; C bounds live agents across build, review and repair, not the submitted backlog.
+   Verify C is a positive power of two before fan-out. If not, report the configuration blocker
+   or choose lightweight delegation; do not silently round a user's limit upward.
 3. Decompose by cohesive subsystems or features. Give each builder the full user request plus
    its piece to discover and implement. Builders choose their own files, interfaces and design.
    Limited alternative implementations are welcome when they explore meaningfully different
@@ -56,12 +60,14 @@ Record the integration branch, effect permissions and required CI before proceed
    IntermediateReview and FinalReview stages sharing the same total capacity C.
    The parent coordinates dependency release and mechanical merges; agents do not coordinate
    other agents unless separately authorized with finite inherited delegation fuel.
-3. Preserve an explicit requested builder count N. Otherwise, prepare 3C initial Build items
+3. Preserve an explicit requested builder count N when it is a positive power of two. Otherwise
+   ask for a supported count or use lightweight delegation; never silently add or discard tasks.
+   With no explicit count, prepare 2C initial Build items
    only when this selected workflow has enough useful scope. Submit the chosen cohort with
-   build.submit_all. This is the initial queued cohort, not 3C simultaneously running processes.
+   build.submit_all. This is the initial queued cohort, not 2C simultaneously running processes.
    Later population develops through review, repair and merge outcomes; do not maintain a
-   predictive 3C frontier or refill merely to meet that number. If useful scope cannot support
-   the default cohort, choose a natural smaller cohort or return to lightweight delegation.
+   predictive 2C frontier or refill merely to meet that number. If useful scope cannot support
+   the default cohort, choose a smaller power-of-two cohort or return to lightweight delegation.
    Never pad the cohort with fabricated features or duplicate busywork.
 4. Give every builder its own branch and worktree from the green baseline. Isolation is the
    default, not a fallback after exhaustive file partitioning. Checkouts may touch any files
@@ -115,14 +121,13 @@ Record the integration branch, effect permissions and required CI before proceed
    move that result directly to its depth bucket. Failures never enter ready buckets.
 6. Drain same-depth pairs in parallel. Do not release an unreviewed parent or reuse a node that
    another merge has already claimed. Preserve every original branch/worktree until completion.
-7. Cross-depth joins are exceptional: wait until the build frontier is genuinely quiescent,
-   including reviews, CI waits, merge repairs or in-flight merges that can release more nodes.
-   Once no equal-depth pair remains and no earlier work can change the frontier, carry the
-   lowest-depth orphan into the next nearest-depth node, then resume same-depth reduction.
-8. Apply at most one orphan carry at a level before moving upward; some cohort sizes require
-   carries at multiple levels. Do not interpret 'one odd branch' as one global exception that
-   leaves the forest unreduced. Every carry still uses git merge, exact-tip CI and the same
-   repair/review gate. Go to Stage 6 only when all accepted nodes reduce to one validated root.
+7. Power-of-two cohorts have no merge orphans: every merge joins equal-depth siblings. Wait
+   for a temporarily unmatched node's sibling to finish review, CI or repair; never carry a
+   node across depths or shrink the cohort after a failure. If a contributor is blocked, keep
+   its recovery state and report the blocker rather than dropping it to force a root.
+8. Proceed to Stage 6 only with one validated root containing all N original contributors at
+   depth log2(N), with no pending nodes or merges. Do not mistake a completed subtree for the
+   whole workflow.
 
 ## Stage 6: Final review and integration
 
@@ -146,7 +151,7 @@ Record the integration branch, effect permissions and required CI before proceed
    'Deleting worktrees from the server' means deleting their remote branches, not remote folders.
 2. Large counts are expressly acceptable. With N initial builders and distinct binary merge
    worktrees, the tree has N-1 merge nodes and 2N-1 worktrees/branches, before extras. For the
-   default N=3C cohort this is 6C-1; explicit user-requested counts take precedence.
+   default N=2C cohort this is 4C-1; explicit user-requested counts take precedence.
    This is expected and authorized by this workflow, not a reason to lower C or serialize work.
 3. The user accepts heavy disk use. Use sccache for Rust and analogous cache solutions when
    other compilers become problematic; fix cache/resource behavior at that layer instead of
