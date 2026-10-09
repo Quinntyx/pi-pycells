@@ -197,3 +197,15 @@ test("power-of-two cohorts reduce without orphan handling and preserve all contr
   assert.ok(prose.includes("positive powers of two"));
   assert.ok(!/lowest-depth orphan|orphan carry|cross-depth carries/.test(workflow));
 });
+
+
+test("configuration docs preserve the reference and describe installed SDK sources", () => {
+  const config = fs.readFileSync(path.join(__dirname, "../docs/configuration.md"), "utf8");
+  for (const heading of ["## What it does", "## How it works", "## Usage", "## Environment variables",
+    "### Execution", "### Tool policy", "### Routing, recovery, sessions", "### Paths and library",
+    "### pi-subagents provisioning", "### Fixed limits (not configurable)"]) {
+    assert.ok(config.includes(heading), heading);
+  }
+  assert.ok(config.includes("Installed SDK source, or managed remote `dev` cache"));
+  assert.ok(!config.includes("~/docs/src/pi-subagents"));
+});

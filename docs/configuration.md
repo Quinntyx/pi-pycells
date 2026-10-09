@@ -125,7 +125,7 @@ optional `pi_subagents` package (`src/subagents-env.ts`). Provisioning runs only
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `PTC_SUBAGENTS_REPO_URL` | URL | `https://git.quinntyx.dev/quinntyx/pi-subagents.git` | Where the provisioner clones pi-subagents from when no dev checkout is found. |
-| `PTC_SUBAGENTS_SOURCE` | path | `~/docs/src/pi-subagents` (if it exists) | Dev checkout installed editable instead of the managed clone; only used when the directory actually contains a `pyproject.toml`. |
+| `PTC_SUBAGENTS_SOURCE` | path | Installed SDK source, or managed remote `dev` cache | Validated runtime source supplied by the managed SDK and inherited by child kernels; no local checkout is probed. |
 | `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` | number | `24` | Minimum interval between syncs; a younger sync stamp in the extension clone skips re-sync. |
 
 ### Fixed limits (not configurable)
