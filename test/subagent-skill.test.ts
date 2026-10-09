@@ -3,13 +3,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const skill = readFileSync(new URL("../skills/pi-subagents/SKILL.md", import.meta.url), "utf8");
-const prose = skill.toLowerCase().replace(/\s+/g, " ");
+const workflow = readFileSync(
+  new URL("../skills/pi-subagents/references/implementation-workflow.md", import.meta.url), "utf8");
+const combined = `${skill}
+${workflow}`;
+const prose = combined.toLowerCase().replace(/\s+/g, " ");
 
-function section(title: string): string {
+function section(title: string, document = combined): string {
   const marker = `\n${title}\n`;
-  const start = skill.indexOf(marker);
+  const start = document.indexOf(marker);
   assert.notEqual(start, -1, `missing ${title}`);
-  const tail = skill.slice(start + marker.length);
+  const tail = document.slice(start + marker.length);
   const next = tail.search(/\n#{1,2} /);
   return next === -1 ? tail : tail.slice(0, next);
 }
@@ -19,9 +23,66 @@ test("subagent skill is a standalone bounded-width procedure without demonstrati
   assert.match(skill, /metadata:\n  type: procedure\n---\n\n# Contract/);
   assert.ok(skill.split("\n").length < 500);
   assert.ok(skill.split("\n").every((line) => line.length <= 100));
-  assert.ok(!skill.includes("```"));
+  for (const document of [skill, workflow]) {
+    assert.ok(document.split("\n").every((line) => line.length <= 100));
+    assert.ok(!document.includes("```"));
+    assert.ok(!/\b(?:subagents|pi_subagents)\.agent\b|\bfrom pi_subagents import[^\n]*\bagent\b/.test(document));
+  }
   for (const title of ["## Input Contract", "## Output Contract", "# Entrypoint"])
     assert.ok(skill.includes(title));
+});
+
+
+test("individual delegation is the default and counts do not imply a workflow", () => {
+  const select = section("## Stage 1: Select the delegation mode", skill)
+    .toLowerCase().replace(/\s+/g, " ");
+  for (const term of ["default to lightweight delegation", "does not request a workflow",
+      "agent count alone", "user explicitly requests a workflow", "scope is large enough",
+      "do not expand a request for n agents to 3c tasks", "total-launch cap"])
+    assert.ok(select.includes(term), term);
+  const contract = section("## Input Contract", skill).toLowerCase();
+  assert.ok(!contract.includes("forgejo"));
+  assert.ok(!contract.includes("review cap"));
+});
+
+test("one agent uses one pool, stage and Task without implementation workflow requirements", () => {
+  const prepare = section("## Stage 2: Prepare only what this work needs", skill)
+    .toLowerCase().replace(/\s+/g, " ");
+  assert.ok(prepare.includes("import agentpool and task from pi_subagents"));
+  assert.ok(prepare.includes("agentpool is the launch entrypoint for both individual agents"));
+  const single = section("## Stage 3: Spin up individual subagents", skill)
+    .toLowerCase().replace(/\s+/g, " ");
+  for (const term of ["one agentpool with concurrency one", "slots one", "one task",
+      "stage.submit", "retain the returned handle", "no additional build/review/merge stages",
+      "submit exactly the requested n", "no mandatory five-cycle", "await handle", "pool.pop",
+      "same outcome twice", "start-only or background", "without waiting or closing the pool",
+      "new handle", "do not close the pool between turns"])
+    assert.ok(single.includes(term), term);
+});
+
+test("implementation protocol is progressively loaded only in selected workflow mode", () => {
+  const dispatch = section("## Stage 4: Run a selected workflow", skill)
+    .toLowerCase().replace(/\s+/g, " ");
+  assert.ok(dispatch.includes("references/implementation-workflow.md"));
+  assert.ok(dispatch.includes("only within that selected mode"));
+  assert.ok(dispatch.includes("requested non-implementation workflow"));
+  assert.ok(dispatch.includes("do not import build ci"));
+  assert.ok(!skill.includes("## Stage 2: Establish CI before fan-out"));
+  assert.ok(!skill.includes("## Stage 5: Balanced mechanical merge and CI gate"));
+  assert.match(workflow, /conditional workflow policy, not general AgentPool requirements/);
+  const initial = section("## Stage 3: Author and submit the initial cohort", workflow)
+    .toLowerCase().replace(/\s+/g, " ");
+  assert.ok(initial.includes("preserve an explicit requested builder count n"));
+  assert.ok(initial.includes("natural smaller cohort or return to lightweight delegation"));
+});
+
+test("lightweight completion retains active sessions and closes only its finished pool", () => {
+  const finish = section("## Stage 5: Report, retain or close", skill)
+    .toLowerCase().replace(/\s+/g, " ");
+  for (const term of ["if agents are active", "follow-up is expected", "failure recovery",
+      "no continuation is needed", "close that pool explicitly", "invalidates its handles",
+      "do not close unrelated pools globally", "cleanup needs separate authorization"])
+    assert.ok(finish.includes(term), term);
 });
 
 test("builders explore subsystems in worktrees rather than implementing file allowlists", () => {
@@ -94,7 +155,8 @@ test("saved-cell review, explicit kernels, nonrecursive leaves and native compac
   for (const term of ["explicit kernel selection", "review the saved", "finite inherited delegation fuel",
       "leaves have zero delegation fuel", "native compaction", "deduplicate submission"])
     assert.ok(prose.includes(term), term);
-  assert.ok(prose.includes("for read-only work"));
+  assert.ok(prose.includes(
+    "read-only agents may share immutable inputs without worktrees, ci setup or git mutation"));
 });
 
 test("retained handle, failure and replay contracts remain explicit", () => {

@@ -1,6 +1,6 @@
 ---
 name: pi-subagents
-description: "Use when orchestrating Pi subagents, pools, worktrees, or parallel implementation."
+description: "Use when launching, continuing, or coordinating individual or multiple Pi subagents."
 metadata:
   type: procedure
 ---
@@ -9,196 +9,115 @@ metadata:
 
 ## Input Contract
 
-- The overall user request, target repository and integration branch, and allowed effects.
-- Effective pool concurrency C, the requested subsystem scope, and acceptance criteria.
-- Git/worktree and push permission for implementation; preserve preexisting user work.
-- An installed pi-subagents runtime, the subagent profile, and an explicit persistent kernel.
-- Forgejo Actions access and an available runner when the remote host is git.quinntyx.dev.
-- Review caps: five intermediate review/repair cycles and five final cycles unless overridden.
+- The user's requested work, desired agent count when specified, and permitted effects.
+- A launch directory, profile and installed pi-subagents runtime; a repository only if needed.
+- A meaningful persistent kernel name and actual runtime/delegation capacity.
+- Acceptance criteria appropriate to the delegated work, without invented delivery deadlines.
+- Git, push, shared-resource and cleanup permission only for operations the task actually needs.
 
 ## Output Contract
 
-- An exploratory subsystem implementation, reduced through CI-gated balanced merge nodes.
-- A published, reviewed integration tip containing every accepted contributing branch.
-- A durable notebook with task lineage, review counters, CI evidence and merge-tree state.
-- On interruption or failure, retained local/remote branches and worktrees for recovery.
-- Cleanup only after the whole workflow succeeds and all owned work is safely integrated.
+- AgentPool-owned handles and inspected outcomes, or a durable status handoff for pending work.
+- Exactly the requested useful assignments, without inflating agent count into a workflow cohort.
+- Retained sessions and recoverable work on failure, interruption or expected continuation.
+- Only authorized effects, with completed work and remaining blockers reported accurately.
 
 # Entrypoint
 
-## Stage 1: Prepare
+## Stage 1: Select the delegation mode
 
-1. Identify the overall requested behavior, acceptance criteria, constraints and target branch.
+1. Identify the requested work, acceptance criteria, allowed effects and desired agent count N.
    Do not invent a delivery deadline, task time quota, file allowlist or implementation design.
-   For a planning-only or read-only request, do not create CI or mutate Git; go to Stage 3.
-   For implementation, inspect the actual remote and test framework, then go to Stage 2.
-2. Resolve C from the user's concurrency request and actual runtime capacity. Record the value
-   explicitly; C bounds live agents across build, review and repair, not the submitted backlog.
-3. Decompose by cohesive subsystems or features. Give each builder the full user request plus
-   its piece to discover and implement. Builders choose their own files, interfaces and design.
-   Limited alternative implementations are welcome when they explore meaningfully different
-   approaches; avoid many agents independently rebuilding the entire application.
+   Ask only when missing information prevents a safe assignment; otherwise use known context.
+2. Default to lightweight delegation: one agent or a natural small set of independent tasks.
+   Asking to spin up subagents does not request a workflow. Agent count alone is not a reason
+   to select one. Do not impose five review passes, a balanced merge tree or 3C decomposition.
+3. Select workflow mode only if the user explicitly requests a workflow or the scope is large
+   enough that dependent implementation, CI gates and multi-subsystem integration justify it.
+   State the reason for that choice. Preserve user overrides and requested counts in either mode.
+4. Resolve live concurrency C within runtime capacity and inherited permission. N is the number
+   of assignments; C is the live admission bound, not a required number of tasks. Do not expand
+   a request for N agents to 3C tasks. If N exceeds C, queue the requested N without duplication.
+   Honor whether a count limits simultaneous agents, assignments or total launches. Do not
+   reinterpret a total-launch cap as concurrency or add unrequested roles behind that cap.
+5. Both modes go to Stage 2. After preparation, lightweight work goes to Stage 3; selected
+   workflow work goes to Stage 4. Permission to edit does not implicitly select workflow mode.
 
-## Stage 2: Establish CI before fan-out
+## Stage 2: Prepare only what this work needs
 
-1. If the repository remote host is git.quinntyx.dev, configure or repair Forgejo Actions before
-   submitting builders. Otherwise retain existing CI and record the available validation gate.
-2. Inspect the project's test discovery and canonical test command. Reuse the actual framework;
-   do not substitute a token smoke check for the test suite. Ensure added tests are discovered.
-3. Reuse existing workflows. Forgejo reads .forgejo/workflows and falls back to .github/workflows
-   only when the former directory is absent; do not accidentally disable existing automation.
-   Cover pushes to every temporary build and merge branch, not only dev/main or pull requests.
-4. Verify Actions is enabled, a compatible runner is available, and required jobs can report a
-   result. Missing runners, permissions or credentials are infrastructure blockers, not success.
-   Do not install services, invent credentials, deploy production or weaken tests to get green.
-5. Commit/push the CI setup on an authorized bootstrap branch based on the target. Wait for the
-   required test jobs to succeed at that exact commit, then use it as the builders' baseline.
-   Preserve the target branch until final integration. If the baseline is red, fix bootstrap
-   or report its blocker before fan-out; unrelated local green tests cannot replace this gate.
-6. Record required workflows/jobs and their commit identity. Missing, queued, running, skipped,
-   cancelled or stale results are not green. Use the forge's supported API/CLI for its installed
-   version; do not assume GitHub-only commands work on Forgejo. Proceed to Stage 3 when ready.
+1. Inspect the persistent kernel before using it. Preflight the installed AgentPool, Task,
+   stage.submit, stage.submit_all, pool.pop and failure APIs, plus the requested profile.
+   Use explicit kernel selection; retain submission identities and live pool/handle objects.
+2. Import AgentPool and Task from pi_subagents. AgentPool is the launch entrypoint for both
+   individual agents and many agents. Do not substitute SDK convenience launch helpers or
+   manual tmux/CLI spawning. A pool does not imply a multi-stage workflow.
+3. Choose cwd and agentDir explicitly, preserving the profile's model unless the user names one.
+   Read-only agents may share immutable inputs without worktrees, CI setup or Git mutation.
+   Isolate concurrent writers with separate worktrees/checkouts and lease real shared resources.
+   Do not touch another writer's checkout or predesign interfaces to avoid creating worktrees.
+4. Write readable briefs with the actual request, each assigned unit, acceptance criteria,
+   directory, permitted effects and relevant checks. Builders choose their own files, interfaces
+   and design. Worktree ownership replaces per-file ownership; never invent arbitrary allowlists.
+5. Keep setup, submission/collection and teardown distinct for retained sessions. Review the saved
+   execution cell unless the user explicitly authorized no-prompt execution. Do not resubmit on
+   replay merely because earlier output is absent. Continue to the mode selected in Stage 1.
 
-## Stage 3: Author and submit the initial cohort
+## Stage 3: Spin up individual subagents
 
-1. Use a persistent kernel with a meaningful name and explicit kernel selection on operations.
-   Preflight Task/AgentPool APIs, the profile and failure classes before submitting work.
-   Store constants, execution and teardown as distinct notebook cells. Review the saved
-   execution cell unless the user explicitly authorized no-prompt execution.
-2. For read-only work, submit the requested useful units without CI or Git mutation; inspect
-   their outcomes and go directly to Stage 7. For implementation, create Build,
-   IntermediateReview and FinalReview stages sharing the same total capacity C.
-   The parent coordinates dependency release and mechanical merges; agents do not coordinate
-   other agents unless separately authorized with finite inherited delegation fuel.
-3. For implementation, prepare 3C initial Build items and submit them with build.submit_all.
-   This is the initial queued cohort, not 3C simultaneously running processes. Later population
-   develops through review, repair and merge outcomes; do not maintain a predictive 3C frontier
-   or refill merely to meet that number. If scope cannot support useful 3C items, report that
-   before launching instead of padding the cohort with fabricated features or duplicate busywork.
-4. Give every builder its own branch and worktree from the green baseline. Isolation is the
-   default, not a fallback after exhaustive file partitioning. Checkouts may touch any files
-   needed for their subsystem. Allocate all initial worktrees without treating disk count as
-   a concurrency limit. Keep leases only for genuinely shared ports/services/mutable resources.
-5. Compose clear task briefs: overall request, assigned subsystem, acceptance criteria, actual
-   checkout and test/CI responsibilities. Do not prescribe implementation interfaces, exact
-   edit paths, arbitrary completion times or a detailed parent-designed solution.
-6. Require builders to add relevant tests, verify discovery, and ensure CI actually runs those
-   tests. Report implemented behavior, design decisions, checks, risks and real blockers.
-   Set cwd and agentDir explicitly. Use schemas and counters for routing, not solution design.
-7. Record each branch, worktree, baseline, feature scope, session handle and review-cycle count.
-   Consume completions as they arrive. Go to Stage 4 for a settled builder; process independent
-   jobs concurrently rather than waiting for a phase-wide barrier.
+1. For a single subagent, create one AgentPool with concurrency one and one named stage with
+   slots one. Construct one Task and launch it with stage.submit; retain the returned handle.
+   No additional build/review/merge stages, CI bootstrap or worktree tree are required.
+2. For several independent agents, use the same pattern with concurrency bounded by C and the
+   actual assignments. Use one stage or only the stages needed by those tasks. Submit exactly
+   the requested N with stage.submit or stage.submit_all; never manufacture a 3C cohort.
+3. Task carries prompt, name, cwd and agentDir; add schema, model, thinking, metadata or timeout
+   only as required by the real task and runtime. Give leaves zero delegation fuel; child
+   orchestrators need separately authorized finite inherited delegation fuel.
+4. Record the pool, stage, handle, task identity and outcome. Collect through await handle or
+   pool.pop, choosing one accounting path per outcome. A directly awaited result also has a
+   pool completion event; do not process the same outcome twice. Check cancellation and errors
+   using the contracts below rather than treating them as successful text or schema bodies.
+5. If the request is start-only or background work, return handles/status without waiting or
+   closing the pool. Keep its kernel alive. Otherwise inspect each result and perform only the
+   verification the requested unit needs; no mandatory five-cycle review/repair loop applies.
+6. For follow-up, reuse the retained session through the continuation contract below. Track the
+   new handle on a scheduled continuation; awaiting the old handle cannot obtain its new answer.
+   Do not close the pool between turns. Proceed to Stage 5 when reporting or finishing this work.
 
-## Stage 4: Intermediate review and repair
+## Stage 4: Run a selected workflow
 
-1. Commit/push the candidate tip and obtain CI evidence for that exact tip. Assign an isolated
-   reviewer the implemented feature and actual diff. Explicitly say it is an INTERMEDIATE
-   review, not a final whole-project review. Inspect evidence, not merely the builder's claims.
-2. The intermediate reviewer must ignore bugs outside this feature/integration scope and be
-   relatively loose. Block only substantive failures: critical logic bugs, races, deadlocks,
-   crashing exceptions, missing required behavior, or similarly consequential test failures.
-   Do not block on nits, style, minor cleanup, speculative redesign or unrelated existing bugs.
-3. CI remains a hard gate even when review is loose. Do not suppress a failing required test.
-   Classify infrastructure failure separately and repair/rerun it; never treat it as a pass.
-4. If review approves and required CI is green for the current tip, add the node to the ready
-   merge buckets in Stage 5. Otherwise send actionable scoped feedback to the original builder
-   in its retained worktree/session, through Build, then review its next tip again in Stage 4.
-5. Count each intermediate review/repair cycle once; default cap is five. A merge repair uses
-   this same loop. At exhaustion retain the branch/worktree, report the unresolved blocker and
-   stop retrying that node. Independent work may continue; do not silently discard failed work.
+1. For substantial implementation or an explicitly requested implementation workflow, read
+   [the implementation workflow](references/implementation-workflow.md) before submission.
+   Follow its CI, review and integration gates only within that selected mode, then go to Stage 5.
+2. For a requested non-implementation workflow, define AgentPool stages and dependency release
+   according to that work. Do not import build CI, five-cycle review defaults, 3C fan-out or
+   balanced Git merging into research, planning or other work where they serve no purpose.
+   Preserve explicit counts, account for outcomes, and proceed to Stage 5 after delivery/handoff.
 
-## Stage 5: Balanced mechanical merge and CI gate
+## Stage 5: Report, retain or close
 
-1. Store approved nodes by tree depth. Initial build nodes have depth zero. Each node records
-   its branch, worktree, head commit, contributing features, parent nodes and CI evidence.
-2. Atomically claim two ready nodes at the same depth d. Create a distinct merge branch/worktree,
-   start from one parent tip and run ordinary git merge of the other. Successful output has
-   depth d+1 and enters that depth's bucket only after validation. Never append it to a flat
-   first-ready queue where it can immediately absorb unrelated depth-zero arrivals.
-3. Do not spawn merge agents by default. If git merge has textual conflicts, queue a Build
-   repair task in this merge worktree. If it succeeds, push the merge tip and wait for required
-   CI. CI failure after merge is semantic incompatibility and also queues a Build repair task.
-   Operational push/runner/auth failures remain blockers, not fabricated merge success.
-4. Tell repair builders the combined feature scope, both parents and observed conflicts/test
-   failures. Let them choose the sound reconciliation, including choosing the more promising
-   competing implementation while preserving requested behavior. Do not impose a repair design.
-5. A repair returns through Stage 4's five-cycle intermediate loop plus exact-tip CI. A clean
-   git merge with green CI needs no intermediate agent pass merely for having been merged;
-   move that result directly to its depth bucket. Failures never enter ready buckets.
-6. Drain same-depth pairs in parallel. Do not release an unreviewed parent or reuse a node that
-   another merge has already claimed. Preserve every original branch/worktree until completion.
-7. Cross-depth joins are exceptional: wait until the build frontier is genuinely quiescent,
-   including reviews, CI waits, merge repairs or in-flight merges that can release more nodes.
-   Once no equal-depth pair remains and no earlier work can change the frontier, carry the
-   lowest-depth orphan into the next nearest-depth node, then resume same-depth reduction.
-8. Apply at most one orphan carry at a level before moving upward; some cohort sizes require
-   carries at multiple levels. Do not interpret 'one odd branch' as one global exception that
-   leaves the forest unreduced. Every carry still uses git merge, exact-tip CI and the same
-   repair/review gate. Go to Stage 6 only when all accepted nodes reduce to one validated root.
+1. Report verified outcomes, pending work, errors and blockers at the requested level of detail.
+   Do not infer completion from an inactive window, an empty reply or a model's self-report.
+2. If agents are active, follow-up is expected, or failure recovery remains, retain the owned
+   pool, handles, sessions, notebook and workspaces. Return their status and resume identities.
+   A cell interrupt or waiting timeout does not authorize cancellation, respawn or pool close.
+3. Only when owned work is complete and no continuation is needed, close that pool explicitly.
+   Pool close is permanent and invalidates its handles. Do not close unrelated pools globally.
+   Git/worktree/branch cleanup needs separate authorization or the selected workflow's policy.
+   Preserve user state and use trash for approved filesystem removal, never rm.
 
-## Stage 6: Final review and integration
+# Shared runtime and prompt discipline
 
-1. Give the final reviewer the whole request, combined tree and actual test/CI evidence. Say it
-   is FINAL review: it may apply stricter project-wide standards and inspect cross-subsystem
-   behavior, regressions, maintainability and duplication. This is not a scoped loose review.
-2. If rejected, route substantive feedback through Build on the combined worktree and repeat
-   final review and exact-tip CI. Default final review/repair cap is five cycles, counted
-   separately from intermediate cycles. At exhaustion retain state and report the blocker.
-3. When final review and CI pass, fetch the target. If it moved incompatibly, reconcile on the
-   integration worktree and repeat validation/review for the changed candidate; never force-push
-   or reuse stale approval. Merge the accepted root into the authorized target and push it.
-4. Require target CI green at the published tip and verify every contributing task tip is an
-   ancestor of it. A PR, clean local checkout or unpublished branch is not delivery. Create
-   PRs only if the user asked. Proceed to Stage 7 only when the whole workflow succeeds.
-
-## Stage 7: Retention, cleanup and handoff
-
-1. For read-only work, report inspected outcomes and close only the owned completed pool;
-   preserve repository state. For implementation, keep all initial, intermediate merge,
-   repair and review worktrees and remote branches for
-   the ENTIRE workflow. Do not delete either merged children or remote branches incrementally.
-   'Deleting worktrees from the server' means deleting their remote branches, not remote folders.
-2. Large counts are expressly acceptable. With N=3C initial builders and distinct binary merge
-   worktrees, the tree has N-1 merge nodes and 2N-1 = 6C-1 worktrees/branches, before extras.
-   This is expected and authorized by this workflow, not a reason to lower C or serialize work.
-3. The user accepts heavy disk use. Use sccache for Rust and analogous cache solutions when
-   other compilers become problematic; fix cache/resource behavior at that layer instead of
-   reducing agent concurrency. Cache setup still must respect credentials and install policy.
-4. After every worker is stopped, all contributing work is reachable from the published target,
-   target CI is green and final review approved, close the pool. Only then remove owned temporary
-   remote branches and local worktrees/branches. Preserve dev/main, canonical worktrees and user
-   data; use trash for filesystem removal, never rm. Do not force-delete dirty or unmerged work.
-5. A blocked requested subsystem forbids whole-workflow success and cleanup unless the user
-   explicitly supersedes its scope. On partial failure, interruption or unresolved rejected
-   work, retain recoverable state.
-   Report delivered behavior, unresolved issues, test evidence and resume identities; do not
-   claim success or clean away the failed branch to manufacture a completed workflow.
-
-# Runtime and prompt discipline
-
-- The scheduler is event-driven; the initial 3C Build cohort is not a fixed-size batch barrier.
-  Review, repair and merge work may grow the submitted pool while live admission remains C.
-- Preserve explicit user-requested counts. Do not manufacture unrelated subsystems to satisfy C.
-- Acceptance criteria describe required behavior, not parent-specified classes/files/interfaces.
-  Do not call exhaustive design prescriptions 'contracts' and smuggle them into builder prompts.
-- Worktree ownership replaces per-file ownership. Shared services still need exclusive leases
-  where actual interference exists; immutable inputs can be shared without arbitrary handcuffs.
-- Never impose invented task quotas. Distinguish real user deadlines from transport/startup
-  watchdogs. Use supported runtime guards; a timeout is not evidence that the work is useless.
-- Kernel means the persistent Python interpreter; notebook is its recorded .ipynb; session means
-  a Pi agent conversation. Use explicitly named kernels, saved-cell review and durable lineage.
-- Continue valid agent sessions across review feedback. Native compaction handles context
-  pressure; do not request early handoffs or mark a feature done just to refresh context.
-- No automatic recursive delegation. Authorized child orchestrators inherit finite B/L fuel,
-  global admission bounds and any real user deadline; leaves have zero delegation fuel.
-  Review/repair caps bound feedback branching. Queued work is not extra permission to run agents.
-- Prepare shared-resource identifiers and effect permissions, but do not predesign the product.
-- Keep prompts readable. Translate validated results into concrete prose for follow-up agents;
-  do not dump raw JSON into prompts. Use metadata for depth, rounds, parents and CI identities.
-- Preserve model/profile choices unless the user requests a change. Never infer completion or
-  mergeability from a model's self-report, an empty reply, a schema pass or an inactive window.
-- Resume from durable notebook state; deduplicate submission by task identity. Retained failure
-  windows and workspaces are recovery assets. Do not resubmit the entire cohort on cell replay.
+- Native compaction handles context pressure. Do not request early handoffs, replace sessions
+  or mark work done merely to refresh context; continue valid sessions across real feedback.
+- No automatic recursive delegation. Authorized orchestrators inherit finite B/L fuel, global
+  admission bounds and actual user deadlines; leaves have zero delegation fuel.
+- Separate user delivery deadlines from operational transport/startup watchdogs. Use supported
+  runtime guards without inventing business quotas or treating a timeout as worthless work.
+- Keep prompts readable; translate validated results into concrete prose for follow-up agents.
+  Metadata tracks lineage and real counters, not a parent-designed implementation contract.
+- Preserve explicit user-requested counts and deduplicate submission by task identity. Review
+  and merge policies belong to the selected workflow, not to every pool or implementation task.
 
 # API and continuation contract
 
@@ -272,7 +191,7 @@ metadata:
   `PiSubagentsTimeoutError`. These reach `pop()` through `AgentPoolFailureError`.
 - Use supported operational wait guards. `AgentPoolTimeoutError` stops the
   waiting cell, not its pool; inspect `.pool` / `.snapshot` and continue later.
-- Do not blanket-catch a workflow. Catch `AgentPoolFailureError` only around the
+- Do not blanket-catch delegated work. Catch `AgentPoolFailureError` only around the
   individual `pop()` whose task/stage and underlying cause may match the predeclared
   recoverable policy. Check exact allowed cause types and containment conditions;
   neither the wrapper nor membership in a broad exception base is sufficient.
@@ -298,7 +217,8 @@ metadata:
   and `list_models(refresh=True)` forces a reread. Set thinking when appropriate.
 - `with AgentPool(...)` closes on clean exit; reserve it for trivial fixtures
   without retained sessions or substantial orchestration. Exceptions inside the
-  context leave the pool intact. Real workflows use separate teardown cells.
+  context leave the pool intact. Retained individual agents and workflows use separate teardown
+  cells; neither mode authorizes closing a pool while continuation is still needed.
 - Interrupts stop cells, not pools. Do not kill/reset a kernel while agents are
   active: losing handles can orphan windows. Continue using the same namespace.
 - Do not blindly `run_all` an active workflow. Notebook sources, stored outputs,
@@ -308,10 +228,3 @@ metadata:
   another builder's worktree without permission. Worktree use and cleanup remain
   subject to user authorization. Runtime success-only dormancy is not permission
   for extra destructive cleanup or early pool close.
-
-# Forgejo references
-
-- Workflows, runner prerequisites and branch triggers:
-  https://forgejo.org/docs/latest/user/actions/overview/
-  https://forgejo.org/docs/latest/user/actions/quick-start/
-  https://forgejo.org/docs/latest/user/actions/reference/
