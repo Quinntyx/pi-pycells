@@ -17,7 +17,9 @@ See [Python execution boundary](docs/python-runtime.md).
 
 ## Install
 
-First, make sure Pi can answer a normal prompt and that [`uv`](https://docs.astral.sh/uv/) is on your PATH.
+First, make sure Pi can answer a normal prompt and that
+[`uv`](https://docs.astral.sh/uv/) and `tmux` are on your PATH. Start Pi inside the
+tmux session that should own its persistent kernels.
 
 ```bash
 pi install git:git.quinntyx.dev/quinntyx/pi-pycells@dev
@@ -53,9 +55,45 @@ pi remove git:git.quinntyx.dev/quinntyx/pi-pycells@dev
 
 - **Pi and a compatible Node.js runtime.** Follow Pi's current runtime requirements.
 - **uv.** Provisions Python environments and installs dependencies. The default interpreter is CPython 3.14; it is downloaded automatically if needed. IPython is provisioned into kernel environments.
-- **Subagents only:** `git` and [tmux](https://github.com/tmux/tmux). `pi install` installs and loads [pi-sock](https://github.com/Quinntyx/pi-sock) with pi-pycells; agents using the same Pi configuration inherit it. A separate subagents configuration needs pi-sock installed there too (see below). The `pi_subagents` Python module is provisioned when subagents are enabled.
+- **[tmux](https://github.com/tmux/tmux).** Run Pi inside tmux to use kernels. One independent kernel host serves each tmux session.
+- **Subagents only:** `git`. `pi install` installs and loads [pi-sock](https://github.com/Quinntyx/pi-sock) with pi-pycells; agents using the same Pi configuration inherit it. A separate subagents configuration needs pi-sock installed there too (see below). The `pi_subagents` Python module is provisioned when subagents are enabled.
 
 The package includes three skills: **notebook-workflow** for authoring and handover, **pycells-library** for reusable notebooks, and **pi-subagents** for orchestration.
+
+## Persistent kernel host
+
+The first kernel connection starts a `pycells-kernels` tmux window. It owns the
+IPython interpreters independently of Pi; tabs show the actual notebook cells,
+outputs, and live execution. Use Tab/arrow keys to select kernels and
+Up/Down/PageUp/PageDown to scroll. End follows the latest notebook content.
+
+Closing Pi, `/reload`, and `/fork` detach the client without terminating kernels
+or cancelling accepted cells. Discovery is scoped to the **tmux server socket
+and stable tmux session ID**, not its renameable session name. Kernels are tagged
+with their creating Pi session ID. Ordinary discovery shows only that session's
+kernels and explicitly attached kernels.
+
+To recover one from a previous conversation or fork:
+
+```text
+list_kernels({ all_sessions: true })
+attach_kernel({ id: "<discovered kernel ID>", alias: "analysis" })
+inspect_kernel({ kernel: "analysis" })
+```
+
+`list_kernels()` uses the normal session-scoped view. `all_sessions` searches only
+this tmux session's host, not other tmux sessions. Attachment preserves the
+original owner tag and may assign a local alias to avoid name collisions. Check
+`running` and `last_operation` before submitting work: disconnecting does not
+mean an accepted cell failed, and reconnecting never implicitly reruns it.
+Read the recorded cell output after it finishes.
+
+The host keeps state in memory; this is **not** kernel snapshotting. Killing the
+host or its tmux session still terminates its interpreters. To load changes to
+the host/runtime itself, finish your work and explicitly close the
+`pycells-kernels` tmux window before reconnecting. Restarting Pi alone deliberately
+leaves an existing host running. The host does not restore Python memory after
+its own death and contains no separate subagent workflow scheduler.
 
 ## Notebook workflow
 
@@ -82,16 +120,16 @@ Use ordinary Python libraries inside cells. For example, `pathlib` handles files
 ### Naming and targeting kernels
 
 - `provision_kernel` requires a **nonempty, unique `name`** (trimmed; control and
-  terminal escape characters are rejected). Names must be unique among live
-  kernels, and provisioning fails on a duplicate.
+  terminal escape characters are rejected). Names must be unique among the kernels visible to the current Pi session,
+  and provisioning fails on a duplicate.
 - Every other public tool requires **`kernel: "name"`** and resolves it by the
   human-readable live-kernel name. There is no implicit most-recent kernel:
   omitting `kernel`, or naming a kernel that is not live, is an error.
-- There is no global discovery tool; `list_kernels` has been removed. You know
-  the names you provisioned, and each result names its kernel.
-- Internal kernel UUIDs may exist for protocol bookkeeping, but they are never
-  shown in the terminal UI; tool calls and results are labeled with the kernel's
-  name and notebook instead.
+- `list_kernels` discovers your kernels; `all_sessions: true` intentionally
+  includes other Pi sessions on the same tmux host. `attach_kernel` gives a
+  recovered kernel a visible name before ordinary notebook operations.
+- Discovery supplies kernel IDs for explicit attachment. Ordinary notebook
+  calls and result blocks still use readable kernel names and notebook paths.
 
 ### Choosing an operation
 

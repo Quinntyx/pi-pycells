@@ -41,6 +41,9 @@ function makeFakeSessionManager(sandbox) {
       }
     }
 
+    async attachOwner(owner) { this.owner = owner; }
+    async discover() { return this.list(); }
+    async attachKernel(id, alias) { const k = this.list().find(k => k.id === id); if (!k) throw new Error("Unknown kernel"); return { ...k, name: alias ?? k.name, ownerSessionId: this.owner }; }
     async provision(options) {
       this.provisionedKernels ??= [];
       const id = `s${this.provisionedKernels.length + 1}`;
@@ -124,7 +127,7 @@ function buildPi({ eventHandlers, registered, activeTools }) {
     },
     commands,
     on(event, handler) {
-      eventHandlers.set(event, handler);
+      eventHandlers.set(event, (eventValue, ctx) => handler(eventValue, { sessionManager: { getSessionId: () => "test-pi-session" }, ...ctx }));
     },
     getAllTools() {
       return [{ name: "exec_cell" }];
@@ -158,10 +161,12 @@ function restoreInjectedModules(sandbox, overrides = {}) {
     ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
+  const restorePersistent = setModuleExports("../dist/kernel-host/client.js", { PersistentSessionManager: FakeSessionManager });
   return () => {
     restoreSandbox();
     restoreManager();
     restoreSessions();
+    restorePersistent();
   };
 }
 
@@ -230,6 +235,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
+  const restorePersistent = setModuleExports("../dist/kernel-host/client.js", { PersistentSessionManager: FakeSessionManager });
   const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
     createSandbox: async () => sandbox,
   });
@@ -249,9 +255,11 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     assert.deepEqual(
       toolNames.sort(),
       [
+        "attach_kernel",
         "delete_cell",
         "exec_cell",
         "inspect_kernel",
+        "list_kernels",
         "provision_dependency",
         "provision_kernel",
         "read_cell",
@@ -298,6 +306,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     restoreSandbox();
     restoreManager();
     restoreSessions();
+    restorePersistent();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
@@ -1499,8 +1508,9 @@ test("kernels are named, unique, and every operation targets an explicit kernel"
     const ctx = { cwd: process.cwd() };
     const byName = (name) => registered.find((tool) => tool.name === name);
 
-    // Discovery is not a tool: there is no implicit kernel targeting route.
-    assert.ok(!byName("list_kernels"), "list_kernels must not be registered");
+    // Discovery is explicit; execution still requires a named attached kernel.
+    assert.ok(byName("list_kernels"));
+    assert.ok(byName("attach_kernel"));
 
     const provision = byName("provision_kernel");
     const created = await provision.execute("p1", { name: "analysis" }, undefined, undefined, ctx);

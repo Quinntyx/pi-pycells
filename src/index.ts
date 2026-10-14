@@ -49,6 +49,7 @@ import {
 import { highlightCellCode } from "./execution/code-highlight";
 import { createLiveRepaint } from "./execution/live-repaint";
 import { PythonSessionManager } from "./python-session-manager";
+import { PersistentSessionManager } from "./kernel-host/client";
 import type {
   CodeExecutionResult,
   NotebookCellSummary,
@@ -1598,6 +1599,28 @@ function registerKernelTools(
     })
   );
   register(resetKernelTool(sessionManager, directory));
+  if (sessionManager instanceof PersistentSessionManager) {
+    register(withActivityLabel({
+      name: "list_kernels", label: "list kernels",
+      description: "Discover live kernels on this tmux session's persistent host. Default: this Pi session's kernels and explicitly attached kernels. Set all_sessions=true to discover other Pi sessions' kernels for intentional recovery/fork attachment. Discovery alone does not attach or execute code.",
+      parameters: Type.Object({ all_sessions: Type.Optional(Type.Boolean()) }),
+      execute: async (_id, params) => {
+        const kernels = await sessionManager.discover(Boolean((params as { all_sessions?: boolean }).all_sessions));
+        return { content: [{ type: "text", text: JSON.stringify(kernels.map(k => ({ id: k.id, name: k.name, owner_session: k.ownerSessionId, notebook: k.notebookPath, running: k.running, last_operation: k.lastOperation })), null, 2) }], details: { kernels } };
+      },
+    }));
+    register(withActivityLabel({
+      name: "attach_kernel", label: "attach kernel",
+      description: "Explicitly attach a live kernel discovered with list_kernels(all_sessions=true) on this tmux session. Preserve namespace, notebook and execution; never reset/replay it. Creating Pi session tag is retained. Supply alias if its name conflicts with a visible kernel.",
+      parameters: Type.Object({ id: Type.String(), alias: Type.Optional(Type.String()) }),
+      execute: async (_id, params) => {
+        const args = params as { id: string; alias?: string };
+        const kernel = await sessionManager.attachKernel(args.id, args.alias);
+        const ref = directory.register(kernel.name, kernel.id, kernel.notebookPath);
+        return { content: [{ type: "text", text: `Attached kernel "${ref.name}" (${kernel.id}); ${kernel.running ? "execution still running—inspect before submitting more code" : "namespace retained"}.` }], details: { ...kernelIdentity(ref), owner_session: kernel.ownerSessionId, running: kernel.running } };
+      },
+    }));
+  }
 }
 
 /** session_start: scan custom tools, then (re)register all PTC tools. */
@@ -1613,6 +1636,9 @@ async function handleSessionStart(
   ctx: ExtensionContext
 ): Promise<void> {
   sessionState.currentCwd = ctx.cwd;
+  if (sessionManager instanceof PersistentSessionManager) {
+    await sessionManager.attachOwner(ctx.sessionManager.getSessionId());
+  }
   if (!sessionState.customToolsStarted) {
     await customToolManager.start();
     sessionState.customToolsStarted = true;
@@ -1698,7 +1724,7 @@ function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
   sessionState.recoveryState = null;
 }
 
-/** session_shutdown: close custom tools, dispose all kernels, clean the sandbox. */
+/** session_shutdown: close Pi-local tools and detach; persistent kernels keep running. */
 async function handleSessionShutdown(
   customToolManager: CustomToolManager,
   sandboxManager: SandboxManager,
@@ -1757,7 +1783,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   }
 
   let subagentRuntime: SubagentRuntimeApi | undefined;
-  const sessionManager = new PythonSessionManager(sandboxManager, settings, extensionRoot, {
+  const sessionManager = new PersistentSessionManager(sandboxManager, settings, extensionRoot, {
     onSubagentSnapshot: (sessionId, execId, snapshot) => {
       subagentRuntime?.publish(sessionId, snapshot);
       sessionState.lastSubagentSnapshot = snapshot;

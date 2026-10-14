@@ -91,11 +91,14 @@ test("tight loops rate-limit progress frames and the kernel is reaped on disposa
 });
 
 test("an idle timeout interrupts the cell without killing the persistent kernel", async () => {
-  const { manager, sandbox, process: spawnedProcess } = await makeManager({ executionTimeoutMs: 200 });
+  const { manager, sandbox, process: spawnedProcess } = await makeManager();
 
   try {
     const { id } = await manager.provision({ name: "lifecycle-idle", cwd: process.cwd(), ctx: fakeCtx() });
     const proc = spawnedProcess();
+    // Do not make this watchdog test depend on cold optional-library imports.
+    await manager.execForeground(id, "pass", { cwd: process.cwd() });
+    manager.settings.executionTimeoutMs = 200;
     await assert.rejects(
       manager.execForeground(id, "import time\ntime.sleep(30)", { cwd: process.cwd() }),
       /idle for|timed out|interrupted/i,
@@ -103,8 +106,9 @@ test("an idle timeout interrupts the cell without killing the persistent kernel"
 
     assert.equal(proc.exitCode, null);
     assert.equal(proc.signalCode, null);
+    manager.settings.executionTimeoutMs = 10_000;
     const recovered = await manager.execForeground(id, "return 'still alive'", { cwd: process.cwd() });
-    assert.match(recovered.output, /^return \(Out\[2\]\):\n  still alive/);
+    assert.match(recovered.output, /^return \(Out\[3\]\):\n  still alive/);
   } finally {
     await dispose(manager, sandbox);
   }
@@ -155,5 +159,27 @@ test("retired host-tool frames fail fast without dispatching any host operation"
   try {
     const { id } = await manager.provision({ name: "reject-bridge", cwd: process.cwd(), ctx: fakeCtx() });
     await assert.rejects(manager.execForeground(id, "_ptc_protocol_write({'type': 'tool_call', 'id': 'x', 'tool': 'bash', 'params': {'command': 'false'}})", { ctx: fakeCtx() }), /Unsupported notebook transport frame: tool_call/);
+  } finally { await dispose(manager, sandbox); }
+});
+
+
+test("interrupting cell preparation reports an error and keeps the interpreter usable", async () => {
+  const { manager, sandbox } = await makeManager();
+  try {
+    const { id } = await manager.provision({ name: "prepare-interrupt", cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.execForeground(id, [
+      "import time",
+      "_runtime = _ptc_exec_chunk.__globals__",
+      "_original_setup = _runtime['_setup_matplotlib']",
+      "def _slow_setup():",
+      "    _runtime['_setup_matplotlib'] = _original_setup",
+      "    time.sleep(30)",
+      "_runtime['_setup_matplotlib'] = _slow_setup",
+    ].join("\n"), { cwd: process.cwd() });
+    manager.settings.executionTimeoutMs = 200;
+    await assert.rejects(manager.execForeground(id, "prepared = 42", { cwd: process.cwd() }), /idle for|interrupted/i);
+    manager.settings.executionTimeoutMs = 10_000;
+    const result = await manager.execForeground(id, "return 42", { cwd: process.cwd() });
+    assert.equal(parseSection(result.output, "return"), "42");
   } finally { await dispose(manager, sandbox); }
 });

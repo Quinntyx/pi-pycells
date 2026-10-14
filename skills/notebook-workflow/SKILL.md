@@ -40,25 +40,52 @@ may hold values from code that is no longer in the notebook. `run_to` /
 `run_all` / `reset_kernel` exist to resync; `inspect_kernel` shows what the
 namespace actually holds. Never assume the kernel matches the notebook.
 
-| Operation | Use it when | Notebook effect | Kernel effect |
-| --- | --- | --- | --- |
-| `provision_kernel` | You need a kernel (once per task). Give it a unique `name`. | Creates/opens the `.ipynb`. | Fresh namespace. |
-| `scratch_run(code)` | Explore: try an import, check a shape, iterate on a value. | **Nothing is appended.** | Mutates the namespace. |
-| `write_cell(at, source, type=...)` | Author content: add or replace a cell (`type="markdown"` for prose). | Inserts/replaces at position `at`; a replaced cell's outputs are cleared as stale; saved immediately. | None. |
-| `run_cell(n)` | Execute the cell you just wrote or edited, at its position. **The main execution path** — write one cell, run one cell. | Updates that cell's outputs. | Mutates the namespace. |
-| `run_to(n)` | Jump to a cell: rebuild 1..*n* after `reset_kernel()`, or resync to a specific point when otherwise needed. **Not the routine driver for freshly written cells.** | Refreshes outputs for 1..*n*. | Rebuilds namespace from those cells. |
-| `run_all()` | Resync the whole notebook (the run-before-handover op). | Refreshes all outputs. | Rebuilds the full namespace. |
-| `reset_kernel()` | You need a clean namespace. | Untouched. | Restarts the interpreter. |
-| `exec_cell(code)` | You have proven code and want it **both executed and appended** as a new cell. | Appends a new code cell with outputs. | Mutates the namespace. |
-| `delete_cell(n)` | Remove a cell. | Deletes it. | None. |
-| `read_cells` / `read_cell` | Curate: read cell sources and current outputs. | None. | None. |
-| `inspect_kernel` | See what the named kernel's namespace actually holds (names, types, funcs). | None. | None. |
+- `provision_kernel`: You need a kernel (once per task). Give it a unique `name`.. Notebook:
+  Creates/opens the `.ipynb`.. Runtime: Fresh namespace.
+- `scratch_run(code)`: Explore: try an import, check a shape, iterate on a value.. Notebook:
+  **Nothing is appended.**. Runtime: Mutates the namespace.
+- `write_cell(at, source, type=...)`: Author content: add or replace a cell (`type="markdown"` for
+  prose).. Notebook: Inserts/replaces at position `at`; a replaced cell's outputs are cleared as
+  stale; saved immediately.. Runtime: None.
+- `run_cell(n)`: Execute the cell you just wrote or edited, at its position. **The main execution
+  path** — write one cell, run one cell.. Notebook: Updates that cell's outputs.. Runtime: Mutates
+  the namespace.
+- `run_to(n)`: Jump to a cell: rebuild 1..*n* after `reset_kernel()`, or resync to a specific point
+  when otherwise needed. **Not the routine driver for freshly written cells.**. Notebook: Refreshes
+  outputs for 1..*n*.. Runtime: Rebuilds namespace from those cells.
+- `run_all()`: Resync the whole notebook (the run-before-handover op).. Notebook: Refreshes all
+  outputs.. Runtime: Rebuilds the full namespace.
+- `reset_kernel()`: You need a clean namespace.. Notebook: Untouched.. Runtime: Restarts the
+  interpreter.
+- `exec_cell(code)`: You have proven code and want it **both executed and appended** as a new cell..
+  Notebook: Appends a new code cell with outputs.. Runtime: Mutates the namespace.
+- `delete_cell(n)`: Remove a cell.. Notebook: Deletes it.. Runtime: None.
+- `read_cells` / `read_cell`: Curate: read cell sources and current outputs.. Notebook: None..
+  Runtime: None.
+- `inspect_kernel`: See what the named kernel's namespace actually holds (names, types, funcs)..
+  Notebook: None.. Runtime: None.
 
 Every operation in this table other than `provision_kernel` takes a required
 `kernel: "name"` argument resolved against live kernels by human-readable name;
-unknown or omitted names are errors, and `list_kernels` no longer exists.
+unknown or omitted names are errors. `list_kernels` discovers kernels on the current
+tmux session's persistent host; ordinary discovery includes only this Pi session's
+kernels and explicitly attached ones.
 `write_cell` both inserts a new cell and replaces the one at `at` — it is the
 only in-place source editor, and it never executes anything.
+
+**Attachment and recovery**
+
+- Pi sessions are clients of one persistent host per tmux session. Closing Pi,
+  reloading, or forking detaches the client; it does not cancel accepted cells.
+- Before provisioning replacement state after a resume or fork, call
+  `list_kernels` with `all_sessions: true` to intentionally inspect previous Pi
+  sessions on the same tmux host. Ordinary discovery must remain session-scoped.
+- Attach the selected kernel using `attach_kernel` with its discovered `id` and
+  an optional `alias`; the original creating Pi session tag does not change.
+- Check `running` and `last_operation`, then inspect the namespace when idle.
+  Do not rerun an accepted cell merely because its originating tool call was lost.
+- Read durable cell outputs to recover completed results. Killing the kernel host
+  still loses Python memory; no automatic snapshot or reconstruction is promised.
 
 **Canonical flows**
 

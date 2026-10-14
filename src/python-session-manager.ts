@@ -1095,6 +1095,8 @@ interface SessionRecord {
   /** Number of source code chunks attempted during provisioning. */
   prefixChunkCount: number;
   sourcedFrom?: string;
+  /** Private launch environment; never exposed through summaries. */
+  launchEnvironment?: NodeJS.ProcessEnv;
 }
 
 /** Join a notebook cell's `source`/`text` field, which may be a string or array. */
@@ -1426,11 +1428,11 @@ export class PythonSessionManager {
     }
   }
 
-  private spawnSession(code: string, cwd: string, pythonExecutable?: string): ChildProcess {
+  private spawnSession(code: string, cwd: string, pythonExecutable?: string, launchEnvironment?: NodeJS.ProcessEnv): ChildProcess {
     // Subagent agent-dir selection is env-driven end to end: the kernel
     // inherits PI_CODING_SUBAGENT_DIR / PI_CODING_AGENT_DIR from this process
     // and pi_subagents resolves it — no PTC-side translation needed.
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...(launchEnvironment ?? process.env) };
 
     // The current sandbox API takes one options object. Keep a compatibility
     // path for older SandboxManager implementations while the contract migration
@@ -1442,7 +1444,12 @@ export class PythonSessionManager {
       return spawnWithOptions.call(this.sandboxManager, { code, cwd, env, pythonExecutable });
     }
 
-    return this.sandboxManager.spawn(code, cwd, pythonExecutable);
+    if (!launchEnvironment) return this.sandboxManager.spawn(code, cwd, pythonExecutable);
+    // Legacy synchronous adapters read process.env while spawning. Scope it to
+    // this launch only, never across an await or another interpreter's work.
+    const previousEnvironment = process.env;
+    try { process.env = env; return this.sandboxManager.spawn(code, cwd, pythonExecutable); }
+    finally { process.env = previousEnvironment; }
   }
 
   /**
@@ -1458,6 +1465,7 @@ export class PythonSessionManager {
     parentToolCallId?: string;
     /** Pinned interpreter; undefined spawns the shared venv's python. */
     pythonExecutable?: string;
+    launchEnvironment?: NodeJS.ProcessEnv;
   }): { proc: ChildProcess; protocol: PersistentSessionProtocol } {
     const { sessionId, cwd } = params;
     const { rpcCode, runtimeCode, sessionCode } = loadPythonRuntimeSources(this.extensionRoot);
@@ -1469,10 +1477,10 @@ export class PythonSessionManager {
       maxOutputChars: this.settings.maxSpoolChars,
       hostWorkspaceRoot: cwd,
       runtimeWorkspaceRoot: this.sandboxManager.getRuntimeWorkspaceRoot(cwd),
-      autoimportSubagents: !process.env.PI_SUBAGENT_DEPTH,
+      autoimportSubagents: !(params.launchEnvironment ?? process.env).PI_SUBAGENT_DEPTH,
     });
 
-    const proc = this.spawnSession(prelude, cwd, params.pythonExecutable);
+    const proc = this.spawnSession(prelude, cwd, params.pythonExecutable, params.launchEnvironment);
     const protocol = new PersistentSessionProtocol(proc, {
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
       sendSignal: (signal) => {
@@ -1514,6 +1522,7 @@ export class PythonSessionManager {
     ctx: ExtensionToolContext;
     /** Required public kernel identity; validated and uniqueness-checked. */
     name?: string;
+    launchEnvironment?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
     onUpdate?: ToolUpdateCallback;
     parentToolCallId?: string;
@@ -1584,6 +1593,7 @@ export class PythonSessionManager {
       signal: options.signal,
       parentToolCallId: options.parentToolCallId,
       pythonExecutable,
+      launchEnvironment: options.launchEnvironment,
     });
 
     const record: SessionRecord = {
@@ -1603,6 +1613,7 @@ export class PythonSessionManager {
       prefixCellCount: preparedSource?.prefixCellCount ?? 0,
       prefixChunkCount: 0,
       sourcedFrom: preparedSource?.path,
+      launchEnvironment: options.launchEnvironment ? { ...options.launchEnvironment } : undefined,
     };
 
     // Reap the session only if the process being reaped is still the record's
@@ -1931,6 +1942,7 @@ export class PythonSessionManager {
         // A pinned kernel resets onto its own pinned interpreter, never the
         // shared venv — otherwise reset silently de-pins the kernel.
         pythonExecutable: record.pythonExecutable,
+          launchEnvironment: record.launchEnvironment,
       });
       record.proc = proc;
       record.protocol = protocol;

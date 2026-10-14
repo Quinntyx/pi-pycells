@@ -1287,6 +1287,33 @@ def _ptc_interrupt_chunk() -> None:
         task.cancel()
 
 
+async def _ptc_guarded_exec_chunk(frame: dict) -> None:
+    """Keep interrupts during cell preparation from escaping the worker task.
+
+    IPython imports, namespace fingerprinting and capture setup happen before
+    the inner user-code guard. A short idle timeout can interrupt those too.
+    """
+    global _cell_counter
+    try:
+        await _ptc_exec_chunk(frame)
+    except (KeyboardInterrupt, SystemExit, _ptc_asyncio.CancelledError) as error:
+        _ptc_sys.settrace(None)
+        _stdout_proxy.flush()
+        _ptc_sys.stdout = _ORIGINAL_STDOUT
+        count = frame.get("source_exec_count")
+        if not isinstance(count, int) or count < 1:
+            count = max(1, _cell_counter)
+            _cell_counter = count
+        code = frame.get("code") or ""
+        source = frame.get("source_path")
+        _ptc_report_cell_error(
+            frame.get("id") or "unknown", count, code,
+            source or f"<ptc-cell-{count}>", source,
+            frame.get("target_cell_index"), error,
+            append=frame.get("append", True),
+        )
+
+
 async def _ptc_session_entry() -> None:
     """Persistent exec loop; driven by _ptc_session_bootstrap() when
     PTC_MODE == "session"."""
@@ -1339,7 +1366,7 @@ async def _ptc_session_entry() -> None:
             _ptc_doc_op(frame)
             _stdout_proxy.flush()
             continue
-        task = _ptc_asyncio.ensure_future(_ptc_exec_chunk(frame))
+        task = _ptc_asyncio.ensure_future(_ptc_guarded_exec_chunk(frame))
         _ptc_current_chunk_task = task
         # Attribute agents spawned during this chunk to it: the viewer only
         # renders rows whose exec scope matches the exec being streamed.
