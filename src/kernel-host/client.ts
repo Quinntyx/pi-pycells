@@ -72,8 +72,12 @@ async function acquireCreationLease(socketPath: string): Promise<() => void> {
 }
 export async function ensureHost(endpoint: HostEndpoint, extensionRoot: string): Promise<void> {
   if (await reachable(endpoint.socketPath)) return;
-  const main = path.join(extensionRoot, "dist/kernel-host/main.js");
-  if (!fs.existsSync(main)) throw new Error(`Kernel host executable missing: ${main}. Build/update pi-pycells before provisioning.`);
+  // Git packages are source-loaded by Pi and installed without build tooling.
+  // Prefer the shipped launcher over potentially stale local build output.
+  const sourceMain = path.join(extensionRoot, "src/kernel-host/launch.cjs");
+  const compiledMain = path.join(extensionRoot, "dist/kernel-host/main.js");
+  const main = fs.existsSync(sourceMain) ? sourceMain : compiledMain;
+  if (!fs.existsSync(main)) throw new Error(`Kernel host executable missing: expected ${sourceMain} or ${compiledMain}. Reinstall/update pi-pycells before provisioning.`);
   const args = ["-S", endpoint.tmuxSocket];
   // A PID-fenced creation lease survives an interrupted launcher without the
   // permanently held lock that tmux wait-for -L would leave after SIGKILL.

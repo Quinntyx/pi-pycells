@@ -181,6 +181,17 @@ function toolResultDetails(result) {
   return result.details;
 }
 
+test("extension root is the package root for both source and compiled entrypoints", () => {
+  try {
+    const { getExtensionRoot } = require("../dist/index.js");
+    const root = path.resolve(__dirname, "..");
+    assert.equal(getExtensionRoot(path.join(root, "src")), root);
+    assert.equal(getExtensionRoot(path.join(root, "dist")), root);
+  } finally {
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
 test("ptc extension bootstraps session tools, the /ptc command, and cleans up runtime components", async () => {
   const sandbox = {
     cleanupCalls: 0,
@@ -298,6 +309,8 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
 
     assert.ok(commands.ptc);
     assert.equal(managerInstance.started, 1);
+    assert.equal(managerInstance.extensionRoot, path.resolve(__dirname, ".."));
+    assert.equal(FakeSessionManager.lastInstance.extensionRoot, managerInstance.extensionRoot);
 
     await eventHandlers.get("session_shutdown")();
     assert.equal(managerInstance.closed, 1);

@@ -59,6 +59,7 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
+    "jiti": "^2.7.0",
     "pi-activity": "git+https://git.quinntyx.dev/quinntyx/pi-activity.git#dev",
     "pi-sock": "https://codeload.github.com/Quinntyx/pi-sock/tar.gz/aa842bcfbd178667b9b359ca4411aa879480ff0f",
     "shiki": "^4.4.3"

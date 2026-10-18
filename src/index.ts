@@ -134,11 +134,9 @@ function withKernelRendering(tool: PtcToolDefinition, directory: KernelDirectory
   };
 }
 
-/** Extension root directory (parent of dist/ when loaded from the build output). */
-function getExtensionRoot(): string {
-  return __dirname.endsWith("/dist") || __dirname.endsWith("\\dist")
-    ? __dirname.replace(/[/\\]dist$/, "")
-    : __dirname;
+/** Both Pi's source entrypoint and the compiled entrypoint sit one level below the package root. */
+export function getExtensionRoot(entryDirectory = __dirname): string {
+  return path.resolve(entryDirectory, "..");
 }
 
 /** Lazily create the per-request recovery state held in session state. */

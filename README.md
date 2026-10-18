@@ -64,8 +64,10 @@ The package includes three skills: **notebook-workflow** for authoring and hando
 
 The first kernel connection starts a `pycells-kernels` tmux window. It owns the
 IPython interpreters independently of Pi; tabs show the actual notebook cells,
-outputs, and live execution. Use Tab/arrow keys to select kernels and
-Up/Down/PageUp/PageDown to scroll. End follows the latest notebook content.
+outputs, and live execution. Git installs launch the host from shipped TypeScript
+sources using a declared runtime loader; no manual build or development dependencies
+are required. Use Tab/arrow keys to select kernels and Up/Down/PageUp/PageDown to
+scroll. End follows the latest notebook content.
 
 Closing Pi, `/reload`, and `/fork` detach the client without terminating kernels
 or cancelling accepted cells. Discovery is scoped to the **tmux server socket

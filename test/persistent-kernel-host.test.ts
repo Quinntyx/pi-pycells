@@ -153,7 +153,7 @@ test("tmux host survives SIGKILL of a real client and tmux-session renaming", {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pycells-tmux-host-"));
   const label = `pycells-test-${process.pid}-${Date.now()}`;
   const tx = (...args) => {
-    const result = spawnSync("tmux", ["-L", label, ...args], { encoding: "utf8" });
+    const result = spawnSync("tmux", ["-L", label, "-f", os.devNull, ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
   };
   let child, fork;
@@ -221,6 +221,61 @@ test("tmux host survives SIGKILL of a real client and tmux-session renaming", {
     assert.match(screen, /persistent kernel host/); assert.match(screen, /survivor/);
   } finally {
     fork?.detach(); if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    spawnSync("tmux", ["-L", label, "kill-server"]);
+  }
+});
+
+test("source-only Git package starts a tmux host without dist or development dependencies", {
+  skip: spawnSync("tmux", ["-V"]).status !== 0,
+  timeout: 30_000,
+}, async () => {
+  const root = path.resolve(".");
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "pycells-git-install-"));
+  const packageRoot = path.join(folder, "package");
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  fs.cpSync(path.join(root, "src"), path.join(packageRoot, "src"), { recursive: true });
+  fs.copyFileSync(path.join(root, "package.json"), path.join(packageRoot, "package.json"));
+  for (const name of Object.keys(manifest.dependencies)) {
+    const dependency = path.join(packageRoot, "node_modules", name);
+    fs.mkdirSync(path.dirname(dependency), { recursive: true });
+    fs.symlinkSync(path.join(root, "node_modules", name), dependency, "dir");
+  }
+  assert.equal(fs.existsSync(path.join(packageRoot, "dist")), false);
+  assert.equal(fs.existsSync(path.join(packageRoot, "node_modules", ".bin", "tsc")), false);
+
+  const label = `pycells-git-test-${process.pid}-${Date.now()}`;
+  const tx = (...args) => {
+    const result = spawnSync("tmux", ["-L", label, "-f", os.devNull, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  let client;
+  tx("new-session", "-d", "-s", "git-install", "sleep", "120");
+  try {
+    const [socket, session] = tx("display-message", "-p", "-t", "git-install", "#{socket_path}\t#{session_id}").split("\t");
+    const endpoint = { socketPath: hostSocketPath(socket, session), tmuxSocket: socket, tmuxSession: session };
+    await ensureHost(endpoint, packageRoot);
+    client = new KernelHostConnection(endpoint.socketPath);
+    await client.connect("git-install-owner");
+    assert.deepEqual(await client.request("discover", {}), []);
+    const window = tx("show-option", "-v", "-t", session, "@pi_pycells_kernel_window");
+    assert.match(tx("capture-pane", "-p", "-t", window), /persistent kernel host/);
+
+    if (process.env.PTC_TEST_REAL_RUNTIME === "true") {
+      const notebookPath = path.join(folder, "source-only.ipynb");
+      const kernel = await client.request("call", {
+        method: "provision", args: [{ name: "git-install", cwd: folder, notebookPath }],
+      });
+      const result = await client.request("call", {
+        method: "execForeground", args: [kernel.id, "source_only = 42\nsource_only", { cwd: folder }],
+      });
+      assert.match(result.output, /42/);
+      const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+      assert.equal(notebook.cells.length, 1);
+      assert.ok(JSON.stringify(notebook.cells[0].outputs).includes("42"));
+    }
+  } finally {
+    client?.detach();
     spawnSync("tmux", ["-L", label, "kill-server"]);
   }
 });

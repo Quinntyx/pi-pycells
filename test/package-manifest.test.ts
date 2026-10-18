@@ -7,6 +7,15 @@ const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
 
+test("source-only kernel hosts declare their TypeScript loader as a runtime dependency", () => {
+  assert.equal(typeof manifest.dependencies.jiti, "string");
+  assert.equal(manifest.devDependencies.jiti, undefined);
+  assert.ok(manifest.files.includes("src"));
+  assert.ok(fs.existsSync(path.join(root, "src", "kernel-host", "launch.cjs")));
+  assert.equal(lock.packages["node_modules/jiti"].dev, undefined);
+  assert.equal(lock.packages["node_modules/jiti"].peer, undefined);
+});
+
 test("pi-sock is a pinned runtime dependency, not an optional or peer dependency", () => {
   assert.match(
     manifest.dependencies["pi-sock"],

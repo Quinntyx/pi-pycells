@@ -6,7 +6,7 @@ import { loadSettingsFromEnv } from "../utils";
 import { KernelHost } from "./server";
 import { startHostViewer } from "./viewer";
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const value = (name: string) => { const i = process.argv.indexOf(name); return i < 0 ? undefined : process.argv[i + 1]; };
   const socketPath = value("--socket"), root = value("--root");
   if (!socketPath || !root) throw new Error("kernel host requires --socket and --root");
