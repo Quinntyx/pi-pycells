@@ -162,9 +162,10 @@ function truncateVisible(text: string, maxWidth: number): string {
 	return tuiTruncateToWidth(text, maxWidth, "\u2026");
 }
 
-/** Split cell text into body lines, dropping the single trailing empty line. */
+/** Split LF/CRLF text into body lines, dropping the single trailing empty line. */
 function splitBodyLines(text: string): string[] {
-  const lines = expandTabs(text).split("\n");
+  // CRLF is a line ending, not a cursor command to emit inside the cell fence.
+  const lines = expandTabs(text).split(/\r?\n/);
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   return lines;
 }

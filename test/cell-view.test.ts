@@ -35,6 +35,30 @@ function stripAnsi(text) {
 
 const OPTS = { cellNumber: 1, width: 40, mode: "expanded" };
 
+test("CRLF input and output render exactly like LF without leaking carriage returns", () => {
+  const text = [
+    "[2026-10-20 00:57:57] Connected to remote client: 0x45",
+    "",
+    "\u001b[31mremote log: 界 e\u0301 " + "long message ".repeat(20) + "\u001b[0m",
+    "last line",
+    "",
+  ].join("\n");
+  for (const render of [renderInCell, renderOutCell]) {
+    for (const width of [32, 80, 128]) {
+      for (const mode of ["normal", "expanded"]) {
+        const options = { ...OPTS, width, mode };
+        const expected = render(text, options);
+        for (const windowsText of [text.replace(/\n/g, "\r\n"), text.replace("\n", "\r\n")]) {
+          const actual = render(windowsText, options);
+          assert.deepEqual(actual, expected, `${render.name}, ${width} columns, ${mode}`);
+          assert.ok(actual.every(line => !line.includes("\r")), "CR must not reach the terminal");
+          assert.ok(actual.every(line => visibleWidth(line) === width), "fences and padding remain aligned");
+        }
+      }
+    }
+  }
+});
+
 function codeOf(n) {
   return Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n");
 }
