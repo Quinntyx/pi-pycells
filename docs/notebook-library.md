@@ -50,16 +50,20 @@ tool is needed to keep it.
 Library curation is optional. If explicitly requested, ordinary file operations
 can copy a finished `.ipynb` into the library; check for an existing destination
 before replacing it. Do not silently overwrite an existing reusable notebook
-or copy one with active pools, side effects, or hidden setup state. Read the
-`notebook-workflow` skill before preparing a reusable notebook.
+or copy one with unguarded effects or hidden setup state. Use the
+[notebook-authoring skill](../skills/notebook-authoring/SKILL.md) when creating,
+repairing, or handing over a reusable notebook, not for routine kernel analysis.
+Audit replay effects and cached-result identities before sourcing: provisioning
+executes code immediately; copying an artifact does not make it safe to rerun.
 
 ## Runtime requirements
 
-The Python environment uses the installed managed `pi-subagents` SDK package;
-no local development checkout is required. Register and update that package
-through Pi as described in [subagents.md](subagents.md). Notebook library
-lookup is independent of the SDK checkout location.
+Notebook reuse requires the notebook's Python dependencies and inputs, not an
+orchestration SDK. Library lookup is independent of optional integrations.
 
-Dependencies belong to the explicitly named live kernel. Use
-`provision_dependency` when needed; it requires `uv` on PATH. Native interpreter
-round-trip tests are enabled with `PTC_TEST_REAL_RUNTIME=true`.
+Use `provision_dependency` for the explicitly named live kernel when needed; it
+requires `uv` on PATH. The backing environment may be shared. Installation does
+not record dependency setup in the notebook or reload already imported modules.
+Document requirements, complete authorized installs, then reset before replay.
+A kernel reset clears Python memory, not files, installed packages, or external
+effects. Native interpreter round-trip tests use `PTC_TEST_REAL_RUNTIME=true`.

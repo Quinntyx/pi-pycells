@@ -58,7 +58,11 @@ pi remove git:git.quinntyx.dev/quinntyx/pi-pycells@dev
 - **[tmux](https://github.com/tmux/tmux).** Run Pi inside tmux to use kernels. One independent kernel host serves each tmux session.
 - **Subagents only:** `git`. `pi install` installs and loads [pi-sock](https://github.com/Quinntyx/pi-sock) with pi-pycells; agents using the same Pi configuration inherit it. A separate subagents configuration needs pi-sock installed there too (see below). The `pi_subagents` Python module is provisioned when subagents are enabled.
 
-The package includes three skills: **notebook-workflow** for authoring and handover, **pycells-library** for reusable notebooks, and **pi-subagents** for orchestration.
+The package includes two separately addressable skills: **notebook-authoring** for
+creating, repairing, and handing over reusable notebooks, and **pi-subagents** for
+optional orchestration. Routine kernel analysis does not require the authoring
+skill. Existing skill filters can continue to exclude `skills/pi-subagents`
+independently; the notebook library is a runtime feature, not another skill.
 
 ## Persistent kernel host
 
@@ -241,7 +245,7 @@ More: [subagent setup](docs/subagents.md) and the bundled [pi-subagents skill](s
 
 ## Documentation
 
-- [Notebook workflow skill](skills/notebook-workflow/SKILL.md): cell discipline, markdown narrative, and clean-kernel handover.
+- [Notebook authoring skill](skills/notebook-authoring/SKILL.md): reusable artifacts, replay safety, narrative, and clean-kernel handover.
 - [Kernels](docs/kernels.md): lifecycle, IPython semantics, document operations, and interrupts.
 - [Notebook library](docs/notebook-library.md): sourcing and version pinning.
 - [Subagents](docs/subagents.md): provisioning and orchestration setup.

@@ -1342,6 +1342,136 @@ test("kernel: run_all executes cells in order and stops at the first error", { s
 	}
 });
 
+test("kernel: authoring edits replace or append without resyncing live state", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-authoring-");
+	try {
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "value = 7", cellType: "code" });
+		await manager.writeCell(id, { at: 2, source: "return value * 2", cellType: "code" });
+		await manager.runAll(id, { cwd: tempDir });
+		const oldConsumer = readNotebook(notebookPath).cells[1];
+
+		await manager.writeCell(id, { at: 1, source: "value = 8", cellType: "code" });
+		const edited = readNotebook(notebookPath);
+		assert.equal(edited.cells.length, 2, "replacement is not insertion");
+		assert.equal(edited.cells[0].execution_count, null);
+		assert.deepEqual(edited.cells[0].outputs, []);
+		assert.deepEqual(edited.cells[1], oldConsumer, "downstream output is not recomputed");
+		const state = await manager.scratchRun(id, "return value", { cwd: tempDir });
+		assert.equal(JSON.parse(parseSection(state.output, "return")), 7, "source edits do not change live values");
+
+		const appended = await manager.writeCell(id, { at: 99, source: "# End", cellType: "markdown" });
+		assert.equal(appended.total, 3, "past-end writes append one cell without padding");
+		assert.equal((await manager.readCell(id, 3)).cells[0].source, "# End");
+		await manager.deleteCell(id, 1);
+		const consumer = await manager.runCell(id, 1, { cwd: tempDir });
+		assert.equal(JSON.parse(parseSection(consumer.output, "return")), 14, "deleting a definition leaves its live name");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: run_to and run_all retain old names until a reset exposes hidden setup", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-replay-");
+	try {
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.scratchRun(id, "counter = 40", { cwd: tempDir });
+		await manager.writeCell(id, { at: 1, source: "counter += 1\nreturn counter", cellType: "code" });
+		await manager.writeCell(id, { at: 2, source: "# Presentation", cellType: "markdown" });
+		await manager.writeCell(id, { at: 3, source: "return counter * 2", cellType: "code" });
+		await manager.runAll(id, { cwd: tempDir });
+		await manager.runTo(id, 1, { cwd: tempDir });
+		const again = await manager.runAll(id, { cwd: tempDir });
+		assert.deepEqual(again.steps.map((step: { index: number }) => step.index), [1, 3]);
+		assert.equal(JSON.parse(parseSection(again.lastOutput, "return")), 86, "neither scoped run clears live state");
+
+		const beforeReset = fs.readFileSync(notebookPath, "utf8");
+		const oldPresentation = readNotebook(notebookPath).cells[2];
+		await manager.resetKernel(id, { cwd: tempDir, ctx: fakeCtx() });
+		assert.equal(fs.readFileSync(notebookPath, "utf8"), beforeReset, "reset preserves even old disk outputs");
+		const clean = await manager.runAll(id, { cwd: tempDir });
+		assert.equal(clean.failedIndex, 1);
+		assert.match(clean.lastOutput, /NameError.*counter/);
+		assert.equal(clean.steps.length, 1);
+		assert.deepEqual(readNotebook(notebookPath).cells[2], oldPresentation, "early failure leaves later stale output visible");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: authoring cache example validates identities, completion and failed computation", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-cache-example-");
+	const skill = fs.readFileSync(path.resolve(__dirname, "../skills/notebook-authoring/SKILL.md"), "utf8");
+	const example = skill.match(/```python\n([\s\S]*?)```/)[1];
+	const cachePath = path.join(tempDir, "cache.json");
+	try {
+		const { id } = await manager.provision({ name: nextKernelName(), cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		fs.writeFileSync(path.join(tempDir, "input.txt"), "7");
+		await manager.scratchRun(id, `from pathlib import Path
+INPUT = Path("input.txt")
+CACHE = Path("cache.json")
+CONFIG = {"factor": 2}
+METHOD_VERSION = "v1"
+DEPENDENCY_NAMES = ["ipython"]
+calls = 0
+def compute_rows(input_path, config):
+    global calls
+    calls += 1
+    return [int(input_path.read_text()) * config["factor"]]`, { cwd: tempDir });
+		const runExpecting = async (count: number) => {
+			const result = await manager.scratchRun(id, example + "\nreturn calls", { cwd: tempDir });
+			assert.equal(JSON.parse(parseSection(result.output, "return")), count);
+		};
+		await runExpecting(1);
+		await runExpecting(1); // Exact identity reuses a completed result.
+		const first = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+		assert.equal(typeof first.identity.dependencies.ipython, "string");
+		assert.equal(typeof first.identity.python, "string");
+		fs.writeFileSync(path.join(tempDir, "input.txt"), "8");
+		await runExpecting(2); // Same path, changed content.
+		await manager.scratchRun(id, 'CONFIG["factor"] = 3', { cwd: tempDir });
+		await runExpecting(3);
+		await manager.scratchRun(id, 'METHOD_VERSION = "v2"', { cwd: tempDir });
+		await runExpecting(4);
+
+		// Simulate records produced under older dependency/interpreter versions.
+		for (const field of ["dependencies", "python"]) {
+			const stale = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+			stale.identity[field] = field === "dependencies" ? { ipython: "outdated" } : "0.0.0";
+			fs.writeFileSync(cachePath, JSON.stringify(stale));
+			await runExpecting(field === "dependencies" ? 5 : 6);
+		}
+		fs.writeFileSync(cachePath, "{partial");
+		await runExpecting(7);
+		const incomplete = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+		delete incomplete.rows;
+		fs.writeFileSync(cachePath, JSON.stringify(incomplete));
+		await runExpecting(8);
+		incomplete.rows = {};
+		fs.writeFileSync(cachePath, JSON.stringify(incomplete));
+		await runExpecting(9);
+		assert.deepEqual(JSON.parse(fs.readFileSync(cachePath, "utf8")).rows, [24]);
+
+		const completed = fs.readFileSync(cachePath, "utf8");
+		await manager.scratchRun(id, `METHOD_VERSION = "v3"
+def compute_rows(input_path, config):
+    raise RuntimeError("computation failed")`, { cwd: tempDir });
+		await assert.rejects(manager.scratchRun(id, example, { cwd: tempDir }), /computation failed/);
+		assert.equal(fs.readFileSync(cachePath, "utf8"), completed, "failure never publishes a new completion");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
 test("kernel: external notebook edits survive a scoped run", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	const { execFileSync } = require("node:child_process");
