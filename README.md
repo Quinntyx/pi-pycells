@@ -18,8 +18,9 @@ See [Python execution boundary](docs/python-runtime.md).
 ## Install
 
 First, make sure Pi can answer a normal prompt and that
-[`uv`](https://docs.astral.sh/uv/) and `tmux` are on your PATH. Start Pi inside the
-tmux session that should own its persistent kernels.
+[`uv`](https://docs.astral.sh/uv/) is on your PATH. For terminal Pi, install `tmux`
+and start Pi inside the session that should own its persistent kernels. T3 Code
+starts a headless host automatically for each thread instead.
 
 ```bash
 pi install git:git.quinntyx.dev/quinntyx/pi-pycells@dev
@@ -55,7 +56,7 @@ pi remove git:git.quinntyx.dev/quinntyx/pi-pycells@dev
 
 - **Pi and a compatible Node.js runtime.** Follow Pi's current runtime requirements.
 - **uv.** Provisions Python environments and installs dependencies. The default interpreter is CPython 3.14; it is downloaded automatically if needed. IPython is provisioned into kernel environments.
-- **[tmux](https://github.com/tmux/tmux).** Run Pi inside tmux to use kernels. One independent kernel host serves each tmux session.
+- **[tmux](https://github.com/tmux/tmux), for terminal Pi.** One independent kernel host serves each tmux session. T3 Code does not require tmux for notebook kernels.
 - **Subagents only:** `git`. `pi install` installs and loads [pi-sock](https://github.com/Quinntyx/pi-sock) with pi-pycells; agents using the same Pi configuration inherit it. A separate subagents configuration needs pi-sock installed there too (see below). The `pi_subagents` Python module is provisioned when subagents are enabled.
 
 The package includes two separately addressable skills: **notebook-authoring** for
@@ -66,7 +67,7 @@ independently; the notebook library is a runtime feature, not another skill.
 
 ## Persistent kernel host
 
-The first kernel connection starts a `pycells-kernels` tmux window. It owns the
+Starting Pi inside tmux starts a `pycells-kernels` window. It owns the
 IPython interpreters independently of Pi; tabs show the actual notebook cells,
 outputs, and live execution. Git installs launch the host from shipped TypeScript
 sources using a declared runtime loader; no manual build or development dependencies
@@ -100,6 +101,19 @@ the host/runtime itself, finish your work and explicitly close the
 `pycells-kernels` tmux window before reconnecting. Restarting Pi alone deliberately
 leaves an existing host running. The host does not restore Python memory after
 its own death and contains no separate subagent workflow scheduler.
+
+### T3 Code
+
+Install pi-pycells in the Pi profile used by T3 Code. A compatible T3 server supplies
+a thread-scoped endpoint and starts a headless kernel host when Pi launches. Open
+**Notebook** in the thread's workspace panel, or the thread menu on mobile, to read
+the notebook. Cells and outputs collapse independently; editing and execution stay
+with the agent. Images use the same selection as the model's tool results.
+
+A resumed thread reconnects to its existing kernels, even when Pi's subprocess
+changes. Other threads have separate hosts. The host survives Pi disconnects and
+stops when its T3 server exits; notebook files remain on disk but Python memory is
+not restored after a host restart. Parallel tmux subagents still need tmux.
 
 ## Notebook workflow
 
