@@ -3,7 +3,7 @@ import { randomUUID, createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
 import { PythonSessionManager, UnknownKernelError } from "../python-session-manager";
@@ -11,8 +11,10 @@ import * as executionErrors from "../execution/execution-errors";
 import type { PtcSettings, SandboxManager } from "../types";
 import type { PythonSessionManagerHooks } from "../contracts/execution-types";
 import { cleanArguments, HOST_PROTOCOL_VERSION, type HostState, type HostedKernel, type HostOperation, type SerializedError } from "./protocol";
+import { processIdentity, liveProcess } from "./process-owner";
 const exec = promisify(execFile);
-export interface HostEndpoint { socketPath: string; tmuxSession: string; tmuxSocket: string; }
+export type HostEndpoint = { socketPath: string; tmuxSession: string; tmuxSocket: string; headless?: false }
+  | { socketPath: string; threadId: string; headless: true };
 export function hostSocketPath(tmuxSocket: string, sessionId: string, root = path.join(os.tmpdir(), `pi-pycells-${process.getuid?.() ?? "user"}`)): string {
   const key = createHash("sha256").update(`${tmuxSocket}\0${sessionId}`).digest("hex").slice(0, 24);
   return path.join(root, `kernel-${key}.sock`);
@@ -21,6 +23,13 @@ async function tmux(args: string[]): Promise<string> {
   return (await exec("tmux", args, { timeout: 10_000 })).stdout.trim();
 }
 export async function resolveHostEndpoint(): Promise<HostEndpoint> {
+  const threadId = process.env.T3_THREAD_ID, socketPath = process.env.T3_PYCELLS_SOCKET;
+  if (threadId || socketPath) {
+    if (!threadId || !socketPath || !path.isAbsolute(socketPath) || Buffer.byteLength(socketPath) > 103) {
+      throw new Error("T3_THREAD_ID and T3_PYCELLS_SOCKET must identify a thread and an absolute Unix socket path of at most 103 bytes");
+    }
+    return { socketPath, threadId, headless: true };
+  }
   if (!process.env.TMUX || !process.env.TMUX_PANE) throw new Error("Persistent kernels require Pi to run inside a tmux session");
   const result = await tmux(["display-message", "-p", "-t", process.env.TMUX_PANE, "#{session_id}\t#{socket_path}"]);
   const [tmuxSession, tmuxSocket] = result.split("\t");
@@ -34,16 +43,6 @@ async function reachable(socketPath: string): Promise<boolean> {
     socket.once("connect", () => { clearTimeout(timer); socket.destroy(); resolve(true); });
     socket.once("error", () => { clearTimeout(timer); resolve(false); });
   });
-}
-function processIdentity(pid: number): string | undefined {
-  try { return fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").slice(1).join(") ").trim().split(/\s+/)[19]; }
-  catch { return undefined; }
-}
-function liveLease(lease: { pid?: number; birth?: string }): boolean {
-  if (!Number.isInteger(lease.pid) || lease.pid! < 1) return false;
-  try { process.kill(lease.pid!, 0); } catch { return false; }
-  const current = processIdentity(lease.pid!);
-  return !current || !lease.birth || current === lease.birth;
 }
 async function acquireCreationLease(socketPath: string): Promise<() => void> {
   const file = socketPath + ".lock", nonce = randomUUID(), deadline = Date.now() + 15_000;
@@ -59,7 +58,7 @@ async function acquireCreationLease(socketPath: string): Promise<() => void> {
       try {
         const before = fs.statSync(file);
         let stale = false;
-        try { stale = !liveLease(JSON.parse(fs.readFileSync(file, "utf8"))); }
+        try { stale = !liveProcess(JSON.parse(fs.readFileSync(file, "utf8"))); }
         catch { stale = Date.now() - before.mtimeMs > 5_000; }
         // A dead launcher's lease cannot strand all future clients. Fence the
         // observed inode before retiring it; never steal a live launcher's lock.
@@ -70,6 +69,37 @@ async function acquireCreationLease(socketPath: string): Promise<() => void> {
     }
   }
 }
+async function requestThreadHostLaunch(launcher: string, endpoint: Extract<HostEndpoint, { headless: true }>, rootDir: string): Promise<void> {
+  if (!path.isAbsolute(launcher)) throw new Error("T3_PYCELLS_LAUNCH_SOCKET must be an absolute Unix socket path");
+  await new Promise<void>((resolve, reject) => {
+    const id = randomUUID(), socket = net.createConnection(launcher);
+    const reader = createInterface({ input: socket, crlfDelay: Infinity });
+    const timer = setTimeout(() => finish(new Error("T3 kernel host launcher did not respond")), 6_000);
+    let settled = false;
+    function finish(error?: Error) {
+      if (settled) return; settled = true;
+      clearTimeout(timer); reader.close(); socket.destroy();
+      error ? reject(error) : resolve();
+    }
+    socket.once("error", error => finish(error));
+    socket.once("close", () => { if (!settled) finish(new Error("T3 kernel host launcher disconnected")); });
+    reader.on("error", error => finish(error));
+    reader.on("line", line => {
+      try {
+        if (line.length > 64 * 1024) throw new Error("Invalid T3 kernel host launcher response");
+        const response = JSON.parse(line);
+        if (response.id !== id) throw new Error("Mismatched T3 kernel host launch response");
+        if (response.error) throw new Error(typeof response.error.message === "string" ? response.error.message : "T3 kernel host launch failed");
+        if (!Number.isInteger(response.result?.pid) || response.result.pid < 1) throw new Error("Invalid T3 kernel host launcher response");
+        finish();
+      } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
+    });
+    socket.once("connect", () => {
+      const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+      socket.write(JSON.stringify({ id, op: "launch", threadId: endpoint.threadId, socketPath: endpoint.socketPath, rootDir, environment }) + "\n");
+    });
+  });
+}
 export async function ensureHost(endpoint: HostEndpoint, extensionRoot: string): Promise<void> {
   if (await reachable(endpoint.socketPath)) return;
   // Git packages are source-loaded by Pi and installed without build tooling.
@@ -78,7 +108,6 @@ export async function ensureHost(endpoint: HostEndpoint, extensionRoot: string):
   const compiledMain = path.join(extensionRoot, "dist/kernel-host/main.js");
   const main = fs.existsSync(sourceMain) ? sourceMain : compiledMain;
   if (!fs.existsSync(main)) throw new Error(`Kernel host executable missing: expected ${sourceMain} or ${compiledMain}. Reinstall/update pi-pycells before provisioning.`);
-  const args = ["-S", endpoint.tmuxSocket];
   // A PID-fenced creation lease survives an interrupted launcher without the
   // permanently held lock that tmux wait-for -L would leave after SIGKILL.
   const release = await acquireCreationLease(endpoint.socketPath);
@@ -88,19 +117,49 @@ export async function ensureHost(endpoint: HostEndpoint, extensionRoot: string):
     fs.chmodSync(path.dirname(endpoint.socketPath), 0o700);
     if (fs.existsSync(endpoint.socketPath)) fs.unlinkSync(endpoint.socketPath); // stale socket, not user data
     const environmentPath = endpoint.socketPath + ".environment";
-    fs.writeFileSync(environmentPath, JSON.stringify(process.env), { mode: 0o600 });
-    fs.chmodSync(environmentPath, 0o600);
+    const launcher = endpoint.headless ? process.env.T3_PYCELLS_LAUNCH_SOCKET : undefined;
+    if (!launcher) {
+      fs.writeFileSync(environmentPath, JSON.stringify(process.env), { mode: 0o600 });
+      fs.chmodSync(environmentPath, 0o600);
+    }
     const command = [process.execPath, main, "--socket", endpoint.socketPath, "--root", extensionRoot, "--environment", environmentPath];
-    const window = await tmux([...args, "new-window", "-d", "-P", "-F", "#{window_id}", "-t", endpoint.tmuxSession, "-n", "pycells-kernels", "--", ...command]);
-    await tmux([...args, "set-window-option", "-t", window, "automatic-rename", "off"]);
-    await tmux([...args, "set-window-option", "-t", window, "allow-rename", "off"]);
-    await tmux([...args, "set-option", "-t", endpoint.tmuxSession, "@pi_pycells_kernel_socket", endpoint.socketPath]);
-    await tmux([...args, "set-option", "-t", endpoint.tmuxSession, "@pi_pycells_kernel_window", window]);
+    let destination: string;
+    let launchError: Error | undefined;
+    if (endpoint.headless) {
+      command.push("--headless");
+      const ownerPid = Number(process.env.T3_PYCELLS_OWNER_PID);
+      if (Number.isInteger(ownerPid) && ownerPid > 0) {
+        command.push("--owner-pid", String(ownerPid));
+        const birth = processIdentity(ownerPid);
+        if (birth) command.push("--owner-birth", birth);
+      }
+      const logPath = endpoint.socketPath + ".log";
+      if (launcher) {
+        await requestThreadHostLaunch(launcher, endpoint, extensionRoot);
+      } else {
+        const log = fs.openSync(logPath, "a", 0o600);
+        try {
+          const child = spawn(command[0]!, command.slice(1), { detached: true, stdio: ["ignore", log, log] });
+          child.once("error", error => { launchError = error; });
+          child.unref();
+        } finally { fs.closeSync(log); }
+      }
+      destination = `kernel host log ${logPath}`;
+    } else {
+      const args = ["-S", endpoint.tmuxSocket];
+      const window = await tmux([...args, "new-window", "-d", "-P", "-F", "#{window_id}", "-t", endpoint.tmuxSession, "-n", "pycells-kernels", "--", ...command]);
+      await tmux([...args, "set-window-option", "-t", window, "automatic-rename", "off"]);
+      await tmux([...args, "set-window-option", "-t", window, "allow-rename", "off"]);
+      await tmux([...args, "set-option", "-t", endpoint.tmuxSession, "@pi_pycells_kernel_socket", endpoint.socketPath]);
+      await tmux([...args, "set-option", "-t", endpoint.tmuxSession, "@pi_pycells_kernel_window", window]);
+      destination = `tmux window ${window}`;
+    }
     for (let i = 0; i < 100; i++) {
+      if (launchError) throw launchError;
       if (await reachable(endpoint.socketPath)) return;
       await new Promise(resolve => setTimeout(resolve, 50));
     }
-    throw new Error(`Kernel host did not become ready; inspect tmux window ${window}`);
+    throw new Error(`Kernel host did not become ready; inspect ${destination}`);
   } finally { release(); }
 }
 export function decodeHostError(error: SerializedError): Error {
@@ -163,10 +222,11 @@ export class PersistentSessionManager extends PythonSessionManager {
   }
   async attachOwner(owner: string): Promise<void> {
     if (!owner) throw new Error("A Pi session ID is required to attach a kernel client");
+    if (process.env.T3_THREAD_ID && process.env.T3_PYCELLS_SOCKET) owner = process.env.T3_THREAD_ID;
     if (this.owner === owner && this.ready && this.connection?.connected) return this.ready;
     this.owner = owner;
-    // Loading Pi outside tmux is allowed; only kernel operations require it.
-    if (!this.endpointOverride && (!process.env.TMUX || !process.env.TMUX_PANE)) { this.ready = undefined; return; }
+    // Plain headless Pi can load tools without starting a host; T3 supplies its own endpoint.
+    if (!this.endpointOverride && !process.env.T3_THREAD_ID && !process.env.T3_PYCELLS_SOCKET && (!process.env.TMUX || !process.env.TMUX_PANE)) { this.ready = undefined; return; }
     this.ready = (async () => {
       const endpoint = this.endpointOverride ?? await resolveHostEndpoint();
       if (!this.endpointOverride) await ensureHost(endpoint, this.hostRoot);

@@ -5,12 +5,15 @@ import { createInterface } from "node:readline";
 import { PythonSessionManager, normalizeKernelName } from "../python-session-manager";
 import { serializeError, HOST_PROTOCOL_VERSION, type HostedKernel, type HostOperation, type HostState } from "./protocol";
 
+import { notebookSnapshot } from "./notebook";
+
 const METHODS = new Set(["provision", "inspectKernel", "readCellOutput", "execForeground", "scratchRun", "writeCell", "deleteCell", "readCells", "readCell", "runCell", "runTo", "runAll", "resetKernel", "toScript", "dispose", "interruptRunning"]);
 const UPDATE_OPTIONS: Record<string, number> = { provision: 0, execForeground: 2, scratchRun: 2, runCell: 2, runTo: 2, runAll: 1, resetKernel: 1 };
 
 /** Owns interpreters independently of any Pi connection. It contains no agent workflow logic. */
 export class KernelHost {
   private clients = new Map<net.Socket, { owner: string; attached: Map<string, string> }>();
+  private sockets = new Set<net.Socket>();
   private attachments = new Map<string, Map<string, string>>();
   private owners = new Map<string, { owner: string; name: string }>();
   private operations = new Map<string, HostOperation>();
@@ -18,7 +21,8 @@ export class KernelHost {
   private timer?: NodeJS.Timeout;
   private lastState = "";
   private provisionQueue: Promise<unknown> = Promise.resolve();
-  constructor(readonly manager: PythonSessionManager, readonly socketPath: string) {}
+  constructor(readonly manager: PythonSessionManager, readonly socketPath: string,
+    private options: { headless?: boolean; threadId?: string } = {}) {}
 
   state(): HostState {
     const kernels = this.manager.list().flatMap(row => {
@@ -63,6 +67,7 @@ export class KernelHost {
     fs.mkdirSync(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     // Caller must fence stale endpoints before startup; never unlink a live socket here.
     this.server = net.createServer(socket => {
+      this.sockets.add(socket);
       const reader = createInterface({ input: socket, crlfDelay: Infinity });
       reader.on("error", () => socket.destroy());
       reader.on("line", line => {
@@ -72,7 +77,7 @@ export class KernelHost {
         void this.request(socket, request).catch(error => this.send(socket, { id: request.id, error: serializeError(error) }));
       });
       socket.on("error", () => undefined);
-      socket.on("close", () => { reader.close(); this.clients.delete(socket); });
+      socket.on("close", () => { reader.close(); this.clients.delete(socket); this.sockets.delete(socket); });
     });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
@@ -84,7 +89,12 @@ export class KernelHost {
   }
   private async request(socket: net.Socket, request: any): Promise<void> {
     if (typeof request.id !== "string" || !request.id || typeof request.op !== "string") throw new Error("Malformed host request");
+    if (request.op === "notebookSnapshot" && this.options.headless) {
+      this.send(socket, { id: request.id, result: await notebookSnapshot(this.state().kernels) });
+      return;
+    }
     if (request.op === "hello") {
+      if (this.options.threadId && request.owner !== this.options.threadId) throw new Error("Kernel host belongs to a different T3 thread");
       if (request.version !== HOST_PROTOCOL_VERSION || typeof request.owner !== "string" || !request.owner) throw new Error("Invalid host version or Pi session identity");
       const attached = this.attachments.get(request.owner) ?? new Map<string, string>();
       this.attachments.set(request.owner, attached);
@@ -176,7 +186,7 @@ export class KernelHost {
   /** Explicit host shutdown; Pi disconnect never calls this. */
   async close(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
-    for (const socket of this.clients.keys()) socket.destroy();
+    for (const socket of this.sockets) socket.destroy();
     await this.manager.disposeAll();
     await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve());
     if (fs.existsSync(this.socketPath)) fs.unlinkSync(this.socketPath);

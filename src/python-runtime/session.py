@@ -704,7 +704,7 @@ def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_te
         for image in (images or [])[:4]:
             outputs.append({
                 "output_type": "display_data",
-                "data": {"image/png": image.get("data", "")},
+                "data": {image.get("mimeType", "image/png"): image.get("data", "")},
                 "metadata": {},
             })
         if error is not None:
@@ -1154,6 +1154,9 @@ async def _ptc_exec_chunk(frame: dict) -> None:
             "subagents_text": subagents_text,
             "tools_text": tools_text,
             "images": images,
+            "image_outputs": [
+                {"data": getattr(rich, "data", None) or {}} for rich in (rich_outputs or [])
+            ] + [{"data": {image.get("mimeType", "image/png"): image.get("data", "")}} for image in (images or [])],
             "total_output_chars": total_output_chars,
             "cell": exec_count,
             "digest": digest,

@@ -16,6 +16,7 @@ import { existsSync } from "fs";
 import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { TerminalBuffer } from "./execution/terminal-emulator";
+import { notebookImages, type NotebookMimeOutput } from "./execution/notebook-output";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
   CodeExecutionResult,
@@ -415,7 +416,9 @@ class PersistentSessionProtocol {
             toolsText,
             cellIdx,
           }),
-          images: (msg.images as never[] | undefined) ?? undefined,
+          images: Array.isArray(msg.image_outputs)
+            ? notebookImages(msg.image_outputs as NotebookMimeOutput[])
+            : (msg.images as never[] | undefined) ?? undefined,
           details: this.buildDetails({
             execId: this.execId,
             cellIdx,
