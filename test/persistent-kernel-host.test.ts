@@ -132,11 +132,18 @@ test("source replay blocks provisioning only for the same destination notebook",
     await started;
     const shared = provision(b, "shared", "alias/shared.ipynb");
     void shared.catch(() => undefined);
+    await b.request("discover", {}); // ensure the host keyed the request before the save
+    // Saving a replayed cell atomically replaces the destination symlink.
+    const saved = path.join(cwd, "saved.tmp");
+    fs.writeFileSync(saved, "{}");
+    fs.renameSync(saved, path.join(cwd, "seeded.ipynb"));
+    const samePath = provision(b, "same-path", "alias/seeded.ipynb");
+    void samePath.catch(() => undefined);
     await provision(b, "independent", "other.ipynb");
     assert.deepEqual(entered, ["seeded", "independent"]);
     release();
-    await Promise.all([seeded, shared]);
-    assert.deepEqual(entered, ["seeded", "independent", "shared"]);
+    await Promise.all([seeded, shared, samePath]);
+    assert.deepEqual(entered.toSorted(), ["independent", "same-path", "seeded", "shared"]);
   } finally { release(); await f.close(); }
 });
 

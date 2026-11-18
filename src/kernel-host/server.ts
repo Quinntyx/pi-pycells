@@ -43,7 +43,7 @@ export class KernelHost {
   private timer?: NodeJS.Timeout;
   private lastState = "";
   private reservedNames = new Set<string>();
-  private notebookProvisions = new Map<string, Promise<unknown>>();
+  private notebookProvisions = new Map<string, Promise<void>>();
   constructor(readonly manager: PythonSessionManager, readonly socketPath: string,
     private options: { headless?: boolean; threadId?: string } = {}) {}
 
@@ -76,16 +76,24 @@ export class KernelHost {
   }
   private async provision(options: Parameters<PythonSessionManager["provision"]>[0]) {
     if (!options.notebookPath) return this.manager.provision(options);
-    const key = notebookKey(path.resolve(options.cwd, options.notebookPath));
-    const previous = this.notebookProvisions.get(key);
-    // Source replay writes the notebook before the kernel is visible to clients.
-    const job = previous
-      ? previous.catch(() => undefined).then(() => this.manager.provision(options))
-      : this.manager.provision(options);
-    this.notebookProvisions.set(key, job);
-    try { return await job; }
-    finally {
-      if (this.notebookProvisions.get(key) === job) this.notebookProvisions.delete(key);
+    const destination = path.resolve(options.cwd, options.notebookPath);
+    for (;;) {
+      // An atomic notebook save replaces the directory entry, including any symlink.
+      const entry = path.join(notebookKey(path.dirname(destination)), path.basename(destination));
+      const keys = new Set([destination, entry, notebookKey(destination)]);
+      const blocking = [...keys].map(key => this.notebookProvisions.get(key)).find(Boolean);
+      if (blocking) {
+        await blocking;
+        continue; // A previous save may have changed the resolved path.
+      }
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      for (const key of keys) this.notebookProvisions.set(key, held);
+      try { return await this.manager.provision(options); }
+      finally {
+        for (const key of keys) this.notebookProvisions.delete(key);
+        release();
+      }
     }
   }
   private send(socket: net.Socket, message: unknown): void {
