@@ -1077,8 +1077,11 @@ function truncateTarget(value: string): string {
 
 interface SessionRecord {
   id: string;
-  /** Human-readable, unique-among-live-kernels name (user-facing identity). */
+  /** Human-readable identity, unique within the owner. */
   name: string;
+  ownerSessionId?: string;
+  /** Reserve the name during startup without exposing a partially seeded kernel. */
+  provisioning: boolean;
   notebookPath?: string;
   proc: ChildProcess;
   protocol: PersistentSessionProtocol;
@@ -1201,16 +1204,18 @@ export class PythonSessionManager {
    * chunks excluded). Each row carries the kernel's public `name` alongside the
    * internal `id`.
    */
-  list(): Array<SessionSummary & { name: string }> {
+  list(): Array<SessionSummary & { name: string; ownerSessionId?: string }> {
     return [...this.sessions.values()]
+      .filter(session => !session.provisioning)
       .sort((a, b) => this.recencyIndex(b.id) - this.recencyIndex(a.id))
       .map((session) => this.summarize(session));
   }
 
-  private summarize(session: SessionRecord): SessionSummary & { name: string } {
+  private summarize(session: SessionRecord): SessionSummary & { name: string; ownerSessionId?: string } {
     return {
       id: session.id,
       name: session.name,
+      ownerSessionId: session.ownerSessionId,
       createdAt: session.createdAt,
       lastUsedAt: session.lastUsedAt,
       chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
@@ -1516,7 +1521,7 @@ export class PythonSessionManager {
   /**
    * Provision a new persistent kernel under a human-readable, unique name.
    * `name` is required at runtime: trim-normalized, nonempty, free of
-   * control/terminal escape characters, and unique among live kernels. The
+   * control/terminal escape characters, and unique within its owner. The
    * result carries the public `name` plus the internal `id` (protocol
    * bookkeeping) and the bound `notebookPath`.
    */
@@ -1525,6 +1530,8 @@ export class PythonSessionManager {
     ctx: ExtensionToolContext;
     /** Required public kernel identity; validated and uniqueness-checked. */
     name?: string;
+    /** Set by the host from the connected session, not from the tool input. */
+    ownerSessionId?: string;
     launchEnvironment?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
     onUpdate?: ToolUpdateCallback;
@@ -1535,8 +1542,9 @@ export class PythonSessionManager {
     /** Explicit Python version (validated by the tool schema). Overrides a source-notebook pin; metadata is never mutated. */
     version?: string;
   }): Promise<{
-    /** Public kernel identity (validated, unique among live kernels). */
+    /** Public kernel identity (validated, unique within its owner). */
     name: string;
+    ownerSessionId?: string;
     /** Internal protocol id; never user-facing. */
     id: string;
     /** Notebook bound to the kernel, when one was provided. */
@@ -1551,7 +1559,8 @@ export class PythonSessionManager {
       );
     }
     const kernelName = normalizeKernelName(options.name);
-    this.assertKernelNameAvailable(kernelName);
+    const { ownerSessionId } = options;
+    this.assertKernelNameAvailable(kernelName, ownerSessionId);
 
     // Back-burner: limit disabled 2026-09-26 — revisit for provisioning churn per docs/BACK-BURNER.md §2
     // Keep maxPythonSessions parsing for compatibility, but do not reject new kernels here.
@@ -1602,6 +1611,8 @@ export class PythonSessionManager {
     const record: SessionRecord = {
       id: sessionId,
       name: kernelName,
+      ownerSessionId,
+      provisioning: true,
       proc,
       protocol,
       chunks: [],
@@ -1647,7 +1658,7 @@ export class PythonSessionManager {
 
       // Re-check after the awaits above: a parallel provision could have claimed
       // the name while this interpreter was starting up.
-      this.assertKernelNameAvailable(kernelName);
+      this.assertKernelNameAvailable(kernelName, ownerSessionId);
       this.sessions.set(sessionId, record);
       this.recency = this.recency.filter((id) => id !== sessionId);
       this.recency.push(sessionId);
@@ -1697,8 +1708,10 @@ export class PythonSessionManager {
         }
       }
 
+      record.provisioning = false;
       return {
         name: kernelName,
+        ownerSessionId,
         id: sessionId,
         notebookPath,
         sourcedFrom: preparedSource?.path,
@@ -1713,30 +1726,23 @@ export class PythonSessionManager {
     }
   }
 
-  /** Throw when another live kernel already owns `name`. */
-  private assertKernelNameAvailable(name: string): void {
+  /** Throw when the owner already has a live or provisioning kernel named `name`. */
+  private assertKernelNameAvailable(name: string, ownerSessionId?: string): void {
     for (const record of this.sessions.values()) {
-      if (record.name === name) {
-        throw new PythonSessionError(
-          `kernel name already in use: ${name} (kernel names must be unique among live kernels)`
-        );
+      if (record.name === name && record.ownerSessionId === ownerSessionId) {
+        throw new PythonSessionError(`kernel name already in use: ${name}`);
       }
     }
   }
 
-  /**
-   * Resolve a kernel by its human-readable name. Synchronous; throws
-   * UnknownKernelError (listing live names) for anything not live. The handle
-   * exposes the public `name`, bound `notebookPath`, and the internal `id` for
-   * protocol bookkeeping — never render the id.
-   */
-  resolveKernel(name: string): KernelHandle {
+  /** Resolve a kernel by its public name within an owner's namespace. */
+  resolveKernel(name: string, ownerSessionId?: string): KernelHandle {
     const wanted = normalizeKernelName(name);
-    const record = [...this.sessions.values()].find((candidate) => candidate.name === wanted);
-    if (!record) {
-      throw new UnknownKernelError(wanted, this.list().map((kernel) => kernel.name));
+    const kernels = this.list().filter(kernel => kernel.ownerSessionId === ownerSessionId);
+    const summary = kernels.find(kernel => kernel.name === wanted);
+    if (!summary) {
+      throw new UnknownKernelError(wanted, kernels.map(kernel => kernel.name));
     }
-    const summary = this.summarize(record);
     return {
       id: summary.id,
       name: summary.name,

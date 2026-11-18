@@ -1,7 +1,6 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { PythonSessionManager, normalizeKernelName } from "../python-session-manager";
 import { serializeError, HOST_PROTOCOL_VERSION, type HostedKernel, type HostOperation, type HostState } from "./protocol";
@@ -16,7 +15,6 @@ export class KernelHost {
   private clients = new Map<net.Socket, { owner: string; attached: Map<string, string> }>();
   private sockets = new Set<net.Socket>();
   private attachments = new Map<string, Map<string, string>>();
-  private owners = new Map<string, { owner: string; name: string }>();
   private operations = new Map<string, HostOperation>();
   private server?: net.Server;
   private timer?: NodeJS.Timeout;
@@ -27,11 +25,12 @@ export class KernelHost {
 
   state(): HostState {
     const kernels = this.manager.list().flatMap(row => {
-      const identity = this.owners.get(row.id);
+      const { ownerSessionId } = row;
+      if (ownerSessionId === undefined) return [];
       const operation = [...this.operations.values()].reverse().find(op => op.kernelId === row.id);
       const lastOperation = operation ? { id: operation.id, method: operation.method, status: operation.status, startedAt: operation.startedAt, finishedAt: operation.finishedAt } : undefined;
-      return identity ? [{ ...row, name: identity.name, ownerSessionId: identity.owner,
-        pythonExecutable: this.manager.getPythonExecutable(row.id), snapshot: this.manager.getSubagentSnapshot(row.id), lastOperation }] : [];
+      return [{ ...row, ownerSessionId, pythonExecutable: this.manager.getPythonExecutable(row.id),
+        snapshot: this.manager.getSubagentSnapshot(row.id), lastOperation }];
     });
     // State feeds are lightweight previews, not repeated notebook/result payloads.
     // Full retained output remains available through the explicit operation RPC.
@@ -144,28 +143,22 @@ export class KernelHost {
     }
     const invoke = async () => {
       if (request.method === "provision") {
-        const publicName = normalizeKernelName(args[0]?.name);
-        const nameInUse = this.state().kernels.some(k =>
-          (k.ownerSessionId === client.owner && k.name === publicName) || client.attached.get(k.id) === publicName);
-        if (nameInUse) throw new Error("Kernel name already in use in this Pi session");
-        // Manager names share a namespace and length limit regardless of owner or public name.
-        args[0].name = randomUUID();
+        const name = normalizeKernelName(args[0]?.name);
+        if (this.manager.list().some(k => client.attached.get(k.id) === name)) throw new Error("Kernel name already in use in this Pi session");
         if (args[0].launchEnvironment) {
           // The caller's Pi pane may disappear. Kernels live in the host pane,
           // while their profile configuration still comes from the creator.
           for (const key of ["TMUX", "TMUX_PANE"]) if (process.env[key]) args[0].launchEnvironment[key] = process.env[key];
         }
-        const result = await this.manager.provision(args[0]);
-        this.owners.set(result.id, { owner: client.owner, name: publicName });
+        const result = await this.manager.provision({ ...args[0], name, ownerSessionId: client.owner });
         operation.kernelId = result.id;
-        return { ...result, name: publicName, ownerSessionId: client.owner };
+        return result;
       }
       const fn = (this.manager as any)[request.method];
       const result = await fn.apply(this.manager, args);
-      if (request.method === "dispose") this.owners.delete(args[0]);
       if (request.method === "resetKernel") {
-        const publicName = client.attached.get(args[0]) ?? this.owners.get(args[0])?.name;
-        return { ...result, name: publicName ?? result.name };
+        const alias = client.attached.get(args[0]);
+        if (alias !== undefined) return { ...result, name: alias };
       }
       return result;
     };

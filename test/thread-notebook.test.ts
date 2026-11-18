@@ -62,11 +62,9 @@ test("headless observer reads notebook cells without attaching or executing; tmu
       { output_type: "error", ename: "ValueError", evalue: "bad", traceback: ["Traceback", "ValueError: bad"] },
     ] },
   ] }));
-  const manager = { list: () => [{ id: "k1", notebookPath, running: false }], getPythonExecutable: () => undefined,
-    getSubagentSnapshot: () => null, disposeAll: async () => {} };
+  const manager = { list: () => [{ id: "k1", notebookPath, running: false, name: "analysis", ownerSessionId: "thread-a" }],
+    getPythonExecutable: () => undefined, getSubagentSnapshot: () => null, disposeAll: async () => {} };
   const host = new KernelHost(manager, path.join(folder, "headless.sock"), { headless: true });
-  // Notebook visibility follows live ownership rather than filenames supplied by a viewer.
-  host.owners.set("k1", { owner: "thread-a", name: "analysis" });
   const terminalHost = new KernelHost(manager, path.join(folder, "terminal.sock"));
   await host.listen(); await terminalHost.listen();
   try {

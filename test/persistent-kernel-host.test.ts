@@ -17,10 +17,11 @@ function fakeManager() {
     getPythonExecutable() { return "/python"; }, getSubagentSnapshot() { return null; },
     async provision(options) {
       const name = normalizeKernelName(options.name);
-      if (this.list().some(kernel => kernel.name === name)) throw new Error("Duplicate manager name");
+      const { ownerSessionId } = options;
+      if (this.list().some(kernel => kernel.name === name && kernel.ownerSessionId === ownerSessionId)) throw new Error("Kernel name already in use");
       const id = `k${++count}`;
-      kernels.set(id, { id, name, running: false, cwd: "/tmp", pythonVersion: "3.14" });
-      return { id, name, pythonExecutable: "/python" };
+      kernels.set(id, { id, name, ownerSessionId, running: false, cwd: "/tmp", pythonVersion: "3.14" });
+      return { id, name, ownerSessionId, pythonExecutable: "/python" };
     },
     async execForeground(id, code, options) { executions++; const kernel = kernels.get(id); kernel.running = true; options.onUpdate({ details: { userCode: [code], currentLine: 1 } }); await (this.executionGate ?? new Promise(resolve => setTimeout(resolve, 100))); kernel.running = false; return { text: code, cellIdx: executions }; },
     async dispose(id) { disposed++; kernels.delete(id); }, async disposeAll() { disposed += kernels.size; kernels.clear(); },
@@ -45,15 +46,16 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
   try {
     const a = await f.connect("pi-a"), b = await f.connect("pi-b");
     const name = "a".repeat(64);
-    const provision = client => client.request("call", { method: "provision", args: [{ name }] });
-    const ka = await provision(a);
+    const provision = (client, ownerSessionId) => client.request("call", { method: "provision", args: [{ name, ownerSessionId }] });
+    const ka = await provision(a, "pi-b");
     const kb = await provision(b);
     assert.equal(ka.name, name);
     assert.equal(kb.name, name);
     assert.notEqual(ka.id, kb.id);
-    await assert.rejects(provision(a), /already in use in this Pi session/);
+    assert.deepEqual(f.manager.list().map(k => [k.name, k.ownerSessionId]), [[name, "pi-a"], [name, "pi-b"]]);
+    await assert.rejects(provision(a), /already in use/);
     await a.request("attach", { kernelId: ka.id, alias: "renamed" });
-    await assert.rejects(provision(a), /already in use in this Pi session/);
+    await assert.rejects(provision(a), /already in use/);
     await assert.rejects(a.request("call", { method: "provision", args: [{ name: "renamed" }] }), /already in use in this Pi session/);
     await assert.rejects(a.request("call", { method: "provision", args: [{ name: name + "a" }] }), /too long/);
     assert.deepEqual((await b.request("discover", {})).map(k => k.id), [kb.id]);

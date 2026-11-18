@@ -1887,6 +1887,44 @@ test("kernel names: name uniqueness is enforced even for parallel provisions", a
   }
 });
 
+test("kernel names: the manager keeps the requested name unique within each owner", async () => {
+  const options = { name: "analysis", cwd: process.cwd(), ctx: fakeCtx() };
+  const ownerA = "thread:delegated-task:" + "a".repeat(100);
+  const ownerB = "pi-b";
+  let finishScript;
+  const scriptStarted = new Promise(resolve => { finishScript = resolve; });
+  const { manager } = makeFakeManager({
+    onFrame(frame, proc) {
+      if (frame.type === "exec") {
+        finishScript(() => proc.emitFrame({ type: "exec_done", id: frame.id, output: "ok", total_output_chars: 2 }));
+      }
+    },
+  });
+  try {
+    const pending = manager.provision({ ...options, ownerSessionId: ownerA, script: "value = 42" });
+    const finish = await scriptStarted;
+    try {
+      assert.deepEqual(manager.list(), []);
+      await assert.rejects(manager.provision({ ...options, ownerSessionId: ownerA }), /already in use/);
+    } finally { finish(); }
+    const a = await pending;
+    await assert.rejects(manager.provision({ ...options, ownerSessionId: ownerA }), /already in use/);
+    const b = await manager.provision({ ...options, ownerSessionId: ownerB });
+    const unowned = await manager.provision(options);
+    assert.deepEqual(manager.list().map(k => [k.id, k.name, k.ownerSessionId]), [
+      [unowned.id, "analysis", undefined], [b.id, "analysis", ownerB], [a.id, "analysis", ownerA],
+    ]);
+    assert.equal(manager.resolveKernel("analysis", ownerA).id, a.id);
+    assert.equal(manager.resolveKernel("analysis").id, unowned.id);
+    assert.throws(() => manager.resolveKernel("analysis", "unknown-owner"), UnknownKernelError);
+    await manager.dispose(a.id);
+    const replacement = await manager.provision({ ...options, ownerSessionId: ownerA });
+    assert.equal(manager.resolveKernel("analysis", ownerA).id, replacement.id);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
 test("kernel operations require a live kernel: unknown ids throw UnknownSessionError", async () => {
   const { manager } = makeFakeManager();
   try {
