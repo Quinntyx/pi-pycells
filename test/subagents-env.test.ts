@@ -8,7 +8,9 @@ const {
   sourceAvailable,
   defaultCacheRoot,
   venvPythonPath,
+  versionedVenvPythonPath,
   DEFAULT_PYTHON_VERSION,
+  ensurePythonForVersion,
   ensureSubagentsEnv,
   pidAlive,
   readLockPid,
@@ -298,6 +300,71 @@ test("readLockPid tolerates missing or non-numeric lock content", () => {
 });
 
 // --- C5: shared venv path helpers -------------------------------------------------
+
+test("the default interpreter and its venv aliases wait for the same pinned setup", { skip: process.platform === "win32" }, async (t) => {
+  const home = tmpDir("ptc-default-env-");
+  const keys = ["HOME", "USERPROFILE", "PTC_PYTHON_EXECUTABLE", "PI_SUBAGENT_DEPTH", "PI_SUBAGENTS_PARENT_TOKEN"];
+  const previous = keys.map(key => process.env[key]);
+  process.env.HOME = process.env.USERPROFILE = home;
+  for (const key of keys.slice(2)) delete process.env[key];
+  t.after(() => keys.forEach((key, i) => {
+    if (previous[i] === undefined) delete process.env[key];
+    else process.env[key] = previous[i];
+  }));
+
+  const cp = require("node:child_process");
+  const { EventEmitter } = require("node:events");
+  const { PythonSessionManager } = require("../dist/python-session-manager.js");
+  const { loadSettingsFromEnv } = require("../dist/utils.js");
+  const python = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION);
+  const basePython = path.join(home, "base-python");
+  fs.writeFileSync(basePython, "", { mode: 0o700 });
+  let announceInstall;
+  const installing = new Promise(resolve => { announceInstall = resolve; });
+  t.mock.method(cp, "execFileSync", (cmd) => assert.equal(cmd, "uv"));
+  t.mock.method(cp, "spawn", (cmd, args) => {
+    assert.equal(cmd, "uv");
+    const child = new EventEmitter();
+    if (args[0] === "venv") {
+      fs.mkdirSync(path.dirname(python), { recursive: true });
+      fs.symlinkSync(basePython, python);
+      fs.symlinkSync("python", path.join(path.dirname(python), "python3"));
+      queueMicrotask(() => child.emit("exit", 0));
+    } else {
+      assert.deepEqual(args, ["pip", "install", "--python", python, "ipython"]);
+      announceInstall(child);
+    }
+    return child;
+  });
+  const launched = new Error("sandbox reached");
+  const spawns = [];
+  const manager = new PythonSessionManager({
+    getRuntimeWorkspaceRoot: cwd => cwd,
+    spawn({ env }) { spawns.push(env.PTC_PYTHON_EXECUTABLE); throw launched; },
+  }, loadSettingsFromEnv(), path.resolve(__dirname, ".."));
+  const pinned = ensurePythonForVersion(DEFAULT_PYTHON_VERSION);
+  const installer = await installing;
+  const alias = path.relative(home, path.join(path.dirname(python), "python3"));
+  const wrapper = path.join(home, "python-link");
+  fs.symlinkSync(alias, wrapper);
+  const unrelated = path.join(home, "other-venv", "bin", "python");
+  fs.mkdirSync(path.dirname(unrelated), { recursive: true });
+  fs.symlinkSync(basePython, unrelated);
+  const attempts = [undefined, alias, "python3", wrapper, unrelated].map((configured, i) => {
+    const result = assert.rejects(manager.provision({ name: `kernel-${i}`, cwd: home,
+      launchEnvironment: { ...process.env, PATH: path.dirname(python), PTC_PYTHON_EXECUTABLE: configured } }), error => error === launched);
+    void result.catch(() => undefined);
+    return result;
+  });
+  try {
+    await new Promise(setImmediate); // drain provision's synchronous and microtask work
+    assert.deepEqual(spawns, [unrelated], "only the unrelated venv may start before IPython is installed");
+  } finally {
+    installer.emit("exit", 0);
+    await Promise.all([pinned, ...attempts]);
+  }
+  assert.deepEqual(new Set(spawns), new Set([undefined, alias, "python3", wrapper, unrelated]));
+});
 
 test("defaultCacheRoot and venvPythonPath agree on the canonical layout", () => {
   const root = path.join("some", "cache");

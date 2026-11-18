@@ -5,8 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { KernelHost } from "../dist/kernel-host/server.js";
-import { KernelHostConnection, PersistentSessionManager, hostSocketPath, ensureHost } from "../dist/kernel-host/client.js";
+import { KernelHostConnection, RemoteKernelManager, hostSocketPath, ensureHost } from "../dist/kernel-host/client.js";
 import { renderHostView } from "../dist/kernel-host/viewer.js";
+import { normalizeKernelName } from "../dist/python-session-manager.js";
 
 function fakeManager() {
   const kernels = new Map(); let count = 0, disposed = 0, executions = 0;
@@ -14,7 +15,14 @@ function fakeManager() {
     kernels, get disposed() { return disposed; }, get executions() { return executions; },
     list() { return [...kernels.values()]; },
     getPythonExecutable() { return "/python"; }, getSubagentSnapshot() { return null; },
-    async provision(options) { const id = `k${++count}`; kernels.set(id, { id, name: options.name, running: false, cwd: "/tmp", pythonVersion: "3.14" }); return { id, name: options.name, pythonExecutable: "/python" }; },
+    async provision(options) {
+      const name = normalizeKernelName(options.name);
+      const { ownerSessionId } = options;
+      if (this.list().some(kernel => kernel.name === name && kernel.ownerSessionId === ownerSessionId)) throw new Error("Kernel name already in use");
+      const id = `k${++count}`;
+      kernels.set(id, { id, name, ownerSessionId, running: false, cwd: "/tmp", pythonVersion: "3.14" });
+      return { id, name, ownerSessionId, pythonExecutable: "/python" };
+    },
     async execForeground(id, code, options) { executions++; const kernel = kernels.get(id); kernel.running = true; options.onUpdate({ details: { userCode: [code], currentLine: 1 } }); await (this.executionGate ?? new Promise(resolve => setTimeout(resolve, 100))); kernel.running = false; return { text: code, cellIdx: executions }; },
     async dispose(id) { disposed++; kernels.delete(id); }, async disposeAll() { disposed += kernels.size; kernels.clear(); },
     async resetKernel(id) { return { ...kernels.get(id) }; },
@@ -37,9 +45,19 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
   const f = await fixture();
   try {
     const a = await f.connect("pi-a"), b = await f.connect("pi-b");
-    const ka = await a.request("call", { method: "provision", args: [{ name: "analysis" }] });
-    const kb = await b.request("call", { method: "provision", args: [{ name: "analysis" }] });
+    const name = "a".repeat(64);
+    const provision = (client, ownerSessionId) => client.request("call", { method: "provision", args: [{ name, ownerSessionId }] });
+    const ka = await provision(a, "pi-b");
+    const kb = await provision(b);
+    assert.equal(ka.name, name);
+    assert.equal(kb.name, name);
     assert.notEqual(ka.id, kb.id);
+    assert.deepEqual(f.manager.list().map(k => [k.name, k.ownerSessionId]), [[name, "pi-a"], [name, "pi-b"]]);
+    await assert.rejects(provision(a), /already in use/);
+    await a.request("attach", { kernelId: ka.id, alias: "renamed" });
+    await assert.rejects(provision(a), /already in use/);
+    await assert.rejects(a.request("call", { method: "provision", args: [{ name: "renamed" }] }), /already in use in this Pi session/);
+    await assert.rejects(a.request("call", { method: "provision", args: [{ name: name + "a" }] }), /too long/);
     assert.deepEqual((await b.request("discover", {})).map(k => k.id), [kb.id]);
     assert.equal((await b.request("discover", { allSessions: true })).length, 2);
     await assert.rejects(b.request("call", { method: "dispose", args: [ka.id] }), /not attached/);
@@ -47,12 +65,129 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
     const attached = await b.request("attach", { kernelId: ka.id, alias: "recovered" });
     assert.equal(attached.ownerSessionId, "pi-a"); assert.equal(attached.name, "recovered");
     b.detach(); const b2 = await f.connect("pi-b");
-    assert.deepEqual((await b2.request("discover", {})).map(k => k.name), ["recovered", "analysis"]);
+    assert.deepEqual((await b2.request("discover", {})).map(k => k.name), ["recovered", name]);
     const reset = await b2.request("call", { method: "resetKernel", args: [ka.id, { cwd: "/tmp" }] });
     assert.equal(reset.id, ka.id); assert.equal(reset.name, "recovered");
     assert.equal((await b2.request("discover", {})).find(k => k.id === ka.id).ownerSessionId, "pi-a");
   } finally { await f.close(); }
 });
+test("provision reserves names across connections without blocking unrelated kernels", async () => {
+  const f = await fixture();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  try {
+    const a = await f.connect("pi-a"), a2 = await f.connect("pi-a"), b = await f.connect("pi-b");
+    const provision = (client, name) => client.request("call", { method: "provision", args: [{ name }] });
+    const existing = await provision(b, "existing");
+    const original = f.manager.provision;
+    let announce;
+    const started = new Promise(resolve => { announce = resolve; });
+    f.manager.provision = async function (options) {
+      if (options.ownerSessionId === "pi-a" && options.name === "analysis") {
+        announce();
+        if (await gate === "fail") throw new Error("startup failed");
+      }
+      return original.call(this, options);
+    };
+    const pending = provision(a, "analysis");
+    void pending.catch(() => undefined);
+    await started;
+    const otherOwner = provision(b, "analysis");
+    void otherOwner.catch(() => undefined);
+    await b.request("discover", {}); // same-socket barrier: the host has received the provision
+    assert.ok(f.manager.list().some(k => k.ownerSessionId === "pi-b" && k.name === "analysis"));
+    await otherOwner;
+    const duplicate = assert.rejects(provision(a2, "analysis"), /already in use/);
+    void duplicate.catch(() => undefined);
+    await assert.rejects(a2.request("attach", { kernelId: existing.id, alias: "analysis" }), /different alias/);
+    await duplicate;
+    release("fail");
+    await assert.rejects(pending, /startup failed/);
+    f.manager.provision = original;
+    assert.equal((await provision(a2, "analysis")).name, "analysis");
+  } finally { release(); await f.close(); }
+});
+
+test("source replay blocks provisioning only for the same destination notebook", async () => {
+  const f = await fixture();
+  let release, announce;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { announce = resolve; });
+  const cwd = path.dirname(f.host.socketPath);
+  fs.symlinkSync(cwd, path.join(cwd, "alias"), "dir");
+  fs.symlinkSync("shared.ipynb", path.join(cwd, "seeded.ipynb"));
+  const entered = [];
+  const original = f.manager.provision;
+  f.manager.provision = async function (options) {
+    entered.push(options.name);
+    if (options.source) { announce(); await gate; }
+    return original.call(this, options);
+  };
+  try {
+    const a = await f.connect("pi-a"), b = await f.connect("pi-b");
+    const provision = (client, name, notebookPath, source?) =>
+      client.request("call", { method: "provision", args: [{ name, cwd, notebookPath, source }] });
+    const seeded = provision(a, "seeded", "seeded.ipynb", "seed.py");
+    void seeded.catch(() => undefined);
+    await started;
+    const shared = provision(b, "shared", "alias/shared.ipynb");
+    void shared.catch(() => undefined);
+    await b.request("discover", {}); // ensure the host keyed the request before the save
+    // Saving a replayed cell atomically replaces the destination symlink.
+    const saved = path.join(cwd, "saved.tmp");
+    fs.writeFileSync(saved, "{}");
+    fs.renameSync(saved, path.join(cwd, "seeded.ipynb"));
+    const samePath = provision(b, "same-path", "alias/seeded.ipynb");
+    void samePath.catch(() => undefined);
+    await provision(b, "independent", "other.ipynb");
+    assert.deepEqual(entered, ["seeded", "independent"]);
+    release();
+    await Promise.all([seeded, shared, samePath]);
+    assert.deepEqual(entered.toSorted(), ["independent", "same-path", "seeded", "shared"]);
+  } finally { release(); await f.close(); }
+});
+
+for (const legacy of [false, true]) test(`remote list is current at hello, provision, attach and disposal (${legacy ? "legacy host" : "no discovery round trips"})`, async (t) => {
+  const threadId = process.env.T3_THREAD_ID;
+  delete process.env.T3_THREAD_ID;
+  t.after(() => { if (threadId !== undefined) process.env.T3_THREAD_ID = threadId; });
+  const f = await fixture();
+  const { loadSettingsFromEnv } = await import("../dist/utils.js");
+  const manager = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve("."), {}, { socketPath: f.host.socketPath });
+  try {
+    const peer = await f.connect("pi-b");
+    const provision = (name) => peer.request("call", { method: "provision", args: [{ name }] });
+    const external = await provision("external");
+    if (legacy) {
+      // Emulate a v1 host whose state broadcasts haven't arrived when it replies.
+      f.host.sendState = () => {};
+      const send = f.host.send.bind(f.host);
+      f.host.send = (socket, frame) => {
+        if (frame.result?.stateBeforeReply) frame = { ...frame, result: { version: frame.result.version } };
+        send(socket, frame);
+      };
+    }
+    const requests = [];
+    const handle = f.host.request.bind(f.host);
+    f.host.request = (socket, request) => {
+      requests.push(request.op);
+      return handle(socket, request);
+    };
+    const initial = await f.manager.provision({ name: "initial", ownerSessionId: "pi-a" });
+    await manager.attachOwner("pi-a");
+    assert.deepEqual(manager.list().map(k => k.id), [initial.id]);
+    const kernel = await manager.provision({ name: "analysis" });
+    assert.ok(manager.list().some(k => k.id === kernel.id));
+    await manager.attachKernel(external.id, "imported");
+    assert.equal(manager.list().find(k => k.id === external.id)?.name, "imported");
+    await manager.dispose(kernel.id);
+    assert.ok(!manager.list().some(k => k.id === kernel.id));
+    assert.deepEqual(requests, legacy
+      ? ["hello", "discover", "call", "discover", "attach", "discover", "call", "discover"]
+      : ["hello", "call", "attach", "call"]);
+  } finally { await manager.disposeAll(); await f.close(); }
+});
+
 test("Pi disconnect does not cancel execution, lose its outcome, or replay it", async () => {
   const f = await fixture();
   try {
@@ -122,7 +257,7 @@ test("Pi may initialize outside tmux, but kernel operations explain the requirem
   const { loadSettingsFromEnv } = await import("../dist/utils.js");
   try {
     delete process.env.TMUX; delete process.env.TMUX_PANE;
-    const manager = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve("."));
+    const manager = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve("."));
     await manager.attachOwner("outside-tmux");
     await assert.rejects(manager.discover(), /inside a tmux session/);
     await manager.disposeAll();
@@ -165,11 +300,10 @@ test("tmux host survives SIGKILL of a real client and tmux-session renaming", {
     fs.mkdirSync(path.dirname(expectedEndpoint), { recursive: true });
     fs.writeFileSync(expectedEndpoint + ".lock", JSON.stringify({ pid: 99999999, nonce: "dead-launcher" }));
     fs.writeFileSync(file, String.raw`
-      const { PersistentSessionManager } = require(${JSON.stringify(path.join(root, "dist/kernel-host/client.js"))});
-      const { createSandbox } = require(${JSON.stringify(path.join(root, "dist/sandbox-manager.js"))});
+      const { RemoteKernelManager } = require(${JSON.stringify(path.join(root, "dist/kernel-host/client.js"))});
       const { loadSettingsFromEnv } = require(${JSON.stringify(path.join(root, "dist/utils.js"))});
       (async () => {
-        const manager = new PersistentSessionManager(await createSandbox(), loadSettingsFromEnv(), ${JSON.stringify(root)});
+        const manager = new RemoteKernelManager(loadSettingsFromEnv(), ${JSON.stringify(root)});
         await manager.attachOwner("process-owner");
         const kernel = await manager.provision({ name: "survivor", cwd: ${JSON.stringify(dir)}, notebookPath: ${JSON.stringify(path.join(dir, "work.ipynb"))} });
         let announced = false;

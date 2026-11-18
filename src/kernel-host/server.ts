@@ -3,34 +3,58 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { PythonSessionManager, normalizeKernelName } from "../python-session-manager";
+import { KERNEL_CALLS, type KernelCall } from "../kernel-manager";
 import { serializeError, HOST_PROTOCOL_VERSION, type HostedKernel, type HostOperation, type HostState } from "./protocol";
 
 import { notebookSnapshot } from "./notebook";
 
-const METHODS = new Set(["provision", "inspectKernel", "readCellOutput", "execForeground", "scratchRun", "writeCell", "deleteCell", "readCells", "readCell", "runCell", "runTo", "runAll", "resetKernel", "toScript", "dispose", "interruptRunning"]);
-const UPDATE_OPTIONS: Record<string, number> = { provision: 0, execForeground: 2, scratchRun: 2, runCell: 2, runTo: 2, runAll: 1, resetKernel: 1 };
+type Client = { owner: string; attached: Map<string, string> };
+type HostCall = KernelCall | "interruptRunning";
+const METHODS = new Set<HostCall>([...KERNEL_CALLS, "interruptRunning"]);
+const UPDATE_OPTIONS: Partial<Record<HostCall, number>> = { provision: 0, execForeground: 2, scratchRun: 2, runCell: 2, runTo: 2, runAll: 1, resetKernel: 1 };
+
+function notebookKey(absolutePath: string): string {
+  try { return fs.realpathSync.native(absolutePath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // realpath can't resolve a symlink until its target exists.
+  const parent = path.dirname(absolutePath);
+  let target: string | undefined;
+  try { target = fs.readlinkSync(absolutePath); }
+  catch (error) {
+    const { code } = error as NodeJS.ErrnoException;
+    if (code !== "ENOENT" && code !== "EINVAL") throw error;
+  }
+  if (target !== undefined) {
+    // Let realpath interpret any `..` following another symlink in the target.
+    return notebookKey(path.isAbsolute(target) ? target : `${notebookKey(parent)}${path.sep}${target}`);
+  }
+  return parent === absolutePath ? absolutePath : path.join(notebookKey(parent), path.basename(absolutePath));
+}
 
 /** Owns interpreters independently of any Pi connection. It contains no agent workflow logic. */
 export class KernelHost {
-  private clients = new Map<net.Socket, { owner: string; attached: Map<string, string> }>();
+  private clients = new Map<net.Socket, Client>();
   private sockets = new Set<net.Socket>();
   private attachments = new Map<string, Map<string, string>>();
-  private owners = new Map<string, { owner: string; name: string }>();
   private operations = new Map<string, HostOperation>();
   private server?: net.Server;
   private timer?: NodeJS.Timeout;
   private lastState = "";
-  private provisionQueue: Promise<unknown> = Promise.resolve();
+  private reservedNames = new Set<string>();
+  private notebookProvisions = new Map<string, Promise<void>>();
   constructor(readonly manager: PythonSessionManager, readonly socketPath: string,
     private options: { headless?: boolean; threadId?: string } = {}) {}
 
   state(): HostState {
     const kernels = this.manager.list().flatMap(row => {
-      const identity = this.owners.get(row.id);
+      const { ownerSessionId } = row;
+      if (ownerSessionId === undefined) return [];
       const operation = [...this.operations.values()].reverse().find(op => op.kernelId === row.id);
       const lastOperation = operation ? { id: operation.id, method: operation.method, status: operation.status, startedAt: operation.startedAt, finishedAt: operation.finishedAt } : undefined;
-      return identity ? [{ ...row, name: identity.name, ownerSessionId: identity.owner,
-        pythonExecutable: this.manager.getPythonExecutable(row.id), snapshot: this.manager.getSubagentSnapshot(row.id), lastOperation }] : [];
+      return [{ ...row, ownerSessionId, pythonExecutable: this.manager.getPythonExecutable(row.id),
+        snapshot: this.manager.getSubagentSnapshot(row.id), lastOperation }];
     });
     // State feeds are lightweight previews, not repeated notebook/result payloads.
     // Full retained output remains available through the explicit operation RPC.
@@ -41,9 +65,36 @@ export class KernelHost {
     }));
     return { kernels, operations, pid: process.pid };
   }
-  private visible(owner: string, attached: Map<string, string>): HostedKernel[] {
-    return this.state().kernels.filter(k => k.ownerSessionId === owner || attached.has(k.id))
+  private visible(kernels: HostedKernel[], { owner, attached }: Client): HostedKernel[] {
+    return kernels.filter(k => k.ownerSessionId === owner || attached.has(k.id))
       .map(k => ({ ...k, name: attached.get(k.id) ?? k.name }));
+  }
+  private nameInUse(client: Client, name: string, exceptId?: string): boolean {
+    return this.reservedNames.has(`${client.owner}\0${name}`) || this.manager.list().some(k =>
+      k.id !== exceptId && (k.ownerSessionId === client.owner || client.attached.has(k.id)) &&
+      (client.attached.get(k.id) ?? k.name) === name);
+  }
+  private async provision(options: Parameters<PythonSessionManager["provision"]>[0]) {
+    if (!options.notebookPath) return this.manager.provision(options);
+    const destination = path.resolve(options.cwd, options.notebookPath);
+    for (;;) {
+      // An atomic notebook save replaces the directory entry, including any symlink.
+      const entry = path.join(notebookKey(path.dirname(destination)), path.basename(destination));
+      const keys = new Set([destination, entry, notebookKey(destination)]);
+      const blocking = [...keys].map(key => this.notebookProvisions.get(key)).find(Boolean);
+      if (blocking) {
+        await blocking;
+        continue; // A previous save may have changed the resolved path.
+      }
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      for (const key of keys) this.notebookProvisions.set(key, held);
+      try { return await this.manager.provision(options); }
+      finally {
+        for (const key of keys) this.notebookProvisions.delete(key);
+        release();
+      }
+    }
   }
   private send(socket: net.Socket, message: unknown): void {
     if (socket.destroyed || !socket.writable) return;
@@ -54,14 +105,18 @@ export class KernelHost {
     } catch { socket.destroy(); } // A detached client cannot fail its completed operation.
 
   }
+  private sendState(socket: net.Socket, client: Client, state: HostState): void {
+    this.send(socket, { event: "state", state: {
+      ...state, kernels: this.visible(state.kernels, client), operations: state.operations.filter(op =>
+        op.ownerSessionId === client.owner || (op.kernelId && client.attached.has(op.kernelId))) } });
+  }
   private publish(force = false): void {
+    if (!this.clients.size) return;
     const state = this.state();
     const serialized = JSON.stringify(state);
     if (!force && serialized === this.lastState) return;
     this.lastState = serialized;
-    for (const [socket, client] of this.clients) this.send(socket, { event: "state", state: {
-      ...state, kernels: this.visible(client.owner, client.attached), operations: state.operations.filter(op =>
-        op.ownerSessionId === client.owner || (op.kernelId && client.attached.has(op.kernelId))) } });
+    for (const [socket, client] of this.clients) this.sendState(socket, client, state);
   }
   async listen(): Promise<void> {
     fs.mkdirSync(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
@@ -98,21 +153,25 @@ export class KernelHost {
       if (request.version !== HOST_PROTOCOL_VERSION || typeof request.owner !== "string" || !request.owner) throw new Error("Invalid host version or Pi session identity");
       const attached = this.attachments.get(request.owner) ?? new Map<string, string>();
       this.attachments.set(request.owner, attached);
-      this.clients.set(socket, { owner: request.owner, attached });
-      this.send(socket, { id: request.id, result: { version: HOST_PROTOCOL_VERSION } });
-      this.publish(true); return;
+      const client = { owner: request.owner, attached };
+      this.clients.set(socket, client);
+      this.sendState(socket, client, this.state());
+      this.send(socket, { id: request.id, result: { version: HOST_PROTOCOL_VERSION, stateBeforeReply: true } });
+      return;
     }
     const client = this.clients.get(socket);
     if (!client) throw new Error("Connect with a Pi session identity first");
-    const allowed = (id: string) => this.visible(client.owner, client.attached).some(k => k.id === id);
+    const allowed = (id: string) => this.manager.list().some(k =>
+      k.id === id && (k.ownerSessionId === client.owner || client.attached.has(id)));
     if (request.op === "discover") {
-      this.send(socket, { id: request.id, result: request.allSessions ? this.state().kernels : this.visible(client.owner, client.attached) }); return;
+      const { kernels } = this.state();
+      this.send(socket, { id: request.id, result: request.allSessions ? kernels : this.visible(kernels, client) }); return;
     }
     if (request.op === "attach") {
       const kernel = this.state().kernels.find(k => k.id === request.kernelId);
       if (!kernel) throw new Error("Requested kernel is not live on this tmux session's host");
       const alias = normalizeKernelName(request.alias ?? kernel.name);
-      if (this.visible(client.owner, client.attached).some(k => k.id !== kernel.id && k.name === alias)) throw new Error("Kernel name already visible; pass a different alias");
+      if (this.nameInUse(client, alias, kernel.id)) throw new Error("Kernel name already visible; pass a different alias");
       client.attached.set(kernel.id, alias);
       this.publish(true); this.send(socket, { id: request.id, result: { ...kernel, name: alias } }); return;
     }
@@ -131,57 +190,58 @@ export class KernelHost {
     const operation: HostOperation = { id: request.id, ownerSessionId: client.owner, method: request.method,
       kernelId: request.method === "provision" ? undefined : args[0], status: "running", startedAt: Date.now() };
     this.operations.set(request.id, operation);
-    const optionIndex = UPDATE_OPTIONS[request.method];
+    const method: HostCall = request.method;
+    const optionIndex = UPDATE_OPTIONS[method];
     if (optionIndex !== undefined) {
       const options = args[optionIndex] = { ...(args[optionIndex] ?? {}) };
       options.ctx = { cwd: options.cwd ?? process.cwd(), hasUI: false };
       options.onUpdate = (update: unknown) => {
         operation.update = update;
-        this.send(socket, { event: "update", id: request.id, update }); this.publish();
+        this.send(socket, { event: "update", id: request.id, update });
       };
       // No caller AbortSignal: disconnecting a Pi client must not interrupt its interpreter.
     }
     const invoke = async () => {
       if (request.method === "provision") {
-        const publicName = normalizeKernelName(args[0]?.name);
-        if (this.visible(client.owner, client.attached).some(k => k.name === publicName)) throw new Error("Kernel name already in use in this Pi session");
-        args[0].name = `${client.owner}:${publicName}`;
-        if (args[0].launchEnvironment) {
-          // The caller's Pi pane may disappear. Kernels live in the host pane,
-          // while their profile configuration still comes from the creator.
-          for (const key of ["TMUX", "TMUX_PANE"]) if (process.env[key]) args[0].launchEnvironment[key] = process.env[key];
+        const name = normalizeKernelName(args[0]?.name);
+        if (this.nameInUse(client, name)) throw new Error("Kernel name already in use in this Pi session");
+        const reservation = `${client.owner}\0${name}`;
+        this.reservedNames.add(reservation);
+        try {
+          if (args[0].launchEnvironment) {
+            // The caller's Pi pane may disappear. Kernels live in the host pane,
+            // while their profile configuration still comes from the creator.
+            for (const key of ["TMUX", "TMUX_PANE"]) if (process.env[key]) args[0].launchEnvironment[key] = process.env[key];
+          }
+          const result = await this.provision({ ...args[0], name, ownerSessionId: client.owner });
+          operation.kernelId = result.id;
+          return result;
+        } finally {
+          this.reservedNames.delete(reservation);
         }
-        const result = await this.manager.provision(args[0]);
-        this.owners.set(result.id, { owner: client.owner, name: publicName });
-        operation.kernelId = result.id;
-        return { ...result, name: publicName, ownerSessionId: client.owner };
       }
-      const fn = (this.manager as any)[request.method];
-      const result = await fn.apply(this.manager, args);
-      if (request.method === "dispose") this.owners.delete(args[0]);
-      if (request.method === "resetKernel") {
-        const publicName = client.attached.get(args[0]) ?? this.owners.get(args[0])?.name;
-        return { ...result, name: publicName ?? result.name };
+      if (method === "resetKernel") {
+        const result = await this.manager.resetKernel(args[0], args[1]);
+        const alias = client.attached.get(args[0]);
+        return alias === undefined ? result : { ...result, name: alias };
       }
-      return result;
+      const fn = this.manager[method] as (...args: any[]) => unknown;
+      return fn.apply(this.manager, args);
     };
-    this.publish(true);
+    this.publish();
     try {
-      // Serialize provisioning across clients so hidden namespaces cannot race shared manager names.
-      const job = request.method === "provision" ? this.provisionQueue.then(invoke) : invoke();
-      if (request.method === "provision") this.provisionQueue = job.catch(() => undefined);
-      operation.result = await job;
+      operation.result = await invoke();
       operation.status = "completed";
-      this.send(socket, { id: request.id, result: operation.result });
     } catch (error) {
       operation.error = serializeError(error); operation.status = "failed";
-      this.send(socket, { id: request.id, error: operation.error });
-    } finally {
-      operation.finishedAt = Date.now(); this.publish(true);
-      // Retain recent outcomes for reconnects; never evict active work.
-      const finished = [...this.operations.values()].filter(op => op.status !== "running");
-      for (const old of finished.slice(0, Math.max(0, finished.length - 128))) this.operations.delete(old.id);
     }
+    operation.finishedAt = Date.now();
+    // Send the snapshot before settling the call so synchronous list() is current.
+    this.publish();
+    this.send(socket, operation.error ? { id: request.id, error: operation.error } : { id: request.id, result: operation.result });
+    // Retain recent outcomes for reconnects; never evict active work.
+    const finished = [...this.operations.values()].filter(op => op.status !== "running");
+    for (const old of finished.slice(0, Math.max(0, finished.length - 128))) this.operations.delete(old.id);
   }
   /** Explicit host shutdown; Pi disconnect never calls this. */
   async close(): Promise<void> {

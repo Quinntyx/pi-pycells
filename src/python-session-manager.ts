@@ -2,7 +2,7 @@ import readline from "readline";
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { homedir } from "os";
+import { resolveLibraryDir } from "./kernel-manager";
 import type { ChildProcess } from "child_process";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -13,7 +13,7 @@ import {
 } from "./execution/execution-errors";
 import { sectionize } from "./utils";
 import { existsSync } from "fs";
-import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
+import { ensurePythonForVersion, pendingPythonSetup, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { TerminalBuffer } from "./execution/terminal-emulator";
 import { notebookImages, type NotebookMimeOutput } from "./execution/notebook-output";
@@ -1077,8 +1077,11 @@ function truncateTarget(value: string): string {
 
 interface SessionRecord {
   id: string;
-  /** Human-readable, unique-among-live-kernels name (user-facing identity). */
+  /** Human-readable identity, unique within the owner. */
   name: string;
+  ownerSessionId?: string;
+  /** Reserve the name during startup without exposing a partially seeded kernel. */
+  provisioning: boolean;
   notebookPath?: string;
   proc: ChildProcess;
   protocol: PersistentSessionProtocol;
@@ -1186,7 +1189,7 @@ export class PythonSessionManager {
   private sessions = new Map<string, SessionRecord>();
   private recency: string[] = [];
   /** Set after the first provision() has waited (once) for venv provisioning. */
-  private envGateSettled = false;
+  private envGate?: Promise<void>;
 
   constructor(
     private sandboxManager: SandboxManager,
@@ -1201,16 +1204,18 @@ export class PythonSessionManager {
    * chunks excluded). Each row carries the kernel's public `name` alongside the
    * internal `id`.
    */
-  list(): Array<SessionSummary & { name: string }> {
+  list(): Array<SessionSummary & { name: string; ownerSessionId?: string }> {
     return [...this.sessions.values()]
+      .filter(session => !session.provisioning)
       .sort((a, b) => this.recencyIndex(b.id) - this.recencyIndex(a.id))
       .map((session) => this.summarize(session));
   }
 
-  private summarize(session: SessionRecord): SessionSummary & { name: string } {
+  private summarize(session: SessionRecord): SessionSummary & { name: string; ownerSessionId?: string } {
     return {
       id: session.id,
       name: session.name,
+      ownerSessionId: session.ownerSessionId,
       createdAt: session.createdAt,
       lastUsedAt: session.lastUsedAt,
       chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
@@ -1329,15 +1334,7 @@ export class PythonSessionManager {
    * PTC_LIBRARY_DIR (both `~/`-expanded), then `<pi agent dir>/pycells-library`.
    */
   resolveLibraryDir(): string {
-    const configured = this.settings.libraryDir?.trim() || process.env.PTC_LIBRARY_DIR?.trim();
-    if (configured) {
-      const expanded = configured === "~" || configured.startsWith(`~${path.sep}`)
-        ? path.join(homedir(), configured.slice(2))
-        : configured;
-      return path.resolve(expanded);
-    }
-    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".pi", "agent");
-    return path.resolve(agentDir, "pycells-library");
+    return resolveLibraryDir(this.settings);
   }
 
   private resolveSourcePath(source: string, cwd: string): string {
@@ -1516,7 +1513,7 @@ export class PythonSessionManager {
   /**
    * Provision a new persistent kernel under a human-readable, unique name.
    * `name` is required at runtime: trim-normalized, nonempty, free of
-   * control/terminal escape characters, and unique among live kernels. The
+   * control/terminal escape characters, and unique within its owner. The
    * result carries the public `name` plus the internal `id` (protocol
    * bookkeeping) and the bound `notebookPath`.
    */
@@ -1525,6 +1522,8 @@ export class PythonSessionManager {
     ctx: ExtensionToolContext;
     /** Required public kernel identity; validated and uniqueness-checked. */
     name?: string;
+    /** Set by the host from the connected session, not from the tool input. */
+    ownerSessionId?: string;
     launchEnvironment?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
     onUpdate?: ToolUpdateCallback;
@@ -1535,8 +1534,9 @@ export class PythonSessionManager {
     /** Explicit Python version (validated by the tool schema). Overrides a source-notebook pin; metadata is never mutated. */
     version?: string;
   }): Promise<{
-    /** Public kernel identity (validated, unique among live kernels). */
+    /** Public kernel identity (validated, unique within its owner). */
     name: string;
+    ownerSessionId?: string;
     /** Internal protocol id; never user-facing. */
     id: string;
     /** Notebook bound to the kernel, when one was provided. */
@@ -1551,7 +1551,8 @@ export class PythonSessionManager {
       );
     }
     const kernelName = normalizeKernelName(options.name);
-    this.assertKernelNameAvailable(kernelName);
+    const { ownerSessionId } = options;
+    this.assertKernelNameAvailable(kernelName, ownerSessionId);
 
     // Back-burner: limit disabled 2026-09-26 — revisit for provisioning churn per docs/BACK-BURNER.md §2
     // Keep maxPythonSessions parsing for compatibility, but do not reject new kernels here.
@@ -1562,12 +1563,9 @@ export class PythonSessionManager {
     // the venv instead of locking the session onto system python3 while
     // provisioned packages live elsewhere. Skipped when the interpreter is
     // pinned or the venv already exists.
-    if (!this.envGateSettled) {
-      this.envGateSettled = true;
-      if (!process.env.PTC_PYTHON_EXECUTABLE && !existsSync(venvPythonPath())) {
-        await waitForSubagentsEnv();
-      }
-    }
+    this.envGate ??= !process.env.PTC_PYTHON_EXECUTABLE && !existsSync(venvPythonPath())
+      ? waitForSubagentsEnv() : Promise.resolve();
+    await this.envGate;
 
     const sessionId = randomUUID().replace(/-/g, "").slice(0, 12);
     const { cwd } = options;
@@ -1589,6 +1587,10 @@ export class PythonSessionManager {
         pythonExecutable = await ensurePythonForVersion(preparedSource.pythonVersion);
       }
     }
+    if (!pythonExecutable) {
+      const setup = pendingPythonSetup(options.launchEnvironment ?? process.env, cwd);
+      if (setup) await setup;
+    }
     const { proc, protocol } = this.createInterpreter({
       sessionId,
       cwd,
@@ -1602,6 +1604,8 @@ export class PythonSessionManager {
     const record: SessionRecord = {
       id: sessionId,
       name: kernelName,
+      ownerSessionId,
+      provisioning: true,
       proc,
       protocol,
       chunks: [],
@@ -1636,107 +1640,102 @@ export class PythonSessionManager {
       if (record.killed || proc.exitCode !== null || proc.signalCode !== null) {
         throw new PythonSessionError("python session exited during startup");
       }
+      if (notebookPath) {
+        protocol.setNotebookPath(notebookPath);
+      }
+      if (preparedSource) {
+        // The first frame tells the runtime that copied markdown and code cells
+        // occupy the prefix numbering range. It is consumed once by the protocol.
+        protocol.setInitialCellCount(preparedSource.prefixCellCount);
+      }
+
+      // Re-check after the awaits above: a parallel provision could have claimed
+      // the name while this interpreter was starting up.
+      this.assertKernelNameAvailable(kernelName, ownerSessionId);
+      this.sessions.set(sessionId, record);
+      this.recency = this.recency.filter((id) => id !== sessionId);
+      this.recency.push(sessionId);
+
+      let sourceError: SourceExecutionError | undefined;
+      if (preparedSource) {
+        const sourceCells = preparedSource.kind === "python"
+          ? [{ code: preparedSource.pythonCode ?? "", index: 0, file: preparedSource.path }]
+          : preparedSource.cells
+              .map((cell, index) => ({ cell, index }))
+              .filter(({ cell }) => cell.cell_type === "code")
+              .map(({ cell, index }) => ({ code: notebookText(cell.source), index, file: undefined }));
+
+        for (const sourceCell of sourceCells) {
+          record.prefixChunkCount += 1;
+          try {
+            await this.execChunk(
+              record,
+              sourceCell.code,
+              options.onUpdate,
+              options.signal,
+              sourceCell.file,
+              undefined,
+              sourceCell.index
+            );
+          } catch (error) {
+            sourceError = {
+              cellIdx: sourceCell.index + 1,
+              message: error instanceof Error ? error.message : String(error),
+              traceback: error instanceof PtcPythonError ? error.traceback : undefined,
+            };
+            break;
+          }
+        }
+      }
+
+      let scriptError: PtcPythonError | undefined;
+      if (options.script) {
+        try {
+          await this.execChunk(record, options.script, options.onUpdate);
+        } catch (error) {
+          if (error instanceof PtcPythonError) {
+            scriptError = error;
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      record.provisioning = false;
+      return {
+        name: kernelName,
+        ownerSessionId,
+        id: sessionId,
+        notebookPath,
+        sourcedFrom: preparedSource?.path,
+        sourceError,
+        scriptError,
+      };
     } catch (error) {
-      record.killed = true;
+      this.reapSession(record);
       this.terminateSession(record);
       await protocol.dispose().catch(() => undefined);
       throw error;
     }
-    if (notebookPath) {
-      protocol.setNotebookPath(notebookPath);
-    }
-    if (preparedSource) {
-      // The first frame tells the runtime that copied markdown and code cells
-      // occupy the prefix numbering range. It is consumed once by the protocol.
-      protocol.setInitialCellCount(preparedSource.prefixCellCount);
-    }
-
-    // Re-check after the awaits above: a parallel provision could have claimed
-    // the name while this interpreter was starting up.
-    this.assertKernelNameAvailable(kernelName);
-    this.sessions.set(sessionId, record);
-    this.recency = this.recency.filter((id) => id !== sessionId);
-    this.recency.push(sessionId);
-
-    let sourceError: SourceExecutionError | undefined;
-    if (preparedSource) {
-      const sourceCells = preparedSource.kind === "python"
-        ? [{ code: preparedSource.pythonCode ?? "", index: 0, file: preparedSource.path }]
-        : preparedSource.cells
-            .map((cell, index) => ({ cell, index }))
-            .filter(({ cell }) => cell.cell_type === "code")
-            .map(({ cell, index }) => ({ code: notebookText(cell.source), index, file: undefined }));
-
-      for (const sourceCell of sourceCells) {
-        record.prefixChunkCount += 1;
-        try {
-          await this.execChunk(
-            record,
-            sourceCell.code,
-            options.onUpdate,
-            options.signal,
-            sourceCell.file,
-            undefined,
-            sourceCell.index
-          );
-        } catch (error) {
-          sourceError = {
-            cellIdx: sourceCell.index + 1,
-            message: error instanceof Error ? error.message : String(error),
-            traceback: error instanceof PtcPythonError ? error.traceback : undefined,
-          };
-          break;
-        }
-      }
-    }
-
-    let scriptError: PtcPythonError | undefined;
-    if (options.script) {
-      try {
-        await this.execChunk(record, options.script, options.onUpdate);
-      } catch (error) {
-        if (error instanceof PtcPythonError) {
-          scriptError = error;
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    return {
-      name: kernelName,
-      id: sessionId,
-      notebookPath,
-      sourcedFrom: preparedSource?.path,
-      sourceError,
-      scriptError,
-    };
   }
 
-  /** Throw when another live kernel already owns `name`. */
-  private assertKernelNameAvailable(name: string): void {
+  /** Throw when the owner already has a live or provisioning kernel named `name`. */
+  private assertKernelNameAvailable(name: string, ownerSessionId?: string): void {
     for (const record of this.sessions.values()) {
-      if (record.name === name) {
-        throw new PythonSessionError(
-          `kernel name already in use: ${name} (kernel names must be unique among live kernels)`
-        );
+      if (record.name === name && record.ownerSessionId === ownerSessionId) {
+        throw new PythonSessionError(`kernel name already in use: ${name}`);
       }
     }
   }
 
-  /**
-   * Resolve a kernel by its human-readable name. Synchronous; throws
-   * UnknownKernelError (listing live names) for anything not live. The handle
-   * exposes the public `name`, bound `notebookPath`, and the internal `id` for
-   * protocol bookkeeping — never render the id.
-   */
-  resolveKernel(name: string): KernelHandle {
+  /** Resolve a kernel by its public name within an owner's namespace. */
+  resolveKernel(name: string, ownerSessionId?: string): KernelHandle {
     const wanted = normalizeKernelName(name);
-    const record = [...this.sessions.values()].find((candidate) => candidate.name === wanted);
-    if (!record) {
-      throw new UnknownKernelError(wanted, this.list().map((kernel) => kernel.name));
+    const kernels = this.list().filter(kernel => kernel.ownerSessionId === ownerSessionId);
+    const summary = kernels.find(kernel => kernel.name === wanted);
+    if (!summary) {
+      throw new UnknownKernelError(wanted, kernels.map(kernel => kernel.name));
     }
-    const summary = this.summarize(record);
     return {
       id: summary.id,
       name: summary.name,

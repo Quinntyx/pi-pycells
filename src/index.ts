@@ -48,8 +48,8 @@ import {
 } from "./execution/notebook-render";
 import { highlightCellCode } from "./execution/code-highlight";
 import { createLiveRepaint } from "./execution/live-repaint";
-import { PythonSessionManager } from "./python-session-manager";
-import { PersistentSessionManager } from "./kernel-host/client";
+import type { KernelManager } from "./kernel-manager";
+import { RemoteKernelManager } from "./kernel-host/client";
 import type {
   CodeExecutionResult,
   NotebookCellSummary,
@@ -202,7 +202,7 @@ const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into a k
 
 
 /** read_cell_output tool: page through a cell's durable notebook output (1-based cellIdx, explicit kernel). */
-function readCellOutputTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function readCellOutputTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cell_output",
     label: "read output",
@@ -251,7 +251,7 @@ function readCellOutputTool(sessionManager: PythonSessionManager, directory: Ker
 
 /** inspect_kernel tool: structured digest of a kernel's user namespace (imports/defs/classes/vars/cells). */
 function inspectKernelTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   toolDescription: string
 ): PtcToolDefinition {
@@ -311,7 +311,7 @@ function resolveTargetPython(sandboxManager: SandboxManager): string {
 }
 
 export function provisionDependencyTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   sandboxManager: SandboxManager,
   directory?: KernelDirectory
 ): PtcToolDefinition {
@@ -522,7 +522,7 @@ function execFilePtc(
 
 /** provision_kernel tool: spawn a persistent notebook-backed kernel (optionally sourcing a workflow). */
 export function provisionKernelTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
@@ -724,7 +724,7 @@ export function provisionKernelTool(
 /** exec_cell: persistent execution with preview folding, recovery and subagent streaming. Review is separate. */
 function execCellTool(
   pi: ExtensionAPI,
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState,
@@ -957,7 +957,7 @@ function renderNotebookCells(cells: NotebookCellSummary[]): string {
 }
 
 function scratchRunTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState
@@ -1004,7 +1004,7 @@ function scratchRunTool(
   });
 }
 
-function writeCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function writeCellTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "write_cell",
     label: "write cell",
@@ -1085,7 +1085,7 @@ function writeCellTool(sessionManager: PythonSessionManager, directory: KernelDi
   });
 }
 
-function deleteCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function deleteCellTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "delete_cell",
     label: "delete cell",
@@ -1135,7 +1135,7 @@ function deleteCellTool(sessionManager: PythonSessionManager, directory: KernelD
   });
 }
 
-function readCellsTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function readCellsTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cells",
     label: "read cells",
@@ -1175,7 +1175,7 @@ function readCellsTool(sessionManager: PythonSessionManager, directory: KernelDi
   });
 }
 
-function readCellTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function readCellTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cell",
     label: "read cell",
@@ -1212,7 +1212,7 @@ function readCellTool(sessionManager: PythonSessionManager, directory: KernelDir
 }
 
 function runCellTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   settings: PtcSettings,
   sessionState: PtcSessionState
@@ -1277,7 +1277,7 @@ function runCellTool(
 }
 
 function runBatchTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   sessionState: PtcSessionState,
   opts: { name: "run_to" | "run_all"; label: string; description: string; withN: boolean }
@@ -1336,7 +1336,7 @@ function runBatchTool(
   });
 }
 
-function resetKernelTool(sessionManager: PythonSessionManager, directory: KernelDirectory): PtcToolDefinition {
+function resetKernelTool(sessionManager: KernelManager, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "reset_kernel",
     label: "reset kernel",
@@ -1421,7 +1421,7 @@ function registerWorkflowCommand(pi: ExtensionAPI): void {
 
 
 /** Manual kernel controls require the same human-readable name as tools. */
-function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, directory: KernelDirectory): void {
+function registerPtcCommand(pi: ExtensionAPI, sessionManager: KernelManager, directory: KernelDirectory): void {
   pi.registerCommand("ptc", {
     description: "Control Python kernels: /ptc <interrupt|kill> <kernel-name>",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
@@ -1482,7 +1482,7 @@ export interface SubagentRuntimeApi {
  * current per-session snapshots plus running/settled/failed totals, and a
  * listener subscription for snapshot updates.
  */
-export function createSubagentRuntime(sessionManager: Pick<PythonSessionManager, "allSubagentSnapshots">): SubagentRuntimeApi {
+export function createSubagentRuntime(sessionManager: Pick<KernelManager, "allSubagentSnapshots">): SubagentRuntimeApi {
   const listeners = new Set<(payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void>();
 
   let disposed = false;
@@ -1560,7 +1560,7 @@ function registerKernelTools(
   pi: ExtensionAPI,
   settings: PtcSettings,
   sessionState: PtcSessionState,
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   sandboxManager: SandboxManager,
 ): void {
@@ -1597,7 +1597,7 @@ function registerKernelTools(
     })
   );
   register(resetKernelTool(sessionManager, directory));
-  if (sessionManager instanceof PersistentSessionManager) {
+  if (sessionManager instanceof RemoteKernelManager) {
     register(withActivityLabel({
       name: "list_kernels", label: "list kernels",
       description: "Discover live kernels on this tmux session's persistent host. Default: this Pi session's kernels and explicitly attached kernels. Set all_sessions=true to discover other Pi sessions' kernels for intentional recovery/fork attachment. Discovery alone does not attach or execute code.",
@@ -1627,14 +1627,14 @@ async function handleSessionStart(
   sessionState: PtcSessionState,
   pi: ExtensionAPI,
   settings: PtcSettings,
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory: KernelDirectory,
   sandboxManager: SandboxManager,
   _event: unknown,
   ctx: ExtensionContext
 ): Promise<void> {
   sessionState.currentCwd = ctx.cwd;
-  if (sessionManager instanceof PersistentSessionManager) {
+  if (sessionManager instanceof RemoteKernelManager) {
     await sessionManager.attachOwner(ctx.sessionManager.getSessionId());
   }
   if (!sessionState.customToolsStarted) {
@@ -1726,7 +1726,7 @@ function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
 async function handleSessionShutdown(
   customToolManager: CustomToolManager,
   sandboxManager: SandboxManager,
-  sessionManager: PythonSessionManager
+  sessionManager: KernelManager
 ): Promise<void> {
   customToolManager.close();
   await sessionManager.disposeAll();
@@ -1772,7 +1772,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   // Retire the previous fanout before disposal can emit teardown snapshots.
   const previousRuntime = (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] as SubagentRuntimeApi | undefined;
   previousRuntime?.dispose?.();
-  // Reload hygiene: an earlier extension instance's sessions die with it.
+  // Reload hygiene: a local manager stops kernels; a remote manager only detaches.
   const previousManager = (globalThis as Record<string, unknown>).__ptcPythonSessionManager as
     | { disposeAll(): Promise<void> }
     | undefined;
@@ -1781,7 +1781,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   }
 
   let subagentRuntime: SubagentRuntimeApi | undefined;
-  const sessionManager = new PersistentSessionManager(sandboxManager, settings, extensionRoot, {
+  const sessionManager = new RemoteKernelManager(settings, extensionRoot, {
     onSubagentSnapshot: (sessionId, execId, snapshot) => {
       subagentRuntime?.publish(sessionId, snapshot);
       sessionState.lastSubagentSnapshot = snapshot;

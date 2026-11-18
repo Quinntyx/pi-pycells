@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { AgentToolResult, ExtensionContext, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { PythonSessionManager } from "../python-session-manager";
+import type { KernelManager } from "../kernel-manager";
 import type { PtcToolDefinition } from "../types";
 import { withActivityLabel } from "../utils";
 import { highlightCellCode } from "../execution/code-highlight";
@@ -11,7 +11,7 @@ type ReviewDecision = { action: "approve" | "reject"; note?: string };
 type Reviewer = (ctx: ExtensionContext, kernelName: string, code: string) => Promise<ReviewDecision>;
 
 /** Review a SAVED notebook cell (write_cell first): a user decision, never execution or an exact-code permission token. */
-export function createCellReviewTool(manager: PythonSessionManager, review: Reviewer, directory: KernelDirectory): PtcToolDefinition {
+export function createCellReviewTool(manager: KernelManager, review: Reviewer, directory: KernelDirectory): PtcToolDefinition {
   return withActivityLabel({
     name: "request_cell_review",
     label: "review cell",
@@ -60,7 +60,7 @@ export function createCellReviewTool(manager: PythonSessionManager, review: Revi
 
 /** Keep review instructions model-facing; render only the user's decision on success. */
 export function createRenderedCellReviewTool(
-  sessionManager: PythonSessionManager,
+  sessionManager: KernelManager,
   directory?: KernelDirectory,
   review: Reviewer = requestCellApproval
 ): PtcToolDefinition {

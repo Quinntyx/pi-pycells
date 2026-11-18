@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
 import { createInterface } from "node:readline";
-import { resolveHostEndpoint, ensureHost, KernelHostConnection, PersistentSessionManager } from "../dist/kernel-host/client.js";
+import { resolveHostEndpoint, ensureHost, KernelHostConnection, RemoteKernelManager } from "../dist/kernel-host/client.js";
 import { spawn } from "node:child_process";
 import { notebookImages } from "../dist/execution/notebook-output.js";
 import { KernelHost } from "../dist/kernel-host/server.js";
@@ -62,11 +62,9 @@ test("headless observer reads notebook cells without attaching or executing; tmu
       { output_type: "error", ename: "ValueError", evalue: "bad", traceback: ["Traceback", "ValueError: bad"] },
     ] },
   ] }));
-  const manager = { list: () => [{ id: "k1", notebookPath, running: false }], getPythonExecutable: () => undefined,
-    getSubagentSnapshot: () => null, disposeAll: async () => {} };
+  const manager = { list: () => [{ id: "k1", notebookPath, running: false, name: "analysis", ownerSessionId: "thread-a" }],
+    getPythonExecutable: () => undefined, getSubagentSnapshot: () => null, disposeAll: async () => {} };
   const host = new KernelHost(manager, path.join(folder, "headless.sock"), { headless: true });
-  // Notebook visibility follows live ownership rather than filenames supplied by a viewer.
-  host.owners.set("k1", { owner: "thread-a", name: "analysis" });
   const terminalHost = new KernelHost(manager, path.join(folder, "terminal.sock"));
   await host.listen(); await terminalHost.listen();
   try {
@@ -141,30 +139,35 @@ test("concurrent headless startup reuses one source host and follows its T3 owne
   }
 });
 
-test("real T3 headless kernel resumes its namespace and notebook images match model images", {
+test("real T3 delegated kernel resumes its namespace and notebook images match model images", {
   skip: process.env.PTC_TEST_REAL_RUNTIME !== "true",
 }, async () => {
   const { loadSettingsFromEnv } = await import("../dist/utils.js");
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "pycells-headless-real-"));
   const owner = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  const keys = ["T3_THREAD_ID", "T3_PYCELLS_SOCKET", "T3_PYCELLS_OWNER_PID"];
+  const keys = ["T3_THREAD_ID", "T3_PYCELLS_SOCKET", "T3_PYCELLS_OWNER_PID", "T3_PYCELLS_LAUNCH_SOCKET"];
   const original = keys.map(key => process.env[key]);
   const managers = [];
   try {
-    process.env.T3_THREAD_ID = "persistent-thread";
+    const threadId = "thread:delegated-task:command%3Amcp%3A11111111-1111-4111-8111-111111111111%3Adelegate-task%3A22222222-2222-4222-8222-222222222222";
+    process.env.T3_THREAD_ID = threadId;
+    delete process.env.T3_PYCELLS_LAUNCH_SOCKET;
     process.env.T3_PYCELLS_SOCKET = path.join(folder, "host.sock");
     process.env.T3_PYCELLS_OWNER_PID = String(owner.pid);
-    const a = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve(".")); managers.push(a);
+    const a = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve(".")); managers.push(a);
     await a.attachOwner("transient-pi-a");
     const k = await a.provision({ name: "analysis", cwd: folder, notebookPath: path.join(folder, "analysis.ipynb") });
+    assert.equal(k.name, "analysis");
+    assert.equal(k.ownerSessionId, threadId);
     const result = await a.execForeground(k.id, "import matplotlib.pyplot as plt\nfrom IPython.display import display, Image\nimport base64\nvalue = 42\ndisplay(Image(data=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aNfkAAAAASUVORK5CYII=')))\nplt.plot([1, 2, 3], [1, 4, 2])\nvalue", { cwd: folder });
     assert.equal(result.images.length, 2);
     const snapshot = (await request(process.env.T3_PYCELLS_SOCKET, "notebookSnapshot")).result;
     assert.deepEqual(snapshot.kernels[0].cells[0].outputs.filter(o => o.kind === "image").map(({ kind, ...image }) => image), result.images);
     await a.disposeAll();
-    const b = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve(".")); managers.push(b);
+    const b = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve(".")); managers.push(b);
     await b.attachOwner("transient-pi-b");
     assert.equal(b.list()[0].id, k.id);
+    assert.equal(b.list()[0].name, "analysis");
     const resumed = await b.scratchRun(k.id, "value", { cwd: folder });
     assert.match(resumed.output, /42/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(folder, "analysis.ipynb"), "utf8")).cells.length, 1);
