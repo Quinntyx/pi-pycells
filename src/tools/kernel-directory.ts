@@ -1,5 +1,6 @@
 /** Human-facing naming adapter; PythonSessionManager owns kernel identities. */
-import { normalizeKernelName, type PythonSessionManager } from "../python-session-manager";
+import { normalizeKernelName } from "../python-session-manager";
+import type { KernelManager } from "../kernel-manager";
 export { normalizeKernelName } from "../python-session-manager";
 
 export interface KernelRef {
@@ -13,7 +14,7 @@ export class KernelNameError extends Error {}
 export class KernelDirectory {
   // Bindings also support structural manager doubles. Runtime names remain authoritative.
   private names = new Map<string, string>();
-  constructor(private readonly manager: PythonSessionManager) {}
+  constructor(private readonly manager: Pick<KernelManager, "list">) {}
 
   private liveKernels() {
     return this.manager.list().map((kernel) => ({

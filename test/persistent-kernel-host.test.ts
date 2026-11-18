@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { KernelHost } from "../dist/kernel-host/server.js";
-import { KernelHostConnection, PersistentSessionManager, hostSocketPath, ensureHost } from "../dist/kernel-host/client.js";
+import { KernelHostConnection, RemoteKernelManager, hostSocketPath, ensureHost } from "../dist/kernel-host/client.js";
 import { renderHostView } from "../dist/kernel-host/viewer.js";
 import { normalizeKernelName } from "../dist/python-session-manager.js";
 
@@ -71,6 +71,81 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
     assert.equal((await b2.request("discover", {})).find(k => k.id === ka.id).ownerSessionId, "pi-a");
   } finally { await f.close(); }
 });
+test("provision reserves names across connections without blocking unrelated kernels", async () => {
+  const f = await fixture();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  try {
+    const a = await f.connect("pi-a"), a2 = await f.connect("pi-a"), b = await f.connect("pi-b");
+    const provision = (client, name) => client.request("call", { method: "provision", args: [{ name }] });
+    const existing = await provision(b, "existing");
+    const original = f.manager.provision;
+    let announce;
+    const started = new Promise(resolve => { announce = resolve; });
+    f.manager.provision = async function (options) {
+      if (options.ownerSessionId === "pi-a" && options.name === "analysis") {
+        announce();
+        if (await gate === "fail") throw new Error("startup failed");
+      }
+      return original.call(this, options);
+    };
+    const pending = provision(a, "analysis");
+    void pending.catch(() => undefined);
+    await started;
+    const otherOwner = provision(b, "analysis");
+    void otherOwner.catch(() => undefined);
+    await b.request("discover", {}); // same-socket barrier: the host has received the provision
+    assert.ok(f.manager.list().some(k => k.ownerSessionId === "pi-b" && k.name === "analysis"));
+    await otherOwner;
+    const duplicate = assert.rejects(provision(a2, "analysis"), /already in use/);
+    void duplicate.catch(() => undefined);
+    await assert.rejects(a2.request("attach", { kernelId: existing.id, alias: "analysis" }), /different alias/);
+    await duplicate;
+    release("fail");
+    await assert.rejects(pending, /startup failed/);
+    f.manager.provision = original;
+    assert.equal((await provision(a2, "analysis")).name, "analysis");
+  } finally { release(); await f.close(); }
+});
+
+for (const legacy of [false, true]) test(`remote list is current at hello, provision, attach and disposal (${legacy ? "legacy host" : "no discovery round trips"})`, async () => {
+  const f = await fixture();
+  const { loadSettingsFromEnv } = await import("../dist/utils.js");
+  const manager = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve("."), {}, { socketPath: f.host.socketPath });
+  try {
+    const peer = await f.connect("pi-b");
+    const provision = (name) => peer.request("call", { method: "provision", args: [{ name }] });
+    const external = await provision("external");
+    if (legacy) {
+      // Emulate a v1 host whose state broadcasts haven't arrived when it replies.
+      f.host.sendState = () => {};
+      const send = f.host.send.bind(f.host);
+      f.host.send = (socket, frame) => {
+        if (frame.result?.stateBeforeReply) frame = { ...frame, result: { version: frame.result.version } };
+        send(socket, frame);
+      };
+    }
+    const requests = [];
+    const handle = f.host.request.bind(f.host);
+    f.host.request = (socket, request) => {
+      requests.push(request.op);
+      return handle(socket, request);
+    };
+    const initial = await f.manager.provision({ name: "initial", ownerSessionId: "pi-a" });
+    await manager.attachOwner("pi-a");
+    assert.deepEqual(manager.list().map(k => k.id), [initial.id]);
+    const kernel = await manager.provision({ name: "analysis" });
+    assert.ok(manager.list().some(k => k.id === kernel.id));
+    await manager.attachKernel(external.id, "imported");
+    assert.equal(manager.list().find(k => k.id === external.id)?.name, "imported");
+    await manager.dispose(kernel.id);
+    assert.ok(!manager.list().some(k => k.id === kernel.id));
+    assert.deepEqual(requests, legacy
+      ? ["hello", "discover", "call", "discover", "attach", "discover", "call", "discover"]
+      : ["hello", "call", "attach", "call"]);
+  } finally { await manager.disposeAll(); await f.close(); }
+});
+
 test("Pi disconnect does not cancel execution, lose its outcome, or replay it", async () => {
   const f = await fixture();
   try {
@@ -140,7 +215,7 @@ test("Pi may initialize outside tmux, but kernel operations explain the requirem
   const { loadSettingsFromEnv } = await import("../dist/utils.js");
   try {
     delete process.env.TMUX; delete process.env.TMUX_PANE;
-    const manager = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve("."));
+    const manager = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve("."));
     await manager.attachOwner("outside-tmux");
     await assert.rejects(manager.discover(), /inside a tmux session/);
     await manager.disposeAll();
@@ -183,11 +258,10 @@ test("tmux host survives SIGKILL of a real client and tmux-session renaming", {
     fs.mkdirSync(path.dirname(expectedEndpoint), { recursive: true });
     fs.writeFileSync(expectedEndpoint + ".lock", JSON.stringify({ pid: 99999999, nonce: "dead-launcher" }));
     fs.writeFileSync(file, String.raw`
-      const { PersistentSessionManager } = require(${JSON.stringify(path.join(root, "dist/kernel-host/client.js"))});
-      const { createSandbox } = require(${JSON.stringify(path.join(root, "dist/sandbox-manager.js"))});
+      const { RemoteKernelManager } = require(${JSON.stringify(path.join(root, "dist/kernel-host/client.js"))});
       const { loadSettingsFromEnv } = require(${JSON.stringify(path.join(root, "dist/utils.js"))});
       (async () => {
-        const manager = new PersistentSessionManager(await createSandbox(), loadSettingsFromEnv(), ${JSON.stringify(root)});
+        const manager = new RemoteKernelManager(loadSettingsFromEnv(), ${JSON.stringify(root)});
         await manager.attachOwner("process-owner");
         const kernel = await manager.provision({ name: "survivor", cwd: ${JSON.stringify(dir)}, notebookPath: ${JSON.stringify(path.join(dir, "work.ipynb"))} });
         let announced = false;

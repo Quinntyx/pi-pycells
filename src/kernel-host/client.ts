@@ -6,9 +6,9 @@ import * as path from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
-import { PythonSessionManager, UnknownKernelError } from "../python-session-manager";
+import { resolveLibraryDir, type KernelCall, type KernelManager } from "../kernel-manager";
 import * as executionErrors from "../execution/execution-errors";
-import type { PtcSettings, SandboxManager } from "../types";
+import type { PtcSettings } from "../types";
 import type { PythonSessionManagerHooks } from "../contracts/execution-types";
 import { cleanArguments, HOST_PROTOCOL_VERSION, type HostState, type HostedKernel, type HostOperation, type SerializedError } from "./protocol";
 import { processIdentity, liveProcess } from "./process-owner";
@@ -171,6 +171,7 @@ export function decodeHostError(error: SerializedError): Error {
 export class KernelHostConnection {
   state: HostState = { kernels: [], operations: [], pid: 0 };
   private socket?: net.Socket;
+  private stateBeforeReply = false;
   private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; update?: (frame: any) => void }>();
   constructor(readonly socketPath: string, private onState?: (state: HostState) => void) {}
   get connected(): boolean { return Boolean(this.socket && !this.socket.destroyed); }
@@ -197,9 +198,13 @@ export class KernelHostConnection {
         this.pending.clear();
       });
     }
-    await this.request("hello", { owner, version: HOST_PROTOCOL_VERSION });
-    // A discover response provides an initial snapshot without depending on frame scheduling.
-    this.state.kernels = await this.request("discover", {});
+    const hello = await this.request("hello", { owner, version: HOST_PROTOCOL_VERSION });
+    this.stateBeforeReply = hello?.stateBeforeReply === true;
+    await this.refreshLegacyState();
+  }
+  async refreshLegacyState(): Promise<void> {
+    // Older live hosts reply before broadcasting state. Keep them usable across upgrades.
+    if (!this.stateBeforeReply) this.state.kernels = await this.request("discover", {});
   }
   async request(op: string, body: Record<string, unknown>, update?: (frame: any) => void, id = randomUUID()): Promise<any> {
     if (!this.socket || this.socket.destroyed) throw new Error("Kernel host client is not attached");
@@ -212,14 +217,12 @@ export class KernelHostConnection {
 }
 
 /** Pi-side adapter. Only explicit dispose(id) terminates an interpreter. */
-export class PersistentSessionManager extends PythonSessionManager {
+export class RemoteKernelManager implements KernelManager {
   private connection?: KernelHostConnection;
   private owner = "";
   private ready?: Promise<void>;
-  constructor(sandbox: SandboxManager, settings: PtcSettings, private hostRoot: string,
-    private clientHooks: PythonSessionManagerHooks = {}, private endpointOverride?: HostEndpoint) {
-    super(sandbox, settings, hostRoot, clientHooks);
-  }
+  constructor(private settings: PtcSettings, private hostRoot: string,
+    private clientHooks: PythonSessionManagerHooks = {}, private endpointOverride?: HostEndpoint) {}
   async attachOwner(owner: string): Promise<void> {
     if (!owner) throw new Error("A Pi session ID is required to attach a kernel client");
     if (process.env.T3_THREAD_ID && process.env.T3_PYCELLS_SOCKET) owner = process.env.T3_THREAD_ID;
@@ -249,46 +252,40 @@ export class PersistentSessionManager extends PythonSessionManager {
     if (method === "provision") (args[0] as any).launchEnvironment = { ...process.env };
     const result = await this.connection!.request("call", { method, args: cleanArguments(args) }, update);
     if (result?.scriptError?.name) result.scriptError = decodeHostError(result.scriptError);
-    // Request completion precedes state broadcast. Refresh before synchronous name resolution.
-    this.connection!.state.kernels = await this.connection!.request("discover", {});
+    await this.connection!.refreshLegacyState();
     return result;
   }
-  override list() { return this.connection?.state.kernels ?? []; }
-  override get(id: string) { return this.list().some(k => k.id === id); }
-  override getPythonExecutable(id: string) { return this.list().find(k => k.id === id)?.pythonExecutable; }
-  override getSubagentSnapshot(id: string) { return this.list().find(k => k.id === id)?.snapshot ?? null; }
-  override allSubagentSnapshots() { return this.list().flatMap(k => k.snapshot ? [{ sessionId: k.id, snapshot: k.snapshot }] : []); }
-  override latestSubagentSnapshot() { return this.allSubagentSnapshots()[0]?.snapshot ?? null; }
-  override mostRecentActive() { return this.list().find(k => k.running) ?? this.list()[0] ?? null; }
-  override resolveKernel(name: string) {
-    const kernel = this.list().find(k => k.name === name);
-    if (!kernel) throw new UnknownKernelError(name, this.list().map(k => k.name));
-    return kernel;
-  }
+  list() { return this.connection?.state.kernels ?? []; }
+  getPythonExecutable(id: string) { return this.list().find(k => k.id === id)?.pythonExecutable; }
+  allSubagentSnapshots() { return this.list().flatMap(k => k.snapshot ? [{ sessionId: k.id, snapshot: k.snapshot }] : []); }
+  resolveLibraryDir() { return resolveLibraryDir(this.settings); }
   async discover(allSessions = false): Promise<HostedKernel[]> { await this.ensureConnected(); return this.connection!.request("discover", { allSessions }); }
   async attachKernel(id: string, alias?: string): Promise<HostedKernel> {
     await this.ensureConnected(); const kernel = await this.connection!.request("attach", { kernelId: id, alias });
-    this.connection!.state.kernels = await this.connection!.request("discover", {}); return kernel;
+    await this.connection!.refreshLegacyState(); return kernel;
   }
   async operation(id: string): Promise<HostOperation> { await this.ensureConnected(); return this.connection!.request("operation", { operationId: id }); }
-  override interruptRunning(id: string): boolean {
-    if (!this.get(id) || !this.list().find(k => k.id === id)?.running) return false;
+  interruptRunning(id: string): boolean {
+    if (!this.list().find(k => k.id === id)?.running) return false;
     void this.call("interruptRunning", [id]).catch(error => this.clientHooks.onInterrupted?.(id, String(error))); return true;
   }
-  override async disposeAll(): Promise<void> { this.connection?.detach(); this.ready = undefined; this.owner = ""; }
-  override async provision(...args: Parameters<PythonSessionManager["provision"]>): Promise<Awaited<ReturnType<PythonSessionManager["provision"]>>> { return this.call("provision", args); }
-  override async inspectKernel(...args: Parameters<PythonSessionManager["inspectKernel"]>): Promise<Awaited<ReturnType<PythonSessionManager["inspectKernel"]>>> { return this.call("inspectKernel", args); }
-  override async readCellOutput(...args: Parameters<PythonSessionManager["readCellOutput"]>): Promise<Awaited<ReturnType<PythonSessionManager["readCellOutput"]>>> { return this.call("readCellOutput", args); }
-  override async execForeground(...args: Parameters<PythonSessionManager["execForeground"]>): Promise<Awaited<ReturnType<PythonSessionManager["execForeground"]>>> { return this.call("execForeground", args); }
-  override async scratchRun(...args: Parameters<PythonSessionManager["scratchRun"]>): Promise<Awaited<ReturnType<PythonSessionManager["scratchRun"]>>> { return this.call("scratchRun", args); }
-  override async writeCell(...args: Parameters<PythonSessionManager["writeCell"]>): Promise<Awaited<ReturnType<PythonSessionManager["writeCell"]>>> { return this.call("writeCell", args); }
-  override async deleteCell(...args: Parameters<PythonSessionManager["deleteCell"]>): Promise<Awaited<ReturnType<PythonSessionManager["deleteCell"]>>> { return this.call("deleteCell", args); }
-  override async readCells(...args: Parameters<PythonSessionManager["readCells"]>): Promise<Awaited<ReturnType<PythonSessionManager["readCells"]>>> { return this.call("readCells", args); }
-  override async readCell(...args: Parameters<PythonSessionManager["readCell"]>): Promise<Awaited<ReturnType<PythonSessionManager["readCell"]>>> { return this.call("readCell", args); }
-  override async runCell(...args: Parameters<PythonSessionManager["runCell"]>): Promise<Awaited<ReturnType<PythonSessionManager["runCell"]>>> { return this.call("runCell", args); }
-  override async runTo(...args: Parameters<PythonSessionManager["runTo"]>): Promise<Awaited<ReturnType<PythonSessionManager["runTo"]>>> { return this.call("runTo", args); }
-  override async runAll(...args: Parameters<PythonSessionManager["runAll"]>): Promise<Awaited<ReturnType<PythonSessionManager["runAll"]>>> { return this.call("runAll", args); }
-  override async resetKernel(...args: Parameters<PythonSessionManager["resetKernel"]>): Promise<Awaited<ReturnType<PythonSessionManager["resetKernel"]>>> { return this.call("resetKernel", args); }
-  override async toScript(...args: Parameters<PythonSessionManager["toScript"]>): Promise<Awaited<ReturnType<PythonSessionManager["toScript"]>>> { return this.call("toScript", args); }
-  override async dispose(...args: Parameters<PythonSessionManager["dispose"]>): Promise<Awaited<ReturnType<PythonSessionManager["dispose"]>>> { return this.call("dispose", args); }
+  async disposeAll(): Promise<void> { this.connection?.detach(); this.ready = undefined; this.owner = ""; }
+
+  private forward<M extends KernelCall>(method: M): KernelManager[M] {
+    return ((...args: Parameters<KernelManager[M]>) => this.call(method, args)) as KernelManager[M];
+  }
+  readonly provision = this.forward("provision");
+  readonly inspectKernel = this.forward("inspectKernel");
+  readonly readCellOutput = this.forward("readCellOutput");
+  readonly execForeground = this.forward("execForeground");
+  readonly scratchRun = this.forward("scratchRun");
+  readonly writeCell = this.forward("writeCell");
+  readonly deleteCell = this.forward("deleteCell");
+  readonly readCells = this.forward("readCells");
+  readonly readCell = this.forward("readCell");
+  readonly runCell = this.forward("runCell");
+  readonly runTo = this.forward("runTo");
+  readonly runAll = this.forward("runAll");
+  readonly resetKernel = this.forward("resetKernel");
+  readonly dispose = this.forward("dispose");
 }

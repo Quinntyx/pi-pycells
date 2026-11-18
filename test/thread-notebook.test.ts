@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
 import { createInterface } from "node:readline";
-import { resolveHostEndpoint, ensureHost, KernelHostConnection, PersistentSessionManager } from "../dist/kernel-host/client.js";
+import { resolveHostEndpoint, ensureHost, KernelHostConnection, RemoteKernelManager } from "../dist/kernel-host/client.js";
 import { spawn } from "node:child_process";
 import { notebookImages } from "../dist/execution/notebook-output.js";
 import { KernelHost } from "../dist/kernel-host/server.js";
@@ -154,7 +154,7 @@ test("real T3 delegated kernel resumes its namespace and notebook images match m
     delete process.env.T3_PYCELLS_LAUNCH_SOCKET;
     process.env.T3_PYCELLS_SOCKET = path.join(folder, "host.sock");
     process.env.T3_PYCELLS_OWNER_PID = String(owner.pid);
-    const a = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve(".")); managers.push(a);
+    const a = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve(".")); managers.push(a);
     await a.attachOwner("transient-pi-a");
     const k = await a.provision({ name: "analysis", cwd: folder, notebookPath: path.join(folder, "analysis.ipynb") });
     assert.equal(k.name, "analysis");
@@ -164,7 +164,7 @@ test("real T3 delegated kernel resumes its namespace and notebook images match m
     const snapshot = (await request(process.env.T3_PYCELLS_SOCKET, "notebookSnapshot")).result;
     assert.deepEqual(snapshot.kernels[0].cells[0].outputs.filter(o => o.kind === "image").map(({ kind, ...image }) => image), result.images);
     await a.disposeAll();
-    const b = new PersistentSessionManager({}, loadSettingsFromEnv(), path.resolve(".")); managers.push(b);
+    const b = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve(".")); managers.push(b);
     await b.attachOwner("transient-pi-b");
     assert.equal(b.list()[0].id, k.id);
     assert.equal(b.list()[0].name, "analysis");

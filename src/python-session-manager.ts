@@ -2,7 +2,7 @@ import readline from "readline";
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { homedir } from "os";
+import { resolveLibraryDir } from "./kernel-manager";
 import type { ChildProcess } from "child_process";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -1189,7 +1189,7 @@ export class PythonSessionManager {
   private sessions = new Map<string, SessionRecord>();
   private recency: string[] = [];
   /** Set after the first provision() has waited (once) for venv provisioning. */
-  private envGateSettled = false;
+  private envGate?: Promise<void>;
 
   constructor(
     private sandboxManager: SandboxManager,
@@ -1334,15 +1334,7 @@ export class PythonSessionManager {
    * PTC_LIBRARY_DIR (both `~/`-expanded), then `<pi agent dir>/pycells-library`.
    */
   resolveLibraryDir(): string {
-    const configured = this.settings.libraryDir?.trim() || process.env.PTC_LIBRARY_DIR?.trim();
-    if (configured) {
-      const expanded = configured === "~" || configured.startsWith(`~${path.sep}`)
-        ? path.join(homedir(), configured.slice(2))
-        : configured;
-      return path.resolve(expanded);
-    }
-    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".pi", "agent");
-    return path.resolve(agentDir, "pycells-library");
+    return resolveLibraryDir(this.settings);
   }
 
   private resolveSourcePath(source: string, cwd: string): string {
@@ -1571,12 +1563,9 @@ export class PythonSessionManager {
     // the venv instead of locking the session onto system python3 while
     // provisioned packages live elsewhere. Skipped when the interpreter is
     // pinned or the venv already exists.
-    if (!this.envGateSettled) {
-      this.envGateSettled = true;
-      if (!process.env.PTC_PYTHON_EXECUTABLE && !existsSync(venvPythonPath())) {
-        await waitForSubagentsEnv();
-      }
-    }
+    this.envGate ??= !process.env.PTC_PYTHON_EXECUTABLE && !existsSync(venvPythonPath())
+      ? waitForSubagentsEnv() : Promise.resolve();
+    await this.envGate;
 
     const sessionId = randomUUID().replace(/-/g, "").slice(0, 12);
     const { cwd } = options;

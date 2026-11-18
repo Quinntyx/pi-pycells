@@ -26,6 +26,16 @@ function setModuleExports(modulePath, exports) {
   };
 }
 
+function mockRemoteManager(FakeSessionManager, sandbox) {
+  return setModuleExports("../dist/kernel-host/client.js", {
+    RemoteKernelManager: class extends FakeSessionManager {
+      constructor(settings, extensionRoot, hooks) {
+        super(sandbox, settings, extensionRoot, hooks);
+      }
+    },
+  });
+}
+
 function makeFakeSessionManager(sandbox) {
   return class FakePythonSessionManager {
     static lastInstance = null;
@@ -161,7 +171,7 @@ function restoreInjectedModules(sandbox, overrides = {}) {
     ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
-  const restorePersistent = setModuleExports("../dist/kernel-host/client.js", { PersistentSessionManager: FakeSessionManager });
+  const restorePersistent = mockRemoteManager(FakeSessionManager, sandbox);
   return () => {
     restoreSandbox();
     restoreManager();
@@ -246,7 +256,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     ...require("../dist/python-session-manager.js"),
     PythonSessionManager: FakeSessionManager,
   });
-  const restorePersistent = setModuleExports("../dist/kernel-host/client.js", { PersistentSessionManager: FakeSessionManager });
+  const restorePersistent = mockRemoteManager(FakeSessionManager, sandbox);
   const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
     createSandbox: async () => sandbox,
   });

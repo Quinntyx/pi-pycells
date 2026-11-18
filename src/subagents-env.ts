@@ -253,6 +253,8 @@ export function versionedVenvPythonPath(version: string, cacheRoot: string = def
     : join(cacheRoot, `python-env-${version}`, "bin", "python");
 }
 
+const pendingVersionEnvs = new Map<string, Promise<string>>();
+
 /**
  * Ensure a venv exists for the given Python X.Y version and return its
  * interpreter path. uv is required (it also fetches the managed CPython when
@@ -262,7 +264,16 @@ export async function ensurePythonForVersion(version: string): Promise<string> {
   if (isNestedSubagent()) return inheritedSubagentsRuntime(version).venvPython!;
   const cacheRoot = defaultCacheRoot();
   const python = versionedVenvPythonPath(version, cacheRoot);
+  // Check pending first: uv can create the interpreter before IPython is installed.
+  const pending = pendingVersionEnvs.get(python);
+  if (pending) return pending;
   if (existsSync(python)) return python;
+  const setup = createVersionEnv(version, cacheRoot, python).finally(() => pendingVersionEnvs.delete(python));
+  pendingVersionEnvs.set(python, setup);
+  return setup;
+}
+
+async function createVersionEnv(version: string, cacheRoot: string, python: string): Promise<string> {
   if (!hasCommand("uv")) {
     throw new Error("uv is required (https://docs.astral.sh/uv/) to provision Python environments");
   }
