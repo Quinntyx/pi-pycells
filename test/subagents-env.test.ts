@@ -301,7 +301,7 @@ test("readLockPid tolerates missing or non-numeric lock content", () => {
 
 // --- C5: shared venv path helpers -------------------------------------------------
 
-test("an unpinned kernel waits for a pinned setup of the default interpreter", async (t) => {
+test("the default interpreter and its venv aliases wait for the same pinned setup", { skip: process.platform === "win32" }, async (t) => {
   const home = tmpDir("ptc-default-env-");
   const keys = ["HOME", "USERPROFILE", "PTC_PYTHON_EXECUTABLE", "PI_SUBAGENT_DEPTH", "PI_SUBAGENTS_PARENT_TOKEN"];
   const previous = keys.map(key => process.env[key]);
@@ -317,6 +317,8 @@ test("an unpinned kernel waits for a pinned setup of the default interpreter", a
   const { PythonSessionManager } = require("../dist/python-session-manager.js");
   const { loadSettingsFromEnv } = require("../dist/utils.js");
   const python = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION);
+  const basePython = path.join(home, "base-python");
+  fs.writeFileSync(basePython, "", { mode: 0o700 });
   let announceInstall;
   const installing = new Promise(resolve => { announceInstall = resolve; });
   t.mock.method(cp, "execFileSync", (cmd) => assert.equal(cmd, "uv"));
@@ -325,7 +327,8 @@ test("an unpinned kernel waits for a pinned setup of the default interpreter", a
     const child = new EventEmitter();
     if (args[0] === "venv") {
       fs.mkdirSync(path.dirname(python), { recursive: true });
-      fs.writeFileSync(python, "");
+      fs.symlinkSync(basePython, python);
+      fs.symlinkSync("python", path.join(path.dirname(python), "python3"));
       queueMicrotask(() => child.emit("exit", 0));
     } else {
       assert.deepEqual(args, ["pip", "install", "--python", python, "ipython"]);
@@ -334,23 +337,33 @@ test("an unpinned kernel waits for a pinned setup of the default interpreter", a
     return child;
   });
   const launched = new Error("sandbox reached");
-  let spawns = 0;
+  const spawns = [];
   const manager = new PythonSessionManager({
     getRuntimeWorkspaceRoot: cwd => cwd,
-    spawn() { spawns++; throw launched; },
+    spawn({ env }) { spawns.push(env.PTC_PYTHON_EXECUTABLE); throw launched; },
   }, loadSettingsFromEnv(), path.resolve(__dirname, ".."));
   const pinned = ensurePythonForVersion(DEFAULT_PYTHON_VERSION);
   const installer = await installing;
-  const unpinned = assert.rejects(manager.provision({ name: "unpinned", cwd: home }), error => error === launched);
-  void unpinned.catch(() => undefined);
+  const alias = path.relative(home, path.join(path.dirname(python), "python3"));
+  const wrapper = path.join(home, "python-link");
+  fs.symlinkSync(alias, wrapper);
+  const unrelated = path.join(home, "other-venv", "bin", "python");
+  fs.mkdirSync(path.dirname(unrelated), { recursive: true });
+  fs.symlinkSync(basePython, unrelated);
+  const attempts = [undefined, alias, "python3", wrapper, unrelated].map((configured, i) => {
+    const result = assert.rejects(manager.provision({ name: `kernel-${i}`, cwd: home,
+      launchEnvironment: { ...process.env, PATH: path.dirname(python), PTC_PYTHON_EXECUTABLE: configured } }), error => error === launched);
+    void result.catch(() => undefined);
+    return result;
+  });
   try {
     await new Promise(setImmediate); // drain provision's synchronous and microtask work
-    assert.equal(spawns, 0, "the interpreter file exists but IPython is still installing");
+    assert.deepEqual(spawns, [unrelated], "only the unrelated venv may start before IPython is installed");
   } finally {
     installer.emit("exit", 0);
-    await Promise.all([pinned, unpinned]);
+    await Promise.all([pinned, ...attempts]);
   }
-  assert.equal(spawns, 1);
+  assert.deepEqual(new Set(spawns), new Set([undefined, alias, "python3", wrapper, unrelated]));
 });
 
 test("defaultCacheRoot and venvPythonPath agree on the canonical layout", () => {

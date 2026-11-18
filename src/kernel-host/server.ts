@@ -14,13 +14,23 @@ const METHODS = new Set<HostCall>([...KERNEL_CALLS, "interruptRunning"]);
 const UPDATE_OPTIONS: Partial<Record<HostCall, number>> = { provision: 0, execForeground: 2, scratchRun: 2, runCell: 2, runTo: 2, runAll: 1, resetKernel: 1 };
 
 function notebookKey(absolutePath: string): string {
-  try { return fs.realpathSync(absolutePath); }
+  try { return fs.realpathSync.native(absolutePath); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    // Resolve symlinked parents even when the notebook hasn't been created yet.
-    const parent = path.dirname(absolutePath);
-    return parent === absolutePath ? absolutePath : path.join(notebookKey(parent), path.basename(absolutePath));
   }
+  // realpath can't resolve a symlink until its target exists.
+  const parent = path.dirname(absolutePath);
+  let target: string | undefined;
+  try { target = fs.readlinkSync(absolutePath); }
+  catch (error) {
+    const { code } = error as NodeJS.ErrnoException;
+    if (code !== "ENOENT" && code !== "EINVAL") throw error;
+  }
+  if (target !== undefined) {
+    // Let realpath interpret any `..` following another symlink in the target.
+    return notebookKey(path.isAbsolute(target) ? target : `${notebookKey(parent)}${path.sep}${target}`);
+  }
+  return parent === absolutePath ? absolutePath : path.join(notebookKey(parent), path.basename(absolutePath));
 }
 
 /** Owns interpreters independently of any Pi connection. It contains no agent workflow logic. */

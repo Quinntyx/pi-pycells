@@ -1588,8 +1588,7 @@ export class PythonSessionManager {
       }
     }
     if (!pythonExecutable) {
-      const configuredPython = (options.launchEnvironment ?? process.env).PTC_PYTHON_EXECUTABLE;
-      const setup = pendingPythonSetup(configuredPython || undefined);
+      const setup = pendingPythonSetup(options.launchEnvironment ?? process.env, cwd);
       if (setup) await setup;
     }
     const { proc, protocol } = this.createInterpreter({

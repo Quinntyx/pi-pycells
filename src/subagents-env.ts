@@ -29,18 +29,22 @@
  */
 import { execFile, execFileSync, spawn } from "child_process";
 import {
+  accessSync,
   closeSync,
+  constants,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
   writeSync,
 } from "fs";
-import { dirname, isAbsolute, resolve, relative } from "path";
+import { delimiter, dirname, isAbsolute, resolve, relative } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
 import { join } from "path";
@@ -212,8 +216,8 @@ export function sourceAvailable(installedSource: string | undefined, cloneDir: s
 }
 
 /** Pure: default cache root shared with sandbox-manager's venv lookup. */
-export function defaultCacheRoot(): string {
-  return join(homedir(), ".cache", "pi-pycells");
+export function defaultCacheRoot(home = homedir()): string {
+  return join(home, ".cache", "pi-pycells");
 }
 
 /**
@@ -255,9 +259,44 @@ export function versionedVenvPythonPath(version: string, cacheRoot: string = def
 
 const pendingVersionEnvs = new Map<string, Promise<string>>();
 
-/** The default provision can select the versioned interpreter as soon as uv creates it. */
-export function pendingPythonSetup(python = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION)): Promise<string> | undefined {
-  return pendingVersionEnvs.get(python);
+function interpreterDir(python: string): string {
+  const dir = dirname(python);
+  try { return realpathSync.native(dir); } catch { return dir; }
+}
+
+function configuredInterpreter(python: string, cwd: string, pathEnv: string | undefined): string | undefined {
+  if (isAbsolute(python) || python.includes("/") || (process.platform === "win32" && python.includes("\\"))) {
+    return resolve(cwd, python);
+  }
+  // A bare python3 is searched on PATH, not just relative to the kernel's cwd.
+  for (const entry of (pathEnv ?? "/usr/bin:/bin").split(delimiter)) {
+    const candidate = resolve(cwd, entry, python);
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (statSync(candidate).isFile()) return candidate;
+    } catch { /* try the next path entry */ }
+  }
+}
+
+export function pendingPythonSetup(env: NodeJS.ProcessEnv, cwd: string): Promise<string> | undefined {
+  if (!pendingVersionEnvs.size) return;
+  const python = env.PTC_PYTHON_EXECUTABLE;
+  const home = env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || undefined;
+  // A default launch may start selecting this interpreter as soon as uv creates it.
+  let candidate = python ? configuredInterpreter(python, cwd, env.PATH)
+    : versionedVenvPythonPath(DEFAULT_PYTHON_VERSION, defaultCacheRoot(home));
+  const seen = new Set<string>();
+  if (!candidate) return;
+  while (!seen.has(candidate)) {
+    seen.add(candidate);
+    const dir = interpreterDir(candidate);
+    for (const [interpreter, setup] of pendingVersionEnvs) {
+      if (dir === interpreterDir(interpreter)) return setup;
+    }
+    // Use the venv directory, not realpath(python): distinct venvs can link to the same base executable.
+    if (existsSync(join(dir, "..", "pyvenv.cfg"))) return;
+    try { candidate = resolve(dir, readlinkSync(candidate)); } catch { return; }
+  }
 }
 
 /**
@@ -270,7 +309,7 @@ export async function ensurePythonForVersion(version: string): Promise<string> {
   const cacheRoot = defaultCacheRoot();
   const python = versionedVenvPythonPath(version, cacheRoot);
   // Check pending first: uv can create the interpreter before IPython is installed.
-  const pending = pendingPythonSetup(python);
+  const pending = pendingVersionEnvs.get(python);
   if (pending) return pending;
   if (existsSync(python)) return python;
   const setup = createVersionEnv(version, cacheRoot, python).finally(() => pendingVersionEnvs.delete(python));

@@ -115,6 +115,7 @@ test("source replay blocks provisioning only for the same destination notebook",
   const started = new Promise(resolve => { announce = resolve; });
   const cwd = path.dirname(f.host.socketPath);
   fs.symlinkSync(cwd, path.join(cwd, "alias"), "dir");
+  fs.symlinkSync("shared.ipynb", path.join(cwd, "seeded.ipynb"));
   const entered = [];
   const original = f.manager.provision;
   f.manager.provision = async function (options) {
@@ -126,7 +127,7 @@ test("source replay blocks provisioning only for the same destination notebook",
     const a = await f.connect("pi-a"), b = await f.connect("pi-b");
     const provision = (client, name, notebookPath, source?) =>
       client.request("call", { method: "provision", args: [{ name, cwd, notebookPath, source }] });
-    const seeded = provision(a, "seeded", "shared.ipynb", "seed.py");
+    const seeded = provision(a, "seeded", "seeded.ipynb", "seed.py");
     void seeded.catch(() => undefined);
     await started;
     const shared = provision(b, "shared", "alias/shared.ipynb");
