@@ -1,6 +1,7 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { PythonSessionManager, normalizeKernelName } from "../python-session-manager";
 import { serializeError, HOST_PROTOCOL_VERSION, type HostedKernel, type HostOperation, type HostState } from "./protocol";
@@ -144,8 +145,11 @@ export class KernelHost {
     const invoke = async () => {
       if (request.method === "provision") {
         const publicName = normalizeKernelName(args[0]?.name);
-        if (this.visible(client.owner, client.attached).some(k => k.name === publicName)) throw new Error("Kernel name already in use in this Pi session");
-        args[0].name = `${client.owner}:${publicName}`;
+        const nameInUse = this.state().kernels.some(k =>
+          (k.ownerSessionId === client.owner && k.name === publicName) || client.attached.get(k.id) === publicName);
+        if (nameInUse) throw new Error("Kernel name already in use in this Pi session");
+        // Manager names share a namespace and length limit regardless of owner or public name.
+        args[0].name = randomUUID();
         if (args[0].launchEnvironment) {
           // The caller's Pi pane may disappear. Kernels live in the host pane,
           // while their profile configuration still comes from the creator.
@@ -167,7 +171,7 @@ export class KernelHost {
     };
     this.publish(true);
     try {
-      // Serialize provisioning across clients so hidden namespaces cannot race shared manager names.
+      // Keep visible-name validation and publication atomic across concurrent provisions.
       const job = request.method === "provision" ? this.provisionQueue.then(invoke) : invoke();
       if (request.method === "provision") this.provisionQueue = job.catch(() => undefined);
       operation.result = await job;

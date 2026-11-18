@@ -1636,81 +1636,81 @@ export class PythonSessionManager {
       if (record.killed || proc.exitCode !== null || proc.signalCode !== null) {
         throw new PythonSessionError("python session exited during startup");
       }
+      if (notebookPath) {
+        protocol.setNotebookPath(notebookPath);
+      }
+      if (preparedSource) {
+        // The first frame tells the runtime that copied markdown and code cells
+        // occupy the prefix numbering range. It is consumed once by the protocol.
+        protocol.setInitialCellCount(preparedSource.prefixCellCount);
+      }
+
+      // Re-check after the awaits above: a parallel provision could have claimed
+      // the name while this interpreter was starting up.
+      this.assertKernelNameAvailable(kernelName);
+      this.sessions.set(sessionId, record);
+      this.recency = this.recency.filter((id) => id !== sessionId);
+      this.recency.push(sessionId);
+
+      let sourceError: SourceExecutionError | undefined;
+      if (preparedSource) {
+        const sourceCells = preparedSource.kind === "python"
+          ? [{ code: preparedSource.pythonCode ?? "", index: 0, file: preparedSource.path }]
+          : preparedSource.cells
+              .map((cell, index) => ({ cell, index }))
+              .filter(({ cell }) => cell.cell_type === "code")
+              .map(({ cell, index }) => ({ code: notebookText(cell.source), index, file: undefined }));
+
+        for (const sourceCell of sourceCells) {
+          record.prefixChunkCount += 1;
+          try {
+            await this.execChunk(
+              record,
+              sourceCell.code,
+              options.onUpdate,
+              options.signal,
+              sourceCell.file,
+              undefined,
+              sourceCell.index
+            );
+          } catch (error) {
+            sourceError = {
+              cellIdx: sourceCell.index + 1,
+              message: error instanceof Error ? error.message : String(error),
+              traceback: error instanceof PtcPythonError ? error.traceback : undefined,
+            };
+            break;
+          }
+        }
+      }
+
+      let scriptError: PtcPythonError | undefined;
+      if (options.script) {
+        try {
+          await this.execChunk(record, options.script, options.onUpdate);
+        } catch (error) {
+          if (error instanceof PtcPythonError) {
+            scriptError = error;
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      return {
+        name: kernelName,
+        id: sessionId,
+        notebookPath,
+        sourcedFrom: preparedSource?.path,
+        sourceError,
+        scriptError,
+      };
     } catch (error) {
-      record.killed = true;
+      this.reapSession(record);
       this.terminateSession(record);
       await protocol.dispose().catch(() => undefined);
       throw error;
     }
-    if (notebookPath) {
-      protocol.setNotebookPath(notebookPath);
-    }
-    if (preparedSource) {
-      // The first frame tells the runtime that copied markdown and code cells
-      // occupy the prefix numbering range. It is consumed once by the protocol.
-      protocol.setInitialCellCount(preparedSource.prefixCellCount);
-    }
-
-    // Re-check after the awaits above: a parallel provision could have claimed
-    // the name while this interpreter was starting up.
-    this.assertKernelNameAvailable(kernelName);
-    this.sessions.set(sessionId, record);
-    this.recency = this.recency.filter((id) => id !== sessionId);
-    this.recency.push(sessionId);
-
-    let sourceError: SourceExecutionError | undefined;
-    if (preparedSource) {
-      const sourceCells = preparedSource.kind === "python"
-        ? [{ code: preparedSource.pythonCode ?? "", index: 0, file: preparedSource.path }]
-        : preparedSource.cells
-            .map((cell, index) => ({ cell, index }))
-            .filter(({ cell }) => cell.cell_type === "code")
-            .map(({ cell, index }) => ({ code: notebookText(cell.source), index, file: undefined }));
-
-      for (const sourceCell of sourceCells) {
-        record.prefixChunkCount += 1;
-        try {
-          await this.execChunk(
-            record,
-            sourceCell.code,
-            options.onUpdate,
-            options.signal,
-            sourceCell.file,
-            undefined,
-            sourceCell.index
-          );
-        } catch (error) {
-          sourceError = {
-            cellIdx: sourceCell.index + 1,
-            message: error instanceof Error ? error.message : String(error),
-            traceback: error instanceof PtcPythonError ? error.traceback : undefined,
-          };
-          break;
-        }
-      }
-    }
-
-    let scriptError: PtcPythonError | undefined;
-    if (options.script) {
-      try {
-        await this.execChunk(record, options.script, options.onUpdate);
-      } catch (error) {
-        if (error instanceof PtcPythonError) {
-          scriptError = error;
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    return {
-      name: kernelName,
-      id: sessionId,
-      notebookPath,
-      sourcedFrom: preparedSource?.path,
-      sourceError,
-      scriptError,
-    };
   }
 
   /** Throw when another live kernel already owns `name`. */

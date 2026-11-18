@@ -7,6 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { KernelHost } from "../dist/kernel-host/server.js";
 import { KernelHostConnection, PersistentSessionManager, hostSocketPath, ensureHost } from "../dist/kernel-host/client.js";
 import { renderHostView } from "../dist/kernel-host/viewer.js";
+import { normalizeKernelName } from "../dist/python-session-manager.js";
 
 function fakeManager() {
   const kernels = new Map(); let count = 0, disposed = 0, executions = 0;
@@ -14,7 +15,13 @@ function fakeManager() {
     kernels, get disposed() { return disposed; }, get executions() { return executions; },
     list() { return [...kernels.values()]; },
     getPythonExecutable() { return "/python"; }, getSubagentSnapshot() { return null; },
-    async provision(options) { const id = `k${++count}`; kernels.set(id, { id, name: options.name, running: false, cwd: "/tmp", pythonVersion: "3.14" }); return { id, name: options.name, pythonExecutable: "/python" }; },
+    async provision(options) {
+      const name = normalizeKernelName(options.name);
+      if (this.list().some(kernel => kernel.name === name)) throw new Error("Duplicate manager name");
+      const id = `k${++count}`;
+      kernels.set(id, { id, name, running: false, cwd: "/tmp", pythonVersion: "3.14" });
+      return { id, name, pythonExecutable: "/python" };
+    },
     async execForeground(id, code, options) { executions++; const kernel = kernels.get(id); kernel.running = true; options.onUpdate({ details: { userCode: [code], currentLine: 1 } }); await (this.executionGate ?? new Promise(resolve => setTimeout(resolve, 100))); kernel.running = false; return { text: code, cellIdx: executions }; },
     async dispose(id) { disposed++; kernels.delete(id); }, async disposeAll() { disposed += kernels.size; kernels.clear(); },
     async resetKernel(id) { return { ...kernels.get(id) }; },
@@ -37,9 +44,18 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
   const f = await fixture();
   try {
     const a = await f.connect("pi-a"), b = await f.connect("pi-b");
-    const ka = await a.request("call", { method: "provision", args: [{ name: "analysis" }] });
-    const kb = await b.request("call", { method: "provision", args: [{ name: "analysis" }] });
+    const name = "a".repeat(64);
+    const provision = client => client.request("call", { method: "provision", args: [{ name }] });
+    const ka = await provision(a);
+    const kb = await provision(b);
+    assert.equal(ka.name, name);
+    assert.equal(kb.name, name);
     assert.notEqual(ka.id, kb.id);
+    await assert.rejects(provision(a), /already in use in this Pi session/);
+    await a.request("attach", { kernelId: ka.id, alias: "renamed" });
+    await assert.rejects(provision(a), /already in use in this Pi session/);
+    await assert.rejects(a.request("call", { method: "provision", args: [{ name: "renamed" }] }), /already in use in this Pi session/);
+    await assert.rejects(a.request("call", { method: "provision", args: [{ name: name + "a" }] }), /too long/);
     assert.deepEqual((await b.request("discover", {})).map(k => k.id), [kb.id]);
     assert.equal((await b.request("discover", { allSessions: true })).length, 2);
     await assert.rejects(b.request("call", { method: "dispose", args: [ka.id] }), /not attached/);
@@ -47,7 +63,7 @@ test("session-scoped discovery, duplicate names, explicit attachment and reconne
     const attached = await b.request("attach", { kernelId: ka.id, alias: "recovered" });
     assert.equal(attached.ownerSessionId, "pi-a"); assert.equal(attached.name, "recovered");
     b.detach(); const b2 = await f.connect("pi-b");
-    assert.deepEqual((await b2.request("discover", {})).map(k => k.name), ["recovered", "analysis"]);
+    assert.deepEqual((await b2.request("discover", {})).map(k => k.name), ["recovered", name]);
     const reset = await b2.request("call", { method: "resetKernel", args: [ka.id, { cwd: "/tmp" }] });
     assert.equal(reset.id, ka.id); assert.equal(reset.name, "recovered");
     assert.equal((await b2.request("discover", {})).find(k => k.id === ka.id).ownerSessionId, "pi-a");
