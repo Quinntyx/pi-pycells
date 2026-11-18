@@ -4,15 +4,13 @@ import os as _ptc_os
 import sys as _ptc_sys
 import time as _ptc_time
 import traceback as _ptc_traceback
-from typing import Any, Callable
+from typing import Any
 
 """Cell-execution plumbing for the PTC Python kernel: stdout proxy, progress
 tracing, output serialization, and normal numerical/plot imports.
 
-The host-built combined script concatenates notebook control transport + this
-module + user_main, then runs ``_runtime_main`` (one-shot) or session.py's
-persistent exec loop (PTC_MODE == "session"). Names defined here are runtime
-plumbing and are excluded from kernel digests.
+The host combines this module with notebook control transport and session.py's
+persistent exec loop. Names defined here are excluded from kernel digests.
 """
 
 _current_line = 0
@@ -170,37 +168,16 @@ def _report_execution_progress(lineno: int, force: bool = False) -> None:
 def _trace_lines(frame, event, arg):
     """sys.settrace callback: report progress for user frames only.
 
-    Two shapes reach us: the legacy one-shot ``user_main`` wrapper, and cells
-    executed by the embedded IPython shell, whose code objects carry the cell's
-    filename (``_PTC_ACTIVE_FILENAME``). Returning None for every other 'call'
-    event keeps IPython's own machinery out of the per-line hook — tracing all of
-    it line-by-line was pure overhead.
+    Returning None for other 'call' events keeps IPython's own frames out of
+    the per-line hook.
     """
     global _current_line
 
-    if event == "call":
-        if frame.f_code.co_name == "user_main":
-            return _trace_lines
-        if frame.f_code.co_filename == globals().get("_PTC_ACTIVE_FILENAME"):
-            return _trace_lines
+    if event == "call" and frame.f_code.co_filename != _PTC_ACTIVE_FILENAME:
         return None
-
-    if event != "line":
-        return _trace_lines
-
-    if frame.f_code.co_name == "user_main":
-        # f_lineno is offset from co_firstlineno, which points at the `def` line.
-        # The first body line therefore maps to user line 1, not 2.
-        # _PTC_LINENO_OFFSET shifts the mapping when the wrapper's def line is
-        # placed ON the first user statement (persistent session cells), where
-        # the raw delta starts at 0 for the first body line.
-        lineno = frame.f_lineno - frame.f_code.co_firstlineno + globals().get("_PTC_LINENO_OFFSET", 0)
-    else:
-        # IPython compiles the cell with the original line numbers, so f_lineno
-        # is already the 1-based user line.
-        lineno = frame.f_lineno
-    _current_line = lineno
-    _report_execution_progress(lineno)
+    if event == "line":
+        _current_line = frame.f_lineno
+        _report_execution_progress(_current_line)
     return _trace_lines
 
 
@@ -340,22 +317,8 @@ def _python_error_help(error: BaseException) -> str | None:
     return None
 
 
-def _traceback_with_help(error: BaseException) -> str:
-    """Format the current exception's traceback, appending a recovery hint when
-    _python_error_help has one for it."""
-    traceback_text = _ptc_traceback.format_exc().rstrip()
-    hint = _python_error_help(error)
-    return f"{traceback_text}\n{hint}" if hint else traceback_text
-
-
 def _format_exception_with_help(error: BaseException) -> str:
-    """Like _traceback_with_help, but for an exception object captured earlier
-    (IPython's ExecutionResult), when no exception is active on the stack.
-
-    IPython's own execution frames (interactiveshell.run_code etc.) are dropped:
-    they are the embedded equivalent of the old wrapper frames and only add
-    noise to the model-facing traceback.
-    """
+    """Format a captured exception, omitting IPython frames and adding a recovery hint."""
     tb = getattr(error, "__traceback__", None)
     if tb is not None:
         frames = [
@@ -391,50 +354,3 @@ def _stringify_output(value: Any) -> str:
             except Exception:
                 return "<unserializable result>"
     return str(value)
-
-
-async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
-    """One-shot entry: run user_main under the tracer/stdout proxy, then emit a
-    "complete" frame (spool-capped output plus captured figures), or an "error"
-    frame followed by exit(1) on failure."""
-    try:
-        _setup_matplotlib()
-        await _rpc.start_reader()
-        _ptc_sys.settrace(_trace_lines)
-        _ptc_sys.stdout = _stdout_proxy
-        output = await user_main()
-        _stdout_proxy.flush()
-        _ptc_sys.stdout = _ORIGINAL_STDOUT
-        _ptc_sys.settrace(None)
-        # Ensure short executions and the final line are observable even when
-        # the regular progress update was suppressed by the rate limit.
-        if _current_line:
-            _report_execution_progress(_current_line, force=True)
-        _cancel_progress_flush()
-        images = _capture_figures()
-        final_output = _stringify_output(output)
-        total_output_chars = _stdout_proxy.total_chars + len(final_output)
-        remaining_output_chars = max(0, _PTC_MAX_SPOOL_CHARS - _stdout_proxy.accepted_chars)
-        _emit_protocol({
-            "type": "complete",
-            "output": final_output[:remaining_output_chars],
-            "images": images,
-            "total_output_chars": total_output_chars,
-        })
-    except Exception as error:
-        _ptc_sys.stdout = _ORIGINAL_STDOUT
-        _ptc_sys.settrace(None)
-        _emit_protocol(
-            {
-                "type": "error",
-                "message": str(error),
-                "traceback": _traceback_with_help(error),
-            }
-        )
-        _ptc_sys.exit(1)
-    finally:
-        await _rpc.cleanup()
-
-# The one-shot entry point (``asyncio.run(_runtime_main(user_main))``) lives in
-# the host-built combined script for one-shot executions; persistent-session
-# mode (PTC_MODE == "session") invokes session.py's exec loop instead.

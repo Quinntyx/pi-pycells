@@ -1,8 +1,6 @@
 """Persistent PTC session runtime — a headless Jupyter-like kernel.
 
-Unlike the one-shot combined script (rpc + wrappers + runtime + user_main), a
-persistent session keeps one interpreter alive for many cells. The host sends
-JSONL frames on stdin:
+One interpreter stays alive for many cells. The host sends JSONL frames on stdin:
 
     {"type": "exec", "id": "exec_1", "code": "...", "user_code_line_count": N,
      "notebook": "/path/to/notebook.ipynb",          # live notebook artifact
@@ -1318,8 +1316,7 @@ async def _ptc_guarded_exec_chunk(frame: dict) -> None:
 
 
 async def _ptc_session_entry() -> None:
-    """Persistent exec loop; driven by _ptc_session_bootstrap() when
-    PTC_MODE == "session"."""
+    """Run the persistent exec loop."""
     global _ptc_current_chunk_task
 
     await _rpc.start_reader()
