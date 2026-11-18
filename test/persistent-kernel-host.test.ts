@@ -108,7 +108,41 @@ test("provision reserves names across connections without blocking unrelated ker
   } finally { release(); await f.close(); }
 });
 
-for (const legacy of [false, true]) test(`remote list is current at hello, provision, attach and disposal (${legacy ? "legacy host" : "no discovery round trips"})`, async () => {
+test("source replay blocks provisioning only for the same destination notebook", async () => {
+  const f = await fixture();
+  let release, announce;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { announce = resolve; });
+  const cwd = path.dirname(f.host.socketPath);
+  fs.symlinkSync(cwd, path.join(cwd, "alias"), "dir");
+  const entered = [];
+  const original = f.manager.provision;
+  f.manager.provision = async function (options) {
+    entered.push(options.name);
+    if (options.source) { announce(); await gate; }
+    return original.call(this, options);
+  };
+  try {
+    const a = await f.connect("pi-a"), b = await f.connect("pi-b");
+    const provision = (client, name, notebookPath, source?) =>
+      client.request("call", { method: "provision", args: [{ name, cwd, notebookPath, source }] });
+    const seeded = provision(a, "seeded", "shared.ipynb", "seed.py");
+    void seeded.catch(() => undefined);
+    await started;
+    const shared = provision(b, "shared", "alias/shared.ipynb");
+    void shared.catch(() => undefined);
+    await provision(b, "independent", "other.ipynb");
+    assert.deepEqual(entered, ["seeded", "independent"]);
+    release();
+    await Promise.all([seeded, shared]);
+    assert.deepEqual(entered, ["seeded", "independent", "shared"]);
+  } finally { release(); await f.close(); }
+});
+
+for (const legacy of [false, true]) test(`remote list is current at hello, provision, attach and disposal (${legacy ? "legacy host" : "no discovery round trips"})`, async (t) => {
+  const threadId = process.env.T3_THREAD_ID;
+  delete process.env.T3_THREAD_ID;
+  t.after(() => { if (threadId !== undefined) process.env.T3_THREAD_ID = threadId; });
   const f = await fixture();
   const { loadSettingsFromEnv } = await import("../dist/utils.js");
   const manager = new RemoteKernelManager(loadSettingsFromEnv(), path.resolve("."), {}, { socketPath: f.host.socketPath });

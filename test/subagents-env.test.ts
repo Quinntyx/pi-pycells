@@ -8,7 +8,9 @@ const {
   sourceAvailable,
   defaultCacheRoot,
   venvPythonPath,
+  versionedVenvPythonPath,
   DEFAULT_PYTHON_VERSION,
+  ensurePythonForVersion,
   ensureSubagentsEnv,
   pidAlive,
   readLockPid,
@@ -298,6 +300,58 @@ test("readLockPid tolerates missing or non-numeric lock content", () => {
 });
 
 // --- C5: shared venv path helpers -------------------------------------------------
+
+test("an unpinned kernel waits for a pinned setup of the default interpreter", async (t) => {
+  const home = tmpDir("ptc-default-env-");
+  const keys = ["HOME", "USERPROFILE", "PTC_PYTHON_EXECUTABLE", "PI_SUBAGENT_DEPTH", "PI_SUBAGENTS_PARENT_TOKEN"];
+  const previous = keys.map(key => process.env[key]);
+  process.env.HOME = process.env.USERPROFILE = home;
+  for (const key of keys.slice(2)) delete process.env[key];
+  t.after(() => keys.forEach((key, i) => {
+    if (previous[i] === undefined) delete process.env[key];
+    else process.env[key] = previous[i];
+  }));
+
+  const cp = require("node:child_process");
+  const { EventEmitter } = require("node:events");
+  const { PythonSessionManager } = require("../dist/python-session-manager.js");
+  const { loadSettingsFromEnv } = require("../dist/utils.js");
+  const python = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION);
+  let announceInstall;
+  const installing = new Promise(resolve => { announceInstall = resolve; });
+  t.mock.method(cp, "execFileSync", (cmd) => assert.equal(cmd, "uv"));
+  t.mock.method(cp, "spawn", (cmd, args) => {
+    assert.equal(cmd, "uv");
+    const child = new EventEmitter();
+    if (args[0] === "venv") {
+      fs.mkdirSync(path.dirname(python), { recursive: true });
+      fs.writeFileSync(python, "");
+      queueMicrotask(() => child.emit("exit", 0));
+    } else {
+      assert.deepEqual(args, ["pip", "install", "--python", python, "ipython"]);
+      announceInstall(child);
+    }
+    return child;
+  });
+  const launched = new Error("sandbox reached");
+  let spawns = 0;
+  const manager = new PythonSessionManager({
+    getRuntimeWorkspaceRoot: cwd => cwd,
+    spawn() { spawns++; throw launched; },
+  }, loadSettingsFromEnv(), path.resolve(__dirname, ".."));
+  const pinned = ensurePythonForVersion(DEFAULT_PYTHON_VERSION);
+  const installer = await installing;
+  const unpinned = assert.rejects(manager.provision({ name: "unpinned", cwd: home }), error => error === launched);
+  void unpinned.catch(() => undefined);
+  try {
+    await new Promise(setImmediate); // drain provision's synchronous and microtask work
+    assert.equal(spawns, 0, "the interpreter file exists but IPython is still installing");
+  } finally {
+    installer.emit("exit", 0);
+    await Promise.all([pinned, unpinned]);
+  }
+  assert.equal(spawns, 1);
+});
 
 test("defaultCacheRoot and venvPythonPath agree on the canonical layout", () => {
   const root = path.join("some", "cache");

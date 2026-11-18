@@ -255,6 +255,11 @@ export function versionedVenvPythonPath(version: string, cacheRoot: string = def
 
 const pendingVersionEnvs = new Map<string, Promise<string>>();
 
+/** The default provision can select the versioned interpreter as soon as uv creates it. */
+export function pendingPythonSetup(python = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION)): Promise<string> | undefined {
+  return pendingVersionEnvs.get(python);
+}
+
 /**
  * Ensure a venv exists for the given Python X.Y version and return its
  * interpreter path. uv is required (it also fetches the managed CPython when
@@ -265,7 +270,7 @@ export async function ensurePythonForVersion(version: string): Promise<string> {
   const cacheRoot = defaultCacheRoot();
   const python = versionedVenvPythonPath(version, cacheRoot);
   // Check pending first: uv can create the interpreter before IPython is installed.
-  const pending = pendingVersionEnvs.get(python);
+  const pending = pendingPythonSetup(python);
   if (pending) return pending;
   if (existsSync(python)) return python;
   const setup = createVersionEnv(version, cacheRoot, python).finally(() => pendingVersionEnvs.delete(python));

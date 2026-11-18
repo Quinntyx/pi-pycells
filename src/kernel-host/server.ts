@@ -13,6 +13,16 @@ type HostCall = KernelCall | "interruptRunning";
 const METHODS = new Set<HostCall>([...KERNEL_CALLS, "interruptRunning"]);
 const UPDATE_OPTIONS: Partial<Record<HostCall, number>> = { provision: 0, execForeground: 2, scratchRun: 2, runCell: 2, runTo: 2, runAll: 1, resetKernel: 1 };
 
+function notebookKey(absolutePath: string): string {
+  try { return fs.realpathSync(absolutePath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // Resolve symlinked parents even when the notebook hasn't been created yet.
+    const parent = path.dirname(absolutePath);
+    return parent === absolutePath ? absolutePath : path.join(notebookKey(parent), path.basename(absolutePath));
+  }
+}
+
 /** Owns interpreters independently of any Pi connection. It contains no agent workflow logic. */
 export class KernelHost {
   private clients = new Map<net.Socket, Client>();
@@ -23,6 +33,7 @@ export class KernelHost {
   private timer?: NodeJS.Timeout;
   private lastState = "";
   private reservedNames = new Set<string>();
+  private notebookProvisions = new Map<string, Promise<unknown>>();
   constructor(readonly manager: PythonSessionManager, readonly socketPath: string,
     private options: { headless?: boolean; threadId?: string } = {}) {}
 
@@ -52,6 +63,20 @@ export class KernelHost {
     return this.reservedNames.has(`${client.owner}\0${name}`) || this.manager.list().some(k =>
       k.id !== exceptId && (k.ownerSessionId === client.owner || client.attached.has(k.id)) &&
       (client.attached.get(k.id) ?? k.name) === name);
+  }
+  private async provision(options: Parameters<PythonSessionManager["provision"]>[0]) {
+    if (!options.notebookPath) return this.manager.provision(options);
+    const key = notebookKey(path.resolve(options.cwd, options.notebookPath));
+    const previous = this.notebookProvisions.get(key);
+    // Source replay writes the notebook before the kernel is visible to clients.
+    const job = previous
+      ? previous.catch(() => undefined).then(() => this.manager.provision(options))
+      : this.manager.provision(options);
+    this.notebookProvisions.set(key, job);
+    try { return await job; }
+    finally {
+      if (this.notebookProvisions.get(key) === job) this.notebookProvisions.delete(key);
+    }
   }
   private send(socket: net.Socket, message: unknown): void {
     if (socket.destroyed || !socket.writable) return;
@@ -170,7 +195,7 @@ export class KernelHost {
             // while their profile configuration still comes from the creator.
             for (const key of ["TMUX", "TMUX_PANE"]) if (process.env[key]) args[0].launchEnvironment[key] = process.env[key];
           }
-          const result = await this.manager.provision({ ...args[0], name, ownerSessionId: client.owner });
+          const result = await this.provision({ ...args[0], name, ownerSessionId: client.owner });
           operation.kernelId = result.id;
           return result;
         } finally {

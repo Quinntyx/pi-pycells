@@ -13,7 +13,7 @@ import {
 } from "./execution/execution-errors";
 import { sectionize } from "./utils";
 import { existsSync } from "fs";
-import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
+import { ensurePythonForVersion, pendingPythonSetup, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { TerminalBuffer } from "./execution/terminal-emulator";
 import { notebookImages, type NotebookMimeOutput } from "./execution/notebook-output";
@@ -1586,6 +1586,11 @@ export class PythonSessionManager {
       if (sharedVersion !== preparedSource.pythonVersion) {
         pythonExecutable = await ensurePythonForVersion(preparedSource.pythonVersion);
       }
+    }
+    if (!pythonExecutable) {
+      const configuredPython = (options.launchEnvironment ?? process.env).PTC_PYTHON_EXECUTABLE;
+      const setup = pendingPythonSetup(configuredPython || undefined);
+      if (setup) await setup;
     }
     const { proc, protocol } = this.createInterpreter({
       sessionId,
